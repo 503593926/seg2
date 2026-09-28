@@ -1,0 +1,7 @@
+superpixel_size_um: 64.0
+compactness: 10
+
+rw_beta: 1.0
+non_cancer_threshold: 0.2
+cancer_threshold: 0.8
+max_snap_distance_um: 100.0

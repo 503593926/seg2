@@ -1,0 +1,9 @@
+split_mode: loocv  # loocv | transfer
+all_names: []
+ref_names: []
+tgt_names: []
+data_root: ""
+ref_dataset: ""
+tgt_dataset: ""
+num_workers: 4
+inference_batch_size: 1

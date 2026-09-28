@@ -1,0 +1,24 @@
+﻿image:
+  propagation_channels: 32
+  # backbone 尺度由 label_scale 派生(4mpp 起, 再 label_scale/2×/4×)，这里只给通道与块数；
+  # 最细级(scale < label_scale)属于无条件 stem(ConvNeXt 式 patchify + ResidualBlock)，
+  # 其余级是条件化 encoder，每级产出一个 skip 供 decoder 拼接
+  backbone:
+    channels: [32, 48, 64, 64]
+    blocks: [2, 2, 2, 2]
+  # decoder 逐级上采样：从最粗级出发，每级与该级 skip 拼接后过条件化块；
+  # 值为各级（从粗到细）的输出通道，级数 = encoder 级数 - 1
+  decoder_channels: [64, 64]
+  dropout: 0.3  # ModulatedBlock 里丢整条通道（Dropout2d），0 即关闭
+  decomposition:
+    projector_width: 128  # 第一级 P_i 的宽度, 每个 PFM 独立
+    feature_dim: 128  # 共享 S1/S2 的输出宽度, 即 f1/f2 的维度
+    spatial_pool: 8  # spatial 侧去相关统计的池化网格
+  router:
+    hidden_dims: [128, 32]
+    top_k: 2  # global 路由每层保留的 expert 数
+
+gene:
+  latent_dim: 32
+  hidden_dims: [64]
+  dropout: 0.1

@@ -1,0 +1,34 @@
+# Python cache
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.ruff_cache/
+.cache/
+.agents/
+.claude/
+.codex/
+# PyCharm / IntelliJ
+.idea/
+*.log
+
+data/
+/outputs
+/lightning_logs
+/pretrained_model
+*.ckpt
+
+UNI2/
+UNI/
+GenBio_PathFM/
+HOptimus1/
+Virchow2/
+
+/paper
+/SNIC
+
+evaluate/
+baselines/
+
+
+# 本地编译的 SNIC 共享库（每台机器自行编译，不入库）
+*.so

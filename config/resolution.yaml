@@ -1,0 +1,4 @@
+target_mpp: 1.0
+tile_size: 224
+
+label_mpp: 7.0

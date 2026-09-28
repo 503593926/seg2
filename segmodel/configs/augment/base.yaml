@@ -1,0 +1,11 @@
+enabled: true
+stain:
+  method: preset   # random_preset
+  preset: standard  # null
+  intensity_scale_range: [0.7, 1.3]
+  intensity_shift_range: [-0.2, 0.2]
+  probability: 0.1
+# 训练期 PFM 屏蔽：以该概率给每个样本屏蔽若干 PFM（个数在 1..K 上均匀取）的 patch/cls，
+# 其余样本保持全量，避免训练时从未见过完整条件而与推理不一致
+pfm_mask:
+  probability: 0.1
