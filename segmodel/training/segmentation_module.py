@@ -1,4 +1,5 @@
 from copy import deepcopy
+from math import lcm
 from pathlib import Path
 
 import pytorch_lightning as pl
@@ -7,7 +8,7 @@ from torchmetrics.classification import BinaryF1Score, BinaryJaccardIndex
 
 from ..inference.validation import load_expert_masks, validate_slide
 from ..inference.visualization import save_prediction_result
-from .losses import image_losses, pfm_losses
+from .losses import image_losses, pfm_losses, segmentation_loss
 
 
 class SegmentationModule(pl.LightningModule):
@@ -130,6 +131,145 @@ class SegmentationModule(pl.LightningModule):
             prog_bar=True,
         )
 
+    def _mixup_segmentation_loss(self, batch):
+        cfg = self.image_cfg.get("mixup")
+        if cfg is None or not bool(cfg.enabled) or self.current_epoch < int(cfg.start_epoch):
+            return None
+        if float(cfg.probability) <= 0 or torch.rand(()).item() >= float(cfg.probability):
+            return None
+
+        # 布尔 pfm_mask 无法表示插值后的可用程度，只选择所有 PFM 均可用的样本。
+        indices = batch["pfm_mask"].all(dim=1).nonzero(as_tuple=True)[0]
+        if indices.numel() < 2:
+            return None
+        indices = indices[
+            torch.randperm(indices.numel(), device=indices.device)[: int(cfg.max_samples)]
+        ]
+        if indices.numel() < 2:
+            return None
+        partners = indices.roll(1)
+        ratio = torch.distributions.Beta(float(cfg.alpha), float(cfg.alpha)).sample().item()
+
+        def mix(value):
+            return ratio * value[indices].float() + (1 - ratio) * value[partners].float()
+
+        image = batch["image"]
+        if image.dtype == torch.uint8:
+            image = image.float().mul(2.0 / 255.0).sub(1.0)
+        output = self(
+            mix(image),
+            tuple(mix(value) for value in batch["patch"]),
+            tuple(mix(value) for value in batch["cls"]),
+            batch["pfm_mask"][indices],
+        )
+        logits = output["logits"]
+        return (
+            ratio * segmentation_loss(
+                logits, batch["cancer_probability"][indices], batch["valid"][indices]
+            )
+            + (1 - ratio) * segmentation_loss(
+                logits, batch["cancer_probability"][partners], batch["valid"][partners]
+            )
+        )
+
+    def _cutmix_batch(self, batch, cfg):
+        image = batch["image"]
+        target = batch["cancer_probability"][:, 0]
+        valid = batch["valid"][:, 0]
+        available = batch["pfm_mask"].all(dim=1)
+        positive = (target >= float(cfg.positive_threshold)) & valid & available[:, None, None]
+        negative = (target <= float(cfg.negative_threshold)) & valid & available[:, None, None]
+        donors = positive.flatten(1).any(dim=1).nonzero(as_tuple=True)[0]
+        receivers = negative.flatten(1).any(dim=1).nonzero(as_tuple=True)[0]
+        if not donors.numel() or not receivers.numel():
+            return None
+
+        height, width = image.shape[-2:]
+        grids = (batch["cancer_probability"], *batch["patch"], *batch["cls"])
+        if any(height % value.shape[-2] or width % value.shape[-1] for value in grids):
+            raise ValueError("CutMix requires image, label and PFM grids to divide the crop")
+        unit_y = lcm(*(height // value.shape[-2] for value in grids))
+        unit_x = lcm(*(width // value.shape[-1] for value in grids))
+        if height % unit_y or width % unit_x:
+            raise ValueError("CutMix grids cannot share aligned crop boundaries")
+        cells_y, cells_x = height // unit_y, width // unit_x
+        min_cells = int(cfg.min_cells)
+        if cells_y < min_cells or cells_x < min_cells:
+            return None
+
+        receivers = receivers[
+            torch.randperm(receivers.numel(), device=receivers.device)[: int(cfg.max_samples)]
+        ]
+        # 每个目标 crop 选一个不同的病灶来源；来源和目标都必须有完整 PFM。
+        entries = []
+        for receiver in receivers.tolist():
+            choices = donors[donors != receiver]
+            if not choices.numel():
+                continue
+            donor = int(choices[torch.randint(choices.numel(), (1,), device=choices.device)])
+            donor_points = positive[donor].nonzero()
+            receiver_points = negative[receiver].nonzero()
+            source_y, source_x = donor_points[
+                torch.randint(donor_points.shape[0], (1,), device=donor_points.device)
+            ][0].tolist()
+            dest_y, dest_x = receiver_points[
+                torch.randint(receiver_points.shape[0], (1,), device=receiver_points.device)
+            ][0].tolist()
+
+            cells_h = int(torch.randint(min_cells, min(int(cfg.max_cells), cells_y) + 1, (1,)))
+            cells_w = int(torch.randint(min_cells, min(int(cfg.max_cells), cells_x) + 1, (1,)))
+            source_y = source_y * (height // target.shape[-2]) // unit_y
+            source_x = source_x * (width // target.shape[-1]) // unit_x
+            dest_y = dest_y * (height // target.shape[-2]) // unit_y
+            dest_x = dest_x * (width // target.shape[-1]) // unit_x
+            source_y = min(max(source_y - cells_h // 2, 0), cells_y - cells_h) * unit_y
+            source_x = min(max(source_x - cells_w // 2, 0), cells_x - cells_w) * unit_x
+            dest_y = min(max(dest_y - cells_h // 2, 0), cells_y - cells_h) * unit_y
+            dest_x = min(max(dest_x - cells_w // 2, 0), cells_x - cells_w) * unit_x
+            entries.append((receiver, donor, source_y, source_x, dest_y, dest_x,
+                            cells_h * unit_y, cells_w * unit_x))
+
+        if not entries:
+            return None
+        receiver_indices = [entry[0] for entry in entries]
+        mixed = {
+            key: batch[key][receiver_indices].clone()
+            for key in ("image", "cancer_probability", "valid")
+        }
+        mixed["patch"] = tuple(value[receiver_indices].clone() for value in batch["patch"])
+        mixed["cls"] = tuple(value[receiver_indices].clone() for value in batch["cls"])
+        mixed["pfm_mask"] = batch["pfm_mask"][receiver_indices]
+
+        def paste(destination, source, index, entry):
+            _, donor, sy, sx, dy, dx, h, w = entry
+            scale_y = height // source.shape[-2]
+            scale_x = width // source.shape[-1]
+            destination[index, :, dy // scale_y:(dy + h) // scale_y,
+                        dx // scale_x:(dx + w) // scale_x] = source[
+                donor, :, sy // scale_y:(sy + h) // scale_y,
+                sx // scale_x:(sx + w) // scale_x
+            ]
+
+        for index, entry in enumerate(entries):
+            for key in ("image", "cancer_probability", "valid"):
+                paste(mixed[key], batch[key], index, entry)
+            for key in ("patch", "cls"):
+                for destination, source in zip(mixed[key], batch[key]):
+                    paste(destination, source, index, entry)
+        return mixed
+
+    def _cutmix_segmentation_loss(self, batch):
+        cfg = self.image_cfg.get("cutmix")
+        if cfg is None or not bool(cfg.enabled) or self.current_epoch < int(cfg.start_epoch):
+            return None
+        if float(cfg.probability) <= 0 or torch.rand(()).item() >= float(cfg.probability):
+            return None
+        mixed = self._cutmix_batch(batch, cfg)
+        if mixed is None:
+            return None
+        output = self(mixed["image"], mixed["patch"], mixed["cls"], mixed["pfm_mask"])
+        return segmentation_loss(output["logits"], mixed["cancer_probability"], mixed["valid"])
+
     def training_step(self, batch, batch_index):
         output = self(batch["image"], batch["patch"], batch["cls"], batch["pfm_mask"])
         losses = image_losses(output, batch)
@@ -143,6 +283,40 @@ class SegmentationModule(pl.LightningModule):
             float(self.image_cfg.loss_weights[name]) * value
             for name, value in losses.items()
         )
+        mixup_loss = self._mixup_segmentation_loss(batch)
+        self.log(
+            "train/mixup_applied",
+            float(mixup_loss is not None),
+            on_step=False,
+            on_epoch=True,
+            batch_size=len(batch["image"]),
+        )
+        if mixup_loss is not None:
+            loss = loss + float(self.image_cfg.mixup.weight) * mixup_loss
+            self.log(
+                "train/mixup_segmentation",
+                mixup_loss,
+                on_step=False,
+                on_epoch=True,
+                batch_size=len(batch["image"]),
+            )
+        cutmix_loss = self._cutmix_segmentation_loss(batch)
+        self.log(
+            "train/cutmix_applied",
+            float(cutmix_loss is not None),
+            on_step=False,
+            on_epoch=True,
+            batch_size=len(batch["image"]),
+        )
+        if cutmix_loss is not None:
+            loss = loss + float(self.image_cfg.cutmix.weight) * cutmix_loss
+            self.log(
+                "train/cutmix_segmentation",
+                cutmix_loss,
+                on_step=False,
+                on_epoch=True,
+                batch_size=len(batch["image"]),
+            )
         self.log_dict(
             {
                 **{f"train/{name}": value for name, value in losses.items()},

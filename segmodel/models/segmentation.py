@@ -66,7 +66,7 @@ class SegmentationModel(nn.Module):
         self.unet = ConvNeXtUnet(
             encoder_chans=encoder_chans,
             decoder_chans=decoder_chans,
-            drop_path=(0.1, 0.3, 0.5),
+            drop_path=(0.1, 0.2, 0.3),
             blocks=2,
             global_dim=global_dim,
             spatial_dim=spatial_dim,
