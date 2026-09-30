@@ -10,8 +10,6 @@ from torch.nn import functional as F
 import pandas as pd
 from .blocks import ResidualBlock, Resize
 
-UNAVAILABLE_LOGIT = float("-inf")
-
 class LayerNorm(nn.Module):
     def __init__(self, normalized_shape, eps=1e-6):
         super().__init__()
@@ -76,7 +74,7 @@ class Stem(nn.Module):
         return fm1
 
 class ConvNeXtBlock(nn.Module):
-    def __init__(self, dim, drop_path, cnorm_kwargs, layer_scale_init_value=1e-2):
+    def __init__(self, dim, drop_path, cnorm_kwargs, layer_scale_init_value=1e-6):
         super().__init__()
 
         self.dwconv = nn.Conv2d(

@@ -127,6 +127,44 @@ def qc_visualize_pseudo_label(
         [cv2.IMWRITE_JPEG_QUALITY, 95],
     )
 
+    # 仅输出 spot 的矢量图, 保留原始坐标和完整图像范围, 背景透明。
+    radius = qc_spot_diameter_um / (2.0 * label_mpp)
+    elements = [
+        f'<svg xmlns="http://www.w3.org/2000/svg" width="{width}" height="{height}" '
+        f'viewBox="0 0 {width} {height}">',
+    ]
+    for x, y, label in zip(spot_x, spot_y, spot_labels):
+        blue, green, red = label_colors[int(label)]
+        elements.append(
+            f'  <circle cx="{int(x)}" cy="{int(y)}" r="{radius:g}" '
+            f'fill="rgb({red},{green},{blue})" />'
+        )
+    elements.append('</svg>')
+    (output_dir / 'qc_spots.svg').write_text('\n'.join(elements) + '\n', encoding='utf-8')
+
+    # 每行连续的同类像素合成一个矩形路径, 保留原始像素边界和孔洞。
+    mask_elements = [
+        f'<svg xmlns="http://www.w3.org/2000/svg" width="{width}" height="{height}" '
+        f'viewBox="0 0 {width} {height}" shape-rendering="crispEdges">',
+    ]
+    for label in (0, 1):
+        selected = (pseudo_mask == label).astype(np.int8)
+        changes = np.diff(np.pad(selected, ((0, 0), (1, 1))), axis=1)
+        rows, starts = np.nonzero(changes == 1)
+        _, ends = np.nonzero(changes == -1)
+        if not len(starts):
+            continue
+        path = ' '.join(
+            f'M{start} {y}h{end - start}v1H{start}z'
+            for y, start, end in zip(rows, starts, ends)
+        )
+        blue, green, red = label_colors[label]
+        mask_elements.append(f'  <path fill="rgb({red},{green},{blue})" d="{path}" />')
+    mask_elements.append('</svg>')
+    (output_dir / 'qc_pseudo_mask.svg').write_text(
+        '\n'.join(mask_elements) + '\n', encoding='utf-8',
+    )
+
 
 def qc_visualize_feature_map(
     feature_root: Path,
