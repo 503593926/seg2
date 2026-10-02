@@ -1,5 +1,5 @@
 enabled: true
-warmup_epochs: 20
+warmup_epochs: 10
 interval_epochs: 10
 max_rounds: 100
 save_intermediate: true

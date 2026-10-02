@@ -30,51 +30,40 @@ class SegmentationModel(nn.Module):
         self,
         pfm_patch_dims,
         pfm_cls_dims,
-        patch_scale,
-        label_scale,
         propagation_channels=4,
-        dim=128,
-        feature_dim=128,
         spatial_pool=4,
-        router_hidden_dims=(128, 64),
         top_k=2,
-        stem_chans=64,
-        encoder_chans=(64, 128, 256,),
-        decoder_chans=(128, 64),
+        encoder_chans=(96, 128, 160),
+        decoder_chans=(128, 96),
         global_dim=256,
         spatial_dim=32,
-        pfm_count=5,
+        skip_drop_path=0.1,
+        drop_path=(0.1, 0.1, 0.1),
     ):
         super().__init__()
-        self.patch_scale = int(patch_scale)
-        self.label_scale = int(label_scale)
-        self.pfm_count = len(pfm_patch_dims)
-        self.pfm_patch_dims = tuple(int(value) for value in pfm_patch_dims)
-        self.pfm_cls_dims = tuple(int(value) for value in pfm_cls_dims)
+        self.pfm_patch_dims = tuple(pfm_patch_dims)
+        self.pfm_cls_dims = tuple(pfm_cls_dims)
+        self.pfm_count = len(self.pfm_patch_dims)
+
         self.spatial_pool = int(spatial_pool)
-        self.router_hidden_dims = tuple(int(value) for value in router_hidden_dims)
-        self.top_k = int(top_k)
-
-        self.stem_chans = stem_chans
-
         self.stem = Stem(
             in_chans=3,
-            out_chans=stem_chans,
+            out_chans=encoder_chans[0],
         )
         self.global_dim = global_dim
         self.spatial_dim = spatial_dim
         self.unet = ConvNeXtUnet(
             encoder_chans=encoder_chans,
             decoder_chans=decoder_chans,
-            drop_path=(0.1, 0.2, 0.3),
+            drop_path=drop_path,
             blocks=2,
             global_dim=global_dim,
             spatial_dim=spatial_dim,
-            pfm_count=pfm_count,
-            g_top_k=2,
-            s_top_k=2,
+            pfm_count=self.pfm_count,
+            g_top_k=top_k,
+            s_top_k=top_k,
+            skip_drop_path=skip_drop_path,
         )
-
 
         self.feature_channels = int(decoder_chans[-1])
         self.propagation = nn.Sequential(

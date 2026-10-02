@@ -19,6 +19,7 @@ class SegmentationModule(pl.LightningModule):
         model,
         distiller,
         image_cfg,
+        augment_cfg,
         validation_roots=None,
         tiling=None,
         mpp=1.0,
@@ -32,6 +33,7 @@ class SegmentationModule(pl.LightningModule):
         self._last_ema_step = 0
         self.distiller = distiller
         self.image_cfg = image_cfg
+        self.augment_cfg = augment_cfg
         self.validation_roots = validation_roots
         self.tiling = tiling
         self.mpp = mpp
@@ -132,7 +134,7 @@ class SegmentationModule(pl.LightningModule):
         )
 
     def _mixup_segmentation_loss(self, batch):
-        cfg = self.image_cfg.get("mixup")
+        cfg = self.augment_cfg.get("mixup")
         if cfg is None or not bool(cfg.enabled) or self.current_epoch < int(cfg.start_epoch):
             return None
         if float(cfg.probability) <= 0 or torch.rand(()).item() >= float(cfg.probability):
@@ -259,7 +261,7 @@ class SegmentationModule(pl.LightningModule):
         return mixed
 
     def _cutmix_segmentation_loss(self, batch):
-        cfg = self.image_cfg.get("cutmix")
+        cfg = self.augment_cfg.get("cutmix")
         if cfg is None or not bool(cfg.enabled) or self.current_epoch < int(cfg.start_epoch):
             return None
         if float(cfg.probability) <= 0 or torch.rand(()).item() >= float(cfg.probability):
@@ -292,7 +294,7 @@ class SegmentationModule(pl.LightningModule):
             batch_size=len(batch["image"]),
         )
         if mixup_loss is not None:
-            loss = loss + float(self.image_cfg.mixup.weight) * mixup_loss
+            loss = loss + float(self.augment_cfg.mixup.weight) * mixup_loss
             self.log(
                 "train/mixup_segmentation",
                 mixup_loss,
@@ -309,7 +311,7 @@ class SegmentationModule(pl.LightningModule):
             batch_size=len(batch["image"]),
         )
         if cutmix_loss is not None:
-            loss = loss + float(self.image_cfg.cutmix.weight) * cutmix_loss
+            loss = loss + float(self.augment_cfg.cutmix.weight) * cutmix_loss
             self.log(
                 "train/cutmix_segmentation",
                 cutmix_loss,

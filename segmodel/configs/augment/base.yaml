@@ -1,11 +1,56 @@
 enabled: true
+geometry:
+  rotation_quarter_turns: [0, 1, 2, 3]
+  horizontal_flip_probability: 0.5
+  vertical_flip_probability: 0.5
+
 stain:
-  method: preset   # random_preset
-  preset: standard  # null
-  intensity_scale_range: [0.7, 1.3]
-  intensity_shift_range: [-0.2, 0.2]
   probability: 0.1
-# 训练期 PFM 屏蔽：以该概率给每个样本屏蔽若干 PFM（个数在 1..K 上均匀取）的 patch/cls，
-# 其余样本保持全量，避免训练时从未见过完整条件而与推理不一致
+  method: random_preset   # random_preset、preset
+  preset: null  # null、standard
+  intensity_scale_range: [0.8, 1.2]
+  intensity_shift_range: [-0.1, 0.1]
+  augment_background: true
+  tissue_only: true
+
+brightness:
+  probability: 0.1
+  multiplier_range: [0.8, 1.2]
+  tissue_only: true
+
+contrast:
+  probability: 0.1
+  factor_range: [0.8, 1.2]
+  tissue_only: true
+
+low_resolution:
+  probability: 0.1
+  scale_range: [0.5, 1.0]
+  tissue_only: false
+
 pfm_mask:
-  probability: 0.1
+  probability: 0.5
+  min_count: 1
+  max_count: null
+
+sampling:
+  spot_sampling_fraction: 0.25
+
+mixup:
+  enabled: true         # 与 CutMix 分别做消融时单独开启
+  probability: 0.5
+  alpha: 0.8             # Beta(alpha, alpha) 的参数
+  weight: 0.5           # 额外分割损失的权重
+  start_epoch: 0         # 从 0 开始计数；0 表示第一个 epoch 即可启用
+  max_samples: 4         # 每次最多混合 4 个样本，限制显存
+
+cutmix:
+  enabled: true
+  probability: 0.5       # 每步额外执行 CutMix 分割前向的概率
+  weight: 0.5            # 额外分割损失的权重
+  start_epoch: 0         # 从 0 开始计数；0 表示第一个 epoch 即可启用
+  max_samples: 4         # 每次最多合成 4 个 crop，限制显存
+  positive_threshold: 0.9
+  negative_threshold: 0.1
+  min_cells: 1          # 矩形边长按共同特征网格单元计算
+  max_cells: 6

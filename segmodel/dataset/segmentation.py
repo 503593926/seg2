@@ -14,22 +14,65 @@ from .slide import Slide
 
 
 def _build_stain_transform(augment_cfg):
-    if not bool(augment_cfg.get("enabled", False)):
+    if not bool(augment_cfg.enabled):
         return None
 
-    stain_cfg = augment_cfg.get("stain")
-    probability = float(stain_cfg.get("probability", 0.5))
+    stain_cfg = augment_cfg.stain
+    probability = float(stain_cfg.probability)
     if probability <= 0:
         return None
 
     return A.HEStain(
-        method=stain_cfg.get("method", "random_preset"),
-        preset=stain_cfg.get("preset"),
-        intensity_scale_range=stain_cfg.get("intensity_scale_range"),
-        intensity_shift_range=stain_cfg.get("intensity_shift_range"),
-        augment_background=True,
+        method=stain_cfg.method,
+        preset=stain_cfg.preset,
+        intensity_scale_range=stain_cfg.intensity_scale_range,
+        intensity_shift_range=stain_cfg.intensity_shift_range,
+        augment_background=bool(stain_cfg.augment_background),
         p=probability,
     )
+
+
+def _augment_image(image, tissue_mask, rng, cfg):
+    """只改变 H&E 明暗、对比度和清晰度，保持图像尺寸与其他监督不变。"""
+    augmented = None
+    for name in ("brightness", "contrast", "low_resolution"):
+        transform_cfg = cfg[name]
+        probability = float(transform_cfg.probability)
+        if probability <= 0 or rng.random() >= probability:
+            continue
+        tissue_only = bool(transform_cfg.tissue_only)
+        if tissue_only and not tissue_mask.any():
+            continue
+        if augmented is None:
+            augmented = image.permute(1, 2, 0).numpy().astype(np.float32)
+
+        if name == "brightness":
+            multiplier = rng.uniform(*transform_cfg.multiplier_range)
+            transformed = augmented * multiplier
+        elif name == "contrast":
+            factor = rng.uniform(*transform_cfg.factor_range)
+            values = augmented[tissue_mask] if tissue_only else augmented.reshape(-1, 3)
+            mean = values.mean(axis=0)
+            transformed = (augmented - mean) * factor + mean
+        else:
+            height, width = augmented.shape[:2]
+            scale = rng.uniform(*transform_cfg.scale_range)
+            downsampled = cv2.resize(
+                augmented,
+                (max(1, round(width * scale)), max(1, round(height * scale))),
+                interpolation=cv2.INTER_AREA,
+            )
+            transformed = cv2.resize(
+                downsampled, (width, height), interpolation=cv2.INTER_LINEAR
+            )
+
+        if tissue_only:
+            np.copyto(transformed, augmented, where=~tissue_mask[..., None])
+        augmented = np.clip(transformed, 0, 255)
+
+    if augmented is None:
+        return image
+    return torch.from_numpy(np.rint(augmented).astype(np.uint8)).permute(2, 0, 1)
 
 
 def _transform_geometry(value, turns, flip_x, flip_y):
@@ -41,10 +84,11 @@ def _transform_geometry(value, turns, flip_x, flip_y):
     return value.contiguous()
 
 
-def _augment_geometry(sample, rng, size):
+def _augment_geometry(sample, rng, size, cfg):
     """对图像、各 PFM 特征图、监督图和 spot 坐标执行同一组几何增强。"""
-    turns = int(rng.integers(4))
-    flip_x, flip_y = bool(rng.integers(2)), bool(rng.integers(2))
+    turns = int(rng.choice(cfg.rotation_quarter_turns))
+    flip_x = rng.random() < float(cfg.horizontal_flip_probability)
+    flip_y = rng.random() < float(cfg.vertical_flip_probability)
     coordinates = sample["spots"]
     for _ in range(turns):
         coordinates = torch.stack(
@@ -103,7 +147,6 @@ class SegmentationDataset(Dataset):
 
         first_slide = next(iter(self.slide_data.values()))
         self.pfm_count = len(first_slide["patch_map"])
-        self.pfm_mask_probability = float(self.augment_cfg.pfm_mask.probability)
 
         self.label_scale = int(label_scale)
         self.alignment = int(alignment)
@@ -165,29 +208,44 @@ class SegmentationDataset(Dataset):
         return int(self.dataset_cfg.samples_per_epoch)
 
     def _get_inputs(self, name, top, left, rng):
-        stain_mask = None
+        tissue_mask = None
         stain_seed = int(rng.integers(0, np.iinfo(np.uint32).max))
-        if self.stain_transform is not None:
+        needs_tissue_mask = (
+            self.stain_transform is not None and bool(self.augment_cfg.stain.tissue_only)
+        ) or (
+            bool(self.augment_cfg.enabled)
+            and any(
+                float(self.augment_cfg[name].probability) > 0
+                and bool(self.augment_cfg[name].tissue_only)
+                for name in ("brightness", "contrast", "low_resolution")
+            )
+        )
+        if needs_tissue_mask:
             mask_size = self.crop_size // self.label_scale
             mask_top, mask_left = top // self.label_scale, left // self.label_scale
-            stain_mask = self.slide_data[name]["tissue_mask_bl"][
+            tissue_mask = self.slide_data[name]["tissue_mask_bl"][
                 mask_top : mask_top + mask_size,
                 mask_left : mask_left + mask_size,
             ]
-            stain_mask = cv2.resize(
-                stain_mask.astype(np.uint8),
+            tissue_mask = cv2.resize(
+                tissue_mask.astype(np.uint8),
                 (self.crop_size, self.crop_size),
                 interpolation=cv2.INTER_NEAREST,
             ).astype(bool)
-        return self.slides[name].inputs(
+        sample = self.slides[name].inputs(
             top,
             left,
             self.crop_size,
             self.alignment,
             stain_transform=self.stain_transform,
             stain_seed=stain_seed,
-            stain_mask=stain_mask,
+            stain_mask=tissue_mask if bool(self.augment_cfg.stain.tissue_only) else None,
         )
+        if self.augment_cfg.enabled:
+            sample["image"] = _augment_image(
+                sample["image"], tissue_mask, rng, self.augment_cfg
+            )
+        return sample
 
     def __getitem__(self, index):
         # sample = {                              # C=crop_size, S=patch_scale, L=label_scale
@@ -210,21 +268,25 @@ class SegmentationDataset(Dataset):
         sample.update(self._supervision(name, top, left))
         sample.update(self._spot_targets(name, top, left))
         if self.augment_cfg.enabled:
-            sample = _augment_geometry(sample, rng, self.crop_size)
+            sample = _augment_geometry(
+                sample, rng, self.crop_size, self.augment_cfg.geometry
+            )
         # 放在几何增强之后取随机数：p=0 时与加这个机制之前的增强序列完全一致
         sample["pfm_mask"] = self._pfm_mask(rng)
         return sample
 
     def _pfm_mask(self, rng):
-        """每个样本以概率 p 触发屏蔽，触发时屏蔽个数在 1..K 上均匀取；(K,) 布尔掩码，True 表示可用。
+        """按配置概率与数量范围屏蔽 PFM；max_count 为 None 时最多屏蔽 K-1 个。
 
         概率为 0 时也返回全 True 的掩码，下游就不必判断该字段是否存在。
         被屏蔽 PFM 的输入特征不在这里清零——那属于模型的语义，dataset 只负责
         声明"这一步哪些 expert 可用"。
         """
+        cfg = self.augment_cfg.pfm_mask
         available = torch.ones(self.pfm_count, dtype=torch.bool)
-        if self.pfm_mask_probability and rng.random() < self.pfm_mask_probability:
-            count = int(rng.integers(1, self.pfm_count))
+        if float(cfg.probability) and rng.random() < float(cfg.probability):
+            max_count = self.pfm_count - 1 if cfg.max_count is None else int(cfg.max_count)
+            count = int(rng.integers(int(cfg.min_count), max_count + 1))
             masked = rng.choice(self.pfm_count, size=count, replace=False)
             available[masked] = False
         return available
@@ -236,7 +298,7 @@ class SegmentationDataset(Dataset):
         index = int(rng.integers(len(origins)))
         spot_data = self.spots_by_slide[name]
 
-        fraction = self.dataset_cfg.spot_sampling_fraction
+        fraction = float(self.augment_cfg.sampling.spot_sampling_fraction)
         if len(spot_data["coords"]) and rng.random() < fraction:
             center = spot_data["coords"][int(rng.integers(len(spot_data["coords"])))]
             desired = center[::-1] - self.crop_size / 2

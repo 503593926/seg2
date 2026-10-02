@@ -119,13 +119,7 @@ def _train_segmentation(cfg, data_module, gene_vae, tiling, output_dir):
     model = SegmentationModel(
         pfm_patch_dims=slide_data["patch_dims"],
         pfm_cls_dims=slide_data["cls_dims"],
-        patch_scale=data_module.patch_scale,
-        label_scale=label_scale,
-        propagation_channels=int(model_cfg.propagation_channels),
-        feature_dim=int(model_cfg.decomposition.feature_dim),
-        spatial_pool=int(model_cfg.decomposition.spatial_pool),
-        router_hidden_dims=tuple(model_cfg.router.hidden_dims),
-        top_k=int(model_cfg.router.top_k),
+        **OmegaConf.to_container(model_cfg, resolve=True),
     )
     distiller = Distiller(
         model,
@@ -139,6 +133,7 @@ def _train_segmentation(cfg, data_module, gene_vae, tiling, output_dir):
         model,
         distiller,
         train_cfg,
+        cfg.experiment.augment,
         validation_roots=data_module.data_roots,
         tiling=tiling,
         mpp=float(cfg.resolution.target_mpp),
@@ -179,8 +174,6 @@ def _train_segmentation(cfg, data_module, gene_vae, tiling, output_dir):
 def _save_final_model(cfg, model, tiling, output_dir):
     """保存权重与重建所需信息，让 checkpoint 自描述（供外部单跑推理）。"""
     model_config = OmegaConf.to_container(cfg.experiment.model.image, resolve=True)
-    model_config["patch_scale"] = model.patch_scale
-    model_config["label_scale"] = model.label_scale
     model_config["pfm_patch_dims"] = list(model.pfm_patch_dims)
     model_config["pfm_cls_dims"] = list(model.pfm_cls_dims)
     artifact = {

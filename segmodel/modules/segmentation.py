@@ -74,7 +74,7 @@ class Stem(nn.Module):
         return fm1
 
 class ConvNeXtBlock(nn.Module):
-    def __init__(self, dim, drop_path, cnorm_kwargs, layer_scale_init_value=1e-6):
+    def __init__(self, dim, drop_path, cnorm_kwargs, layer_scale_init_value=1e-2):
         super().__init__()
 
         self.dwconv = nn.Conv2d(
@@ -85,7 +85,7 @@ class ConvNeXtBlock(nn.Module):
         )
 
         self.cnorm = ConditionalNorm(dim, **cnorm_kwargs)
-        # self.norm = LayerNorm(dim, eps=1e-6)
+        self.norm = LayerNorm(dim, eps=1e-6)
 
         self.pwconv1 = nn.Conv2d(dim, dim * 4, kernel_size=1)
 
@@ -105,6 +105,7 @@ class ConvNeXtBlock(nn.Module):
         x = self.dwconv(x)
 
         x = self.cnorm(x, task_global, task_spatial, available, routing, global_router, spatial_router)
+        # x = self.norm(x)
 
         x = self.pwconv1(x)
 
@@ -183,10 +184,12 @@ class DecoderStage(nn.Module):
         drop_path,
         blocks,
         cnorm_kwargs,
+        skip_drop_path=0.0,
     ):
         super().__init__()
 
         self.up = Upsample( in_chans, out_chans)
+        self.skip_drop_path = DropPath(skip_drop_path)
 
         self.fuse = nn.Sequential(
             LayerNorm(out_chans + skip_chans, eps=1e-6),
@@ -199,7 +202,7 @@ class DecoderStage(nn.Module):
         x = self.up(x)
 
         # U-Net skip connection
-        x = torch.cat([x, skip], dim=1)
+        x = torch.cat([x, self.skip_drop_path(skip)], dim=1)
 
         # channel fusion
         x = self.fuse(x)
@@ -220,7 +223,8 @@ class ConvNeXtUnet(nn.Module):
         spatial_dim=64,
         pfm_count=5,
         g_top_k=2,
-        s_top_k=3,
+        s_top_k=2,
+        skip_drop_path=0.1,
     ):
         super().__init__()
 
@@ -271,6 +275,7 @@ class ConvNeXtUnet(nn.Module):
                     drop_path=rate,
                     blocks=blocks,
                     cnorm_kwargs=cnorm_kwargs,
+                    skip_drop_path=skip_drop_path,
                 )
             )
 

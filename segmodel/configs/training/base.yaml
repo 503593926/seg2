@@ -10,30 +10,13 @@
 image:
   epochs: 60
   warmup_epochs: 10
-  val_every_n_epochs: 5  # 每 N 个 epoch 验证一次（指标 + validation/ 可视化）；epochs 不被 N 整除时末尾无验证
+  val_every_n_epochs: 1  # 每 N 个 epoch 验证一次（指标 + validation/ 可视化）；epochs 不被 N 整除时末尾无验证
   batch_size: 16
   ema_decay: 0.999
 
   lr: 4e-3
   gene_lr: 0.001
   weight_decay: 0.05
-  mixup:
-    enabled: false         # 与 CutMix 分别做消融时单独开启
-    probability: 0.3
-    alpha: 0.8             # Beta(alpha, alpha) 的参数
-    weight: 1.0            # 额外分割损失的权重
-    start_epoch: 0         # 从 0 开始计数；0 表示第一个 epoch 即可启用
-    max_samples: 4         # 每次最多混合 4 个样本，限制显存
-  cutmix:
-    enabled: false
-    probability: 0.5       # 每步额外执行 CutMix 分割前向的概率
-    weight: 0.5            # 额外分割损失的权重
-    start_epoch: 0         # 从 0 开始计数；0 表示第一个 epoch 即可启用
-    max_samples: 1         # 每次最多合成 4 个 crop，限制显存
-    positive_threshold: 0.8
-    negative_threshold: 0.2
-    min_cells: 2          # 矩形边长按共同特征网格单元计算
-    max_cells: 6
   loss_weights:
     segmentation: 1.0
     affinity: 0.0
