@@ -83,6 +83,11 @@ def _csv_logger(output_dir, stage):
 def _pretrain_gene_vae(cfg, data_module, output_dir):
     runtime_cfg = cfg.experiment.training.runtime
     gene_cfg = cfg.experiment.model.gene
+    if (
+        float(cfg.experiment.training.image.loss_weights.molecular) != 0
+        and int(cfg.experiment.training.vae.pretrain_epochs) <= 0
+    ):
+        raise ValueError("Molecular regularization requires gene VAE pretraining")
     gene_vae = GeneVAE(
         input_dim=data_module.train_gene_adata.n_vars,
         latent_dim=int(gene_cfg.latent_dim),
@@ -124,9 +129,7 @@ def _train_segmentation(cfg, data_module, gene_vae, tiling, output_dir):
     distiller = Distiller(
         model,
         gene_vae,
-        train_cfg.distillation,
-        cfg.experiment.training.vae,
-        float(cfg.experiment.dataset.spot_radius),
+        spot_radius_px=data_module.spot_radius_px,
         label_scale=label_scale,
     )
     module = SegmentationModule(

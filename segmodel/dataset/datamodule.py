@@ -64,8 +64,12 @@ class FoldDataModule(pl.LightningDataModule):
         数据集（候选窗口步长）与推理滑窗都取这一份。
         """
         self.patch_scale = next(iter(self.train_slide_data.values()))["patch_scale"]
+        target_mpp = float(self.cfg.resolution.target_mpp)
+        self.spot_radius_px = (
+            float(self.cfg.experiment.dataset.spot_diameter_um) / (2.0 * target_mpp)
+        )
         self.label_scale = round(
-            float(self.cfg.resolution.label_mpp) / float(self.cfg.resolution.target_mpp)
+            float(self.cfg.resolution.label_mpp) / target_mpp
         )
         self.alignment = lcm(self.label_scale, self.patch_scale)
 
@@ -94,6 +98,7 @@ class FoldDataModule(pl.LightningDataModule):
                 self.cfg,
                 label_scale=self.label_scale,
                 alignment=self.alignment,
+                spot_radius_px=self.spot_radius_px,
                 seed=self.seed,
             )
 

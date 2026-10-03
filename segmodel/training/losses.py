@@ -2,19 +2,12 @@ import torch
 from torch.nn import functional as F
 
 
-def get_gene_losses(reconstruction, expression, mean, logvar, spot_logits, spot_labels):
-    """基因 VAE 的三项损失：重构、KL、spot 分类（预训练与分割训练期的微调共用）。"""
+def get_gene_losses(reconstruction, expression, mean, logvar):
+    """无监督基因 VAE 的重构与 KL 损失。"""
     kl = -0.5 * (1 + logvar - mean.square() - logvar.exp()).mean()
-    known = (spot_labels == 0) | (spot_labels == 1)
-    task = (
-        F.cross_entropy(spot_logits[known], spot_labels[known])
-        if known.any()
-        else spot_logits.sum() * 0
-    )
     return {
         "reconstruction": F.mse_loss(reconstruction, expression),
         "kl": kl,
-        "task": task,
     }
 
 

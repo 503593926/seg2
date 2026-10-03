@@ -61,7 +61,6 @@ class SegmentationModule(pl.LightningModule):
         return self.model(image, patch, cls, pfm_mask)
 
     def on_train_batch_end(self, outputs, batch, batch_idx):
-        self.distiller.ema_update(self.model, self.global_step)
         self._update_ema_model()
 
     @torch.no_grad()
@@ -276,14 +275,16 @@ class SegmentationModule(pl.LightningModule):
         output = self(batch["image"], batch["patch"], batch["cls"], batch["pfm_mask"])
         losses = image_losses(output, batch)
         losses.update(pfm_losses(output, batch, self.model.pfm_count))
-        gene_losses, diagnostics = self.distiller.losses(
-            output, batch, self.current_epoch
-        )
-        losses.update(gene_losses)
+        if float(self.image_cfg.loss_weights.molecular) != 0:
+            molecular_losses, diagnostics = self.distiller.losses(output, batch)
+            losses.update(molecular_losses)
+        else:
+            losses["molecular"] = output["features"].sum() * 0
+            diagnostics = {}
 
         loss = sum(
-            float(self.image_cfg.loss_weights[name]) * value
-            for name, value in losses.items()
+            float(weight) * losses[name]
+            for name, weight in self.image_cfg.loss_weights.items()
         )
         mixup_loss = self._mixup_segmentation_loss(batch)
         self.log(
@@ -373,30 +374,24 @@ class SegmentationModule(pl.LightningModule):
         return metrics
 
     def configure_optimizers(self):
-        weight_decay = float(self.image_cfg.weight_decay)
         image_parameters = list(self.model.named_parameters()) + list(
             self.distiller.image_projector.named_parameters()
         )
-        parameter_groups = []
-        for named_parameters, lr in (
-            (image_parameters, float(self.image_cfg.lr)),
-            (self.distiller.gene_vae.named_parameters(), float(self.image_cfg.gene_lr)),
-        ):
-            decay, no_decay = [], []
-            for name, parameter in named_parameters:
-                if not parameter.requires_grad:
-                    continue
-                if parameter.ndim <= 1 or name.endswith(".bias"):
-                    no_decay.append(parameter)
-                else:
-                    decay.append(parameter)
-            parameter_groups.extend(
-                (
-                    {"params": decay, "lr": lr, "weight_decay": weight_decay},
-                    {"params": no_decay, "lr": lr, "weight_decay": 0.0},
-                )
-            )
-        optimizer = torch.optim.AdamW(parameter_groups)
+        decay, no_decay = [], []
+        for name, parameter in image_parameters:
+            if not parameter.requires_grad:
+                continue
+            if parameter.ndim <= 1 or name.endswith(".bias"):
+                no_decay.append(parameter)
+            else:
+                decay.append(parameter)
+        optimizer = torch.optim.AdamW(
+            [
+                {"params": decay, "weight_decay": float(self.image_cfg.weight_decay)},
+                {"params": no_decay, "weight_decay": 0.0},
+            ],
+            lr=float(self.image_cfg.lr),
+        )
 
         scheduler = torch.optim.lr_scheduler.SequentialLR(
             optimizer,

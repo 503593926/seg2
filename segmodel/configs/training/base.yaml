@@ -1,11 +1,10 @@
 ﻿vae:
   pretrain_lr: 0.001
   weight_decay: 0.01
-  pretrain_epochs: 0
+  pretrain_epochs: 50
   pretrain_batch_size: 128
   rec_loss: 1.0
   kl_weight: 0.1
-  task_weight: 0.1
 
 image:
   epochs: 60
@@ -15,29 +14,17 @@ image:
   ema_decay: 0.999
 
   lr: 4e-3
-  gene_lr: 0.001
   weight_decay: 0.05
   loss_weights:
     segmentation: 1.0
     affinity: 0.0
     superpixel: 0.0
-    molecular: 0.0  # 0 为 No-KD 消融；使用蒸馏时设为非零
-    task: 0.0
-    vae: 0.0
+    molecular: 0.5
     # PFM 解耦：f2 的身份分类与 f1/f2 去相关。四个权重全为 0 时退化成普通多 PFM 路由
     pfm_cls_global: 1.0
     pfm_orth_global: 0.1
     pfm_cls_spatial: 1.0
     pfm_orth_spatial: 0.1
-  distillation:
-    bidirectional_start_epoch: 1
-    ema_decay: 0.99
-    confidence_threshold: 0.8
-    confidence_gamma: 2.0
-    gene_posterior_samples: 4
-    gene_posterior_temperature: 0.02
-    image_consistency_temperature: 0.1
-    image_spatial_temperature: 0.05
 
 runtime:
   accelerator: gpu

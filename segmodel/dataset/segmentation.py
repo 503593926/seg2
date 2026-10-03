@@ -119,6 +119,7 @@ class SegmentationDataset(Dataset):
         cfg,
         label_scale,
         alignment,
+        spot_radius_px,
         seed=0,
     ):
         self.slide_data = slide_data
@@ -150,6 +151,7 @@ class SegmentationDataset(Dataset):
 
         self.label_scale = int(label_scale)
         self.alignment = int(alignment)
+        self.spot_radius_px = float(spot_radius_px)
 
         self.slides = {
             name: Slide.from_sample(name, self.slide_data[name])
@@ -327,7 +329,7 @@ class SegmentationDataset(Dataset):
     def _spot_targets(self, name, top, left):
         """返回窗口内完整 spot 的局部坐标、表达和标签。"""
         spot_data = self.spots_by_slide[name]
-        radius = self.dataset_cfg.spot_radius
+        radius = self.spot_radius_px
         local = spot_data["coords"] - np.array([left, top], dtype=np.float32)
         keep = ((local >= radius) & (local <= self.crop_size - 1 - radius)).all(axis=1)
         indices = torch.from_numpy(spot_data["indices"][keep])
