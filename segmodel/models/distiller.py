@@ -6,7 +6,7 @@ import torch
 from torch import nn
 
 from ..modules import ProjectionHead
-from ..training.losses import distillation_loss
+from ..training.losses import distillation_loss, relation_distillation_loss
 
 
 class Distiller(nn.Module):
@@ -30,23 +30,31 @@ class Distiller(nn.Module):
         self.gene_teacher.eval()
         return self
 
-    def losses(self, output, batch):
+    def losses(self, output, batch, relation_enabled: bool = False):
         image_features = []
         expression = []
+        slide_ids = []
+        spot_ids = []
         for index, spots in enumerate(batch["spots"]):
             if not len(spots):
                 continue
             image_features.append(self._pool_spots(output["features"][index], spots))
             expression.append(batch["gene_expression"][index])
+            if relation_enabled:
+                ids = batch['spot_ids'][index]
+                spot_ids.append(ids)
+                slide_ids.append(batch['slide_id'][index].expand_as(ids))
 
         if not expression:
             zero = output["features"].sum() * 0
-            return {"molecular": zero}, {
+            return {"molecular": zero, 'relation': zero}, {
                 "spots": 0.0,
                 "distillation/gene_to_image": zero.detach(),
                 "distillation/distillation_coverage": 0.0,
                 "distillation/gene_embedding_std": zero.detach(),
                 "distillation/image_embedding_std": zero.detach(),
+                'distillation/relation_pairs': 0.0,
+                'distillation/relation_slides': 0.0,
             }
 
         image_embedding = self.image_projector(torch.cat(image_features))
@@ -58,6 +66,15 @@ class Distiller(nn.Module):
             gene_embedding.float(),
             torch.ones(gene_embedding.shape[0], device=gene_embedding.device),
         )
+        relation = image_embedding.sum() * 0
+        pair_count, slide_count = 0, 0
+        if relation_enabled:
+            relation, pair_count, slide_count = relation_distillation_loss(
+                image_embedding,
+                gene_embedding,
+                torch.cat(slide_ids),
+                torch.cat(spot_ids),
+            )
         diagnostics = {
             "spots": float(len(gene_embedding)),
             "distillation/gene_to_image": molecular.detach(),
@@ -68,8 +85,10 @@ class Distiller(nn.Module):
             "distillation/image_embedding_std": image_embedding.detach().float().std(
                 dim=0, unbiased=False
             ).mean(),
+            'distillation/relation_pairs': float(pair_count),
+            'distillation/relation_slides': float(slide_count),
         }
-        return {"molecular": molecular}, diagnostics
+        return {"molecular": molecular, 'relation': relation}, diagnostics
 
     def _pool_spots(self, features, coordinates):
         """按 spot 圆盘均值池化，坐标与半径按 label_scale 换算到特征网格。"""

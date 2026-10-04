@@ -275,11 +275,15 @@ class SegmentationModule(pl.LightningModule):
         output = self(batch["image"], batch["patch"], batch["cls"], batch["pfm_mask"])
         losses = image_losses(output, batch)
         losses.update(pfm_losses(output, batch, self.model.pfm_count))
-        if float(self.image_cfg.loss_weights.molecular) != 0:
-            molecular_losses, diagnostics = self.distiller.losses(output, batch)
+        relation_enabled = float(self.image_cfg.loss_weights.get('relation', 0)) != 0
+        if float(self.image_cfg.loss_weights.molecular) != 0 or relation_enabled:
+            molecular_losses, diagnostics = self.distiller.losses(
+                output, batch, relation_enabled=relation_enabled,
+            )
             losses.update(molecular_losses)
         else:
             losses["molecular"] = output["features"].sum() * 0
+            losses['relation'] = losses["molecular"]
             diagnostics = {}
 
         loss = sum(

@@ -126,6 +126,7 @@ class SegmentationDataset(Dataset):
         self.gene_expression = torch.from_numpy(gene_adata.X)
         self.spot_labels = torch.from_numpy(gene_adata.obs["spot_label"].to_numpy(dtype=np.int64))
         self.slide_names = list(slide_names)
+        self.slide_ids = {name: index for index, name in enumerate(self.slide_names)}
         self.seed = int(seed)
         self.epoch = 0
 
@@ -258,9 +259,11 @@ class SegmentationDataset(Dataset):
         #     "cancer_probability": (1, C // L, C // L),  # float32, 监督在 7mpp 网格
         #     "valid": (1, C // L, C // L),       # bool
         #     "superpixels": (1, C // L, C // L), # int64
-        #     "spots": (k, 2),                    # float32，以下三项仅用于蒸馏
+        #     "spots": (k, 2),                    # float32, spot 字段用于蒸馏
         #     "gene_expression": (k, G),          # float32
         #     "spot_labels": (k,),                # int64
+        #     'spot_ids': (k,),                    # int64, 表达矩阵中的行索引
+        #     'slide_id': int,                    # 当前 fold 内的切片索引
         # }
         rng = np.random.default_rng(
             np.random.SeedSequence([self.seed, self.epoch, index])
@@ -337,12 +340,14 @@ class SegmentationDataset(Dataset):
             "spots": torch.from_numpy(local[keep].astype(np.float32)),
             "gene_expression": self.gene_expression[indices],
             "spot_labels": self.spot_labels[indices],
+            'spot_ids': indices,
+            'slide_id': self.slide_ids[name],
         }
 
 
 def collate_samples(samples):
     """spot 字段的长度随窗口内完整 spot 数变化，堆不了，保留为逐样本列表；其余按默认规则堆叠。"""
-    variable_keys = {"spots", "gene_expression", "spot_labels"}
+    variable_keys = {"spots", "gene_expression", "spot_labels", 'spot_ids'}
     batch = {}
     for key in samples[0]:
         values = [sample[key] for sample in samples]

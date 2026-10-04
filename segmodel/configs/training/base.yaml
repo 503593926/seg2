@@ -19,7 +19,8 @@ image:
     segmentation: 1.0
     affinity: 0.0
     superpixel: 0.0
-    molecular: 0.5
+    molecular: 0.0
+    relation: 0.5  # 整个 batch 的 spot 余弦相似度关系蒸馏, 设为 0 可关闭
     # PFM 解耦：f2 的身份分类与 f1/f2 去相关。四个权重全为 0 时退化成普通多 PFM 路由
     pfm_cls_global: 1.0
     pfm_orth_global: 0.1
