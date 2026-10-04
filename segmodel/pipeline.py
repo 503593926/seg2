@@ -83,8 +83,9 @@ def _csv_logger(output_dir, stage):
 def _pretrain_gene_vae(cfg, data_module, output_dir):
     runtime_cfg = cfg.experiment.training.runtime
     gene_cfg = cfg.experiment.model.gene
+    loss_weights = cfg.experiment.training.image.loss_weights
     if (
-        float(cfg.experiment.training.image.loss_weights.molecular) != 0
+        any(float(loss_weights.get(name, 0)) != 0 for name in ('molecular', 'interpolation'))
         and int(cfg.experiment.training.vae.pretrain_epochs) <= 0
     ):
         raise ValueError("Molecular regularization requires gene VAE pretraining")

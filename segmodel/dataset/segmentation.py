@@ -10,6 +10,8 @@ import numpy as np
 import torch
 from torch.utils.data import Dataset, default_collate
 
+from tools.spot_interpolation import get_interpolation_plan
+
 from .slide import Slide
 
 
@@ -89,16 +91,19 @@ def _augment_geometry(sample, rng, size, cfg):
     turns = int(rng.choice(cfg.rotation_quarter_turns))
     flip_x = rng.random() < float(cfg.horizontal_flip_probability)
     flip_y = rng.random() < float(cfg.vertical_flip_probability)
-    coordinates = sample["spots"]
-    for _ in range(turns):
-        coordinates = torch.stack(
-            (coordinates[:, 1], size - 1 - coordinates[:, 0]), dim=1
-        )
-    if flip_x:
-        coordinates[:, 0] = size - 1 - coordinates[:, 0]
-    if flip_y:
-        coordinates[:, 1] = size - 1 - coordinates[:, 1]
-    sample["spots"] = coordinates
+    for key in ('spots', 'interpolation_spots'):
+        if key not in sample:
+            continue
+        coordinates = sample[key]
+        for _ in range(turns):
+            coordinates = torch.stack(
+                (coordinates[:, 1], size - 1 - coordinates[:, 0]), dim=1
+            )
+        if flip_x:
+            coordinates[:, 0] = size - 1 - coordinates[:, 0]
+        if flip_y:
+            coordinates[:, 1] = size - 1 - coordinates[:, 1]
+        sample[key] = coordinates
 
     for key in ("image", "cancer_probability", "valid", "superpixels"):
         sample[key] = _transform_geometry(sample[key], turns, flip_x, flip_y)
@@ -126,6 +131,10 @@ class SegmentationDataset(Dataset):
         self.gene_expression = torch.from_numpy(gene_adata.X)
         self.spot_labels = torch.from_numpy(gene_adata.obs["spot_label"].to_numpy(dtype=np.int64))
         self.slide_names = list(slide_names)
+        self.interpolation_enabled = float(
+            cfg.experiment.training.image.loss_weights.get('interpolation', 0)
+        ) != 0
+        self.interpolation_plans = {}
         self.seed = int(seed)
         self.epoch = 0
 
@@ -140,6 +149,16 @@ class SegmentationDataset(Dataset):
                 "coords": coordinates,
                 "indices": indices.astype(np.int64),
             }
+            if self.interpolation_enabled:
+                coordinates, neighbors, weights = get_interpolation_plan(
+                    gene_adata.obs.iloc[indices][['x', 'y']].to_numpy(dtype=np.float32),
+                    coordinates,
+                )
+                self.interpolation_plans[name] = {
+                    'coords': coordinates,
+                    'indices': indices[neighbors],
+                    'weights': weights,
+                }
 
         self.dataset_cfg = cfg.experiment.dataset
         self.augment_cfg = cfg.experiment.augment
@@ -261,6 +280,10 @@ class SegmentationDataset(Dataset):
         #     "spots": (k, 2),                    # float32，以下三项仅用于蒸馏
         #     "gene_expression": (k, G),          # float32
         #     "spot_labels": (k,),                # int64
+        #     'interpolation_spots': (q, 2),       # float32, 以下字段只在插值开启时返回
+        #     'interpolation_expression': (p, G),  # float32, 伪 spot 的实测父节点
+        #     'interpolation_neighbors': (q, 4),   # int64, 当前父节点列表中的索引
+        #     'interpolation_weights': (q, 4),     # float32, 边中点 1/2, 方格中心 1/4
         # }
         rng = np.random.default_rng(
             np.random.SeedSequence([self.seed, self.epoch, index])
@@ -333,16 +356,36 @@ class SegmentationDataset(Dataset):
         local = spot_data["coords"] - np.array([left, top], dtype=np.float32)
         keep = ((local >= radius) & (local <= self.crop_size - 1 - radius)).all(axis=1)
         indices = torch.from_numpy(spot_data["indices"][keep])
-        return {
+        targets = {
             "spots": torch.from_numpy(local[keep].astype(np.float32)),
             "gene_expression": self.gene_expression[indices],
             "spot_labels": self.spot_labels[indices],
         }
+        if self.interpolation_enabled:
+            plan = self.interpolation_plans[name]
+            local = plan['coords'] - np.array([left, top], dtype=np.float32)
+            keep = ((local >= radius) & (local <= self.crop_size - 1 - radius)).all(axis=1)
+            selected = np.flatnonzero(keep)
+            tissue_coords = np.floor(plan['coords'][selected] / self.label_scale).astype(np.int64)
+            tissue = self.slide_data[name]['tissue_mask_bl']
+            selected = selected[tissue[tissue_coords[:, 1], tissue_coords[:, 0]]]
+            parent_indices, neighbors = np.unique(plan['indices'][selected], return_inverse=True)
+            targets.update({
+                'interpolation_spots': torch.from_numpy(local[selected].astype(np.float32)),
+                'interpolation_expression': self.gene_expression[torch.from_numpy(parent_indices)],
+                'interpolation_neighbors': torch.from_numpy(neighbors.reshape(-1, 4)),
+                'interpolation_weights': torch.from_numpy(plan['weights'][selected].copy()),
+            })
+        return targets
 
 
 def collate_samples(samples):
     """spot 字段的长度随窗口内完整 spot 数变化，堆不了，保留为逐样本列表；其余按默认规则堆叠。"""
-    variable_keys = {"spots", "gene_expression", "spot_labels"}
+    variable_keys = {
+        "spots", "gene_expression", "spot_labels",
+        'interpolation_spots', 'interpolation_expression',
+        'interpolation_neighbors', 'interpolation_weights',
+    }
     batch = {}
     for key in samples[0]:
         values = [sample[key] for sample in samples]

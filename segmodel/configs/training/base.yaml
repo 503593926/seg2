@@ -20,6 +20,7 @@ image:
     affinity: 0.0
     superpixel: 0.0
     molecular: 0.5
+    interpolation: 0.1  # 冻结 VAE 后验矩匹配插值 + 方差加权蒸馏
     # PFM 解耦：f2 的身份分类与 f1/f2 去相关。四个权重全为 0 时退化成普通多 PFM 路由
     pfm_cls_global: 1.0
     pfm_orth_global: 0.1
