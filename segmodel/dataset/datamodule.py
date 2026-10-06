@@ -39,6 +39,9 @@ class FoldDataModule(pl.LightningDataModule):
         self.train_names = train_names
         self.test_names = test_names
         self.seed = seed
+        # 验证迭代使用独立随机流，避免验证频率改变训练增强的随机序列。
+        self.val_generator = torch.Generator().manual_seed(seed + 10000)
+        self.vae_val_generator = torch.Generator().manual_seed(seed + 20000)
         self.cfg = cfg
         self.project_root = Path(str(cfg.project_root))
         self.data_roots, self.gene_path = fold_paths(
@@ -146,9 +149,12 @@ class FoldDataModule(pl.LightningDataModule):
             SlideDataset(self.val_slides.values()),
             batch_size=None,
             num_workers=0,
+            generator=self.val_generator,
         )
 
-    def _vae_dataloader(self, gene_adata, shuffle):
+    def _vae_dataloader(
+        self, gene_adata, shuffle, generator: torch.Generator | None = None
+    ):
         expression = torch.from_numpy(gene_adata.X)
         spot_labels = torch.from_numpy(
             gene_adata.obs["spot_label"].to_numpy(dtype=np.int64)
@@ -158,13 +164,16 @@ class FoldDataModule(pl.LightningDataModule):
             batch_size=int(self.cfg.experiment.training.vae.pretrain_batch_size),
             shuffle=shuffle,
             num_workers=0,
+            generator=generator,
         )
 
     def vae_dataloader(self):
         return self._vae_dataloader(self.train_gene_adata, shuffle=True)
 
     def vae_val_dataloader(self):
-        return self._vae_dataloader(self.val_gene_adata, shuffle=False)
+        return self._vae_dataloader(
+            self.val_gene_adata, shuffle=False, generator=self.vae_val_generator
+        )
 
     def test_dataloader(self):
         return DataLoader(
