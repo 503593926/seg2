@@ -1,12 +1,13 @@
-"""训练期分子特征正则：冻结无监督基因 VAE，单向约束图像 spot 特征。"""
+"""训练期 MIL 分子正则：逐位置解码表达，在 spot 内聚合后监督，基因 VAE 冻结。"""
 
 import math
 
 import torch
 from torch import nn
+from torch.nn import functional as F
 
 from ..modules import ProjectionHead
-from ..training.losses import distillation_loss, relation_distillation_loss
+from ..training.losses import relation_distillation_loss
 
 
 class Distiller(nn.Module):
@@ -32,13 +33,23 @@ class Distiller(nn.Module):
 
     def losses(self, output, batch, relation_enabled: bool = False):
         image_features = []
+        predicted_expression = []
         expression = []
         slide_ids = []
         spot_ids = []
         for index, spots in enumerate(batch["spots"]):
             if not len(spots):
                 continue
-            image_features.append(self._pool_spots(output["features"][index], spots))
+            instances = self._spot_instances(output["features"][index], spots)
+            image_features.extend(values.mean(dim=0) for values in instances)
+            # 只解码 spot 覆盖的位置，同一 crop 内合并前向，避免逐 spot 调用网络。
+            local_embedding = self.image_projector(torch.cat(instances))
+            # decoder 参数冻结，但保留对输入的梯度；先解码，再聚合表达。
+            local_expression = self.gene_teacher.decoder(local_embedding).float()
+            predicted_expression.extend(
+                values.mean(dim=0)
+                for values in local_expression.split([len(values) for values in instances])
+            )
             expression.append(batch["gene_expression"][index])
             if relation_enabled:
                 ids = batch['spot_ids'][index]
@@ -49,7 +60,7 @@ class Distiller(nn.Module):
             zero = output["features"].sum() * 0
             return {"molecular": zero, 'relation': zero}, {
                 "spots": 0.0,
-                "distillation/gene_to_image": zero.detach(),
+                "distillation/expression_mse": zero.detach(),
                 "distillation/distillation_coverage": 0.0,
                 "distillation/gene_embedding_std": zero.detach(),
                 "distillation/image_embedding_std": zero.detach(),
@@ -57,14 +68,14 @@ class Distiller(nn.Module):
                 'distillation/relation_slides': 0.0,
             }
 
-        image_embedding = self.image_projector(torch.cat(image_features))
+        # 保留 relation 原来的定义：先池化图像特征，再投影到基因潜空间。
+        image_embedding = self.image_projector(torch.stack(image_features))
+        target_expression = torch.cat(expression).float()
         with torch.no_grad():
-            gene_embedding = self.gene_teacher.embedding(torch.cat(expression))
+            gene_embedding = self.gene_teacher.embedding(target_expression)
 
-        molecular = distillation_loss(
-            image_embedding.float(),
-            gene_embedding.float(),
-            torch.ones(gene_embedding.shape[0], device=gene_embedding.device),
+        molecular = F.mse_loss(
+            torch.stack(predicted_expression), target_expression,
         )
         relation = image_embedding.sum() * 0
         pair_count, slide_count = 0, 0
@@ -77,7 +88,7 @@ class Distiller(nn.Module):
             )
         diagnostics = {
             "spots": float(len(gene_embedding)),
-            "distillation/gene_to_image": molecular.detach(),
+            "distillation/expression_mse": molecular.detach(),
             "distillation/distillation_coverage": 1.0,
             "distillation/gene_embedding_std": gene_embedding.float().std(
                 dim=0, unbiased=False
@@ -90,11 +101,10 @@ class Distiller(nn.Module):
         }
         return {"molecular": molecular, 'relation': relation}, diagnostics
 
-    def _pool_spots(self, features, coordinates):
-        """按 spot 圆盘均值池化，坐标与半径按 label_scale 换算到特征网格。"""
-        channels = features.shape[0]
+    def _spot_instances(self, features, coordinates):
+        """提取各 spot 圆盘内的 (位置数, 通道数) 特征，几何量换算到特征网格。"""
         radius = self.spot_radius_px / self.label_scale
-        pooled = []
+        instances = []
         for center in coordinates:
             center_x = float(center[0]) / self.label_scale
             center_y = float(center[1]) / self.label_scale
@@ -106,7 +116,7 @@ class Distiller(nn.Module):
             columns = torch.arange(left, right, device=features.device)[None, :]
             disk = (columns - center_x).square() + (rows - center_y).square() <= radius**2
             values = features[:, top:bottom, left:right].float()[:, disk]
-            pooled.append(values.mean(dim=1))
-        if not pooled:
-            return features.new_empty((0, channels))
-        return torch.stack(pooled)
+            if not values.shape[1]:
+                raise ValueError("Spot has no feature-grid positions inside its disk")
+            instances.append(values.transpose(0, 1))
+        return instances
