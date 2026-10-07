@@ -29,10 +29,10 @@ def _blend(image, selected, color, alpha=0.45):
     ).astype(np.uint8)
 
 
-def _pseudo_mask_overlay(image_bgr, pseudo_mask):
+def _pseudo_mask_overlay(image_bgr, pseudo_mask_uint8):
     overlay = image_bgr.copy()
-    _blend(overlay, pseudo_mask == 0, (255, 0, 0))
-    _blend(overlay, pseudo_mask == 1, (0, 0, 255))
+    _blend(overlay, pseudo_mask_uint8 == 0, (255, 0, 0))
+    _blend(overlay, pseudo_mask_uint8 == 1, (0, 0, 255))
     return overlay
 
 

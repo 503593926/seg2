@@ -21,36 +21,21 @@ def get_folds(cfg: DictConfig) -> list[dict]:
         folds.append(
             {"train": list(dataset_cfg.ref_names), "test": list(dataset_cfg.tgt_names)}
         )
-    else:
-        raise ValueError(f"Unsupported split mode: {split_mode}")
     return folds
 
 
-def fold_output_dir(run_output_dir, fold, fold_index, seed):
-    test_id = "-".join(fold["test"])
-    return (
-        Path(run_output_dir)
-        / f"seed_{seed}"
-        / f"fold_{fold_index:02d}_test_{test_id}"
-    )
-
-
-def experiment(
-    fold: dict,
-    fold_index: int,
-    seed: int,
-    cfg: DictConfig,
-    run_output_dir: Path,
-) -> None:
-    output_dir = fold_output_dir(run_output_dir, fold, fold_index, seed)
-    run_fold(fold["train"], fold["test"], seed, cfg, output_dir)
-
-
 def run(cfg: DictConfig, run_output_dir: Path) -> None:
+    # 固定先遍历 seed, 再按配置中的切片顺序遍历 fold。
     folds = get_folds(cfg)
     for seed in cfg.seeds:
         for fold_index, fold in enumerate(folds):
-            experiment(fold, fold_index, seed, cfg, run_output_dir)
+            test_id = "-".join(fold["test"])
+            output_dir = (
+                Path(run_output_dir)
+                / f"seed_{seed}"
+                / f"fold_{fold_index:02d}_test_{test_id}"
+            )
+            run_fold(fold["train"], fold["test"], seed, cfg, output_dir)
 
 
 @hydra.main(version_base="1.3", config_path="configs", config_name="config")

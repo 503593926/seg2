@@ -6,15 +6,15 @@ import pytorch_lightning as pl
 
 from tools.propagate_random_walker import build_random_walker_topology
 
-from ..inference.predictor import predict_slide
-from .propagation import (
+from segmodel.dynamic.propagation import (
     build_pseudo_mask,
     label_change_stats,
     propagate_features,
     snap_spots,
     weighted_features,
 )
-from .visualization import save_dynamic_result
+from segmodel.dynamic.visualization import save_dynamic_result
+from segmodel.inference.predictor import predict_slide
 
 
 class DynamicPropagationCallback(pl.Callback):
@@ -74,8 +74,8 @@ class DynamicPropagationCallback(pl.Callback):
         )
 
     def _update_slide(self, dataset, name, model, device, resolution, epoch):
+        # 当前普通模型整片推理, 获取传播特征。
         slide = dataset.slides[name]
-        slide_data = dataset.slide_data[name]
         model_probability, learned = predict_slide(
             model,
             slide,
@@ -86,7 +86,7 @@ class DynamicPropagationCallback(pl.Callback):
             batch_size=self.tiling["batch_size"],
         )
 
-        tissue = slide_data["tissue_mask_bl"]
+        tissue = slide.tissue_mask_bl
         if learned.shape[:2] != tissue.shape:
             raise ValueError(
                 f"{name}: propagation features {learned.shape[:2]} "
@@ -99,9 +99,10 @@ class DynamicPropagationCallback(pl.Callback):
         )
         from tools.snic_features import prepare_snic_lab, run_snic
 
+        # 按轮次重算超像素, 其余轮次复用拓扑。
         lab = prepare_snic_lab(cv2.cvtColor(image, cv2.COLOR_RGB2BGR))
         recompute_snic = self.rounds % int(self.config.snic_every_rounds) == 0
-        superpixels = slide_data["superpixels"]
+        superpixels = slide.superpixels
         if recompute_snic:
             features = weighted_features(
                 lab,
@@ -129,6 +130,7 @@ class DynamicPropagationCallback(pl.Callback):
         else:
             topology = build_random_walker_topology(superpixels)
 
+        # spot 吸附后作为随机游走种子, 传播结果阈值化为新伪标签。
         spot_data = dataset.spots_by_slide[name]
         labels = dataset.spot_labels.numpy()[spot_data["indices"]]
         label_mpp = float(resolution.label_mpp)
@@ -157,7 +159,7 @@ class DynamicPropagationCallback(pl.Callback):
             float(self.config.cancer_threshold),
         )
         coverage_ratio, flip_fraction = label_change_stats(
-            slide_data["pseudo_mask"],
+            slide.pseudo_mask_uint8,
             mask,
             tissue,
         )
@@ -189,7 +191,7 @@ class DynamicPropagationCallback(pl.Callback):
                 model_probability,
                 probability,
                 mask,
-                slide_data["pseudo_mask"],
+                slide.pseudo_mask_uint8,
                 superpixels,
                 learned,
                 {
@@ -211,6 +213,7 @@ class DynamicPropagationCallback(pl.Callback):
             )
             report["output_dir"] = str(result_dir)
 
+        # 提交有效监督并刷新该切片下一轮可采样窗口。
         dataset.update_supervision(
             name,
             mask,

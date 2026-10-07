@@ -1,5 +1,6 @@
-enabled: true
+enabled: true  # 所有增强的总开关, 包含 spot 引导采样.
 geometry:
+  enabled: true
   rotation_quarter_turns: [0, 1, 2, 3]
   horizontal_flip_probability: 0.5
   vertical_flip_probability: 0.5

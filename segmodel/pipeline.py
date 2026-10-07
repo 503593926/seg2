@@ -6,6 +6,7 @@
 import json
 import math
 from pathlib import Path
+from typing import Any, cast
 
 import cv2
 import numpy as np
@@ -14,20 +15,32 @@ import torch
 from omegaconf import OmegaConf
 from pytorch_lightning.loggers import CSVLogger
 
-from .dataset import FoldDataModule
-from .dynamic import DynamicPropagationCallback
-from .inference.metrics import summarize_metrics
-from .inference.validation import validate_slide
-from .models import Distiller, GeneVAE, SegmentationModel
-from .training.callbacks import DatasetEpochCallback, MetricsBelowRichProgressBar
-from .training.gene_module import GeneVAEModule
-from .training.segmentation_module import SegmentationModule
+from segmodel.dataset.datamodule import FoldDataModule
+from segmodel.dynamic.callback import DynamicPropagationCallback
+from segmodel.inference.metrics import summarize_metrics
+from segmodel.inference.validation import validate_slide
+from segmodel.models.gene_vae import GeneVAE
+from segmodel.models.segmentation import SegmentationModel
+from segmodel.training.callbacks import DatasetEpochCallback, MetricsBelowRichProgressBar
+from segmodel.training.distillation import Distiller
+from segmodel.training.gene_module import GeneVAEModule
+from segmodel.training.segmentation_module import SegmentationModule
 
 
 def run_fold(train_names, test_names, seed, cfg, output_dir):
     """跑完一个 fold/seed，返回整片测试的汇总指标。"""
-    output_dir = _prepare_output(cfg, output_dir, seed, train_names, test_names)
+    # 准备当前 fold 的输出目录和配置。
+    output_dir = Path(output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
+    (output_dir / "vae").mkdir(exist_ok=True)
+    (output_dir / "segmentation").mkdir(exist_ok=True)
+    OmegaConf.save(cfg, output_dir / "config.yaml", resolve=True)
+    _write_json(
+        output_dir / "split.json",
+        {"seed": int(seed), "train": list(train_names), "test": list(test_names)},
+    )
 
+    # 先加载训练与验证数据，再训练基因 VAE。
     pl.seed_everything(seed, workers=True)
 
     data_module = FoldDataModule(train_names, test_names, seed, cfg)
@@ -37,10 +50,12 @@ def run_fold(train_names, test_names, seed, cfg, output_dir):
 
     gene_vae = _pretrain_gene_vae(cfg, data_module, output_dir)
 
+    # 分割阶段重新设种子，保持与 VAE 训练的随机状态独立。
     pl.seed_everything(seed, workers=True)
     module = _train_segmentation(cfg, data_module, gene_vae, tiling, output_dir)
     data_module.teardown("fit")
 
+    # 保存最终图像模型，然后执行整片测试。
     _save_final_model(cfg, module.model, tiling, output_dir)
     return _test_final_model(cfg, data_module, module.model, module.device, tiling, output_dir)
 
@@ -49,7 +64,7 @@ def _resolve_tiling(cfg, data_module):
     """滑窗参数：crop_size 训练与推理共用，stride 取一半，起点须与网格对齐（alignment）。"""
     crop_size = int(cfg.experiment.dataset.crop_size)
     stride = crop_size // 2
-    alignment = data_module.alignment
+    alignment = next(iter(data_module.train_slides.values())).alignment
     if crop_size % alignment or stride % alignment:
         raise ValueError(
             f"crop_size={crop_size} and stride={stride} must be divisible by "
@@ -61,23 +76,6 @@ def _resolve_tiling(cfg, data_module):
         "alignment": alignment,
         "batch_size": int(cfg.experiment.dataset.inference_batch_size),
     }
-
-
-def _prepare_output(cfg, output_dir, seed, train_names, test_names):
-    output_dir = Path(output_dir)
-    output_dir.mkdir(parents=True, exist_ok=True)
-    (output_dir / "vae").mkdir(exist_ok=True)
-    (output_dir / "segmentation").mkdir(exist_ok=True)
-    OmegaConf.save(cfg, output_dir / "config.yaml", resolve=True)
-    _write_json(
-        output_dir / "split.json",
-        {"seed": int(seed), "train": list(train_names), "test": list(test_names)},
-    )
-    return output_dir
-
-
-def _csv_logger(output_dir, stage):
-    return CSVLogger(save_dir=output_dir, name=stage, version="")
 
 
 def _pretrain_gene_vae(cfg, data_module, output_dir):
@@ -106,7 +104,7 @@ def _pretrain_gene_vae(cfg, data_module, output_dir):
             MetricsBelowRichProgressBar(refresh_rate=100, leave=True),
         ],
         enable_progress_bar=True,
-        logger=_csv_logger(output_dir, "vae"),
+        logger=CSVLogger(save_dir=output_dir, name="vae", version=""),
         enable_checkpointing=False,
     )
     trainer.fit(
@@ -118,19 +116,19 @@ def _pretrain_gene_vae(cfg, data_module, output_dir):
 
 
 def _train_segmentation(cfg, data_module, gene_vae, tiling, output_dir):
-    label_scale = data_module.label_scale
+    slide = next(iter(data_module.train_slides.values()))
+    label_scale = slide.label_scale
     model_cfg = cfg.experiment.model.image
     train_cfg = cfg.experiment.training.image
-    slide_data = next(iter(data_module.train_slide_data.values()))
     model = SegmentationModel(
-        pfm_patch_dims=slide_data["patch_dims"],
-        pfm_cls_dims=slide_data["cls_dims"],
-        **OmegaConf.to_container(model_cfg, resolve=True),
+        pfm_patch_dims=slide.patch_dims,
+        pfm_cls_dims=slide.cls_dims,
+        **cast(dict[str, Any], OmegaConf.to_container(model_cfg, resolve=True)),
     )
     distiller = Distiller(
         model,
         gene_vae,
-        spot_radius_px=data_module.spot_radius_px,
+        spot_radius_px=slide.spot_radius_px,
         label_scale=label_scale,
     )
     module = SegmentationModule(
@@ -165,7 +163,7 @@ def _train_segmentation(cfg, data_module, gene_vae, tiling, output_dir):
         check_val_every_n_epoch=int(train_cfg.val_every_n_epochs),
         default_root_dir=output_dir / "segmentation",
         callbacks=callbacks,
-        logger=_csv_logger(output_dir, "segmentation"),
+        logger=CSVLogger(save_dir=output_dir, name="segmentation", version=""),
         enable_checkpointing=False,
         num_sanity_val_steps=0,
         gradient_clip_val=1.0,
@@ -177,7 +175,10 @@ def _train_segmentation(cfg, data_module, gene_vae, tiling, output_dir):
 
 def _save_final_model(cfg, model, tiling, output_dir):
     """保存权重与重建所需信息，让 checkpoint 自描述（供外部单跑推理）。"""
-    model_config = OmegaConf.to_container(cfg.experiment.model.image, resolve=True)
+    model_config = cast(
+        dict[str, Any],
+        OmegaConf.to_container(cfg.experiment.model.image, resolve=True),
+    )
     model_config["pfm_patch_dims"] = list(model.pfm_patch_dims)
     model_config["pfm_cls_dims"] = list(model.pfm_cls_dims)
     artifact = {

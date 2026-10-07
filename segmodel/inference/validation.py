@@ -3,9 +3,9 @@ from pathlib import Path
 import cv2
 import numpy as np
 
-from ..dataset.slide import read_image
-from .metrics import segmentation_metrics
-from .predictor import predict_slide
+from segmodel.dataset.loading import read_image
+from segmodel.inference.metrics import segmentation_metrics
+from segmodel.inference.predictor import predict_slide
 
 
 def load_expert_masks(root, slide):

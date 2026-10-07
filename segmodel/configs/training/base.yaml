@@ -20,7 +20,7 @@ image:
     affinity: 0.0
     superpixel: 0.0
     molecular: 0.5
-    relation: 0.0  # 整个 batch 的 spot 余弦相似度关系蒸馏, 设为 0 可关闭
+    relation: 0.0  # crop 内 spot 余弦相似度关系蒸馏, 有效 crop 等权平均, 设为 0 可关闭
     # PFM 解耦：f2 的身份分类与 f1/f2 去相关。四个权重全为 0 时退化成普通多 PFM 路由
     pfm_cls_global: 1.0
     pfm_orth_global: 0.1

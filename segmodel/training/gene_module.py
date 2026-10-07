@@ -1,7 +1,7 @@
 import pytorch_lightning as pl
 import torch
 
-from .losses import get_gene_losses
+from segmodel.training.losses import get_gene_losses
 
 
 class GeneVAEModule(pl.LightningModule):

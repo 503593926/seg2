@@ -1,7 +1,7 @@
 import torch
 from torch import nn
 
-from ..modules import GeneDecoder, GeneEncoder
+from segmodel.modules.vae import GeneDecoder, GeneEncoder
 
 
 class GeneVAE(nn.Module):

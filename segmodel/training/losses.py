@@ -20,14 +20,14 @@ def distillation_loss(embedding, target_embedding, weights):
 def relation_distillation_loss(
     embedding: torch.Tensor,
     target_embedding: torch.Tensor,
-    slide_ids: torch.Tensor,
+    crop_ids: torch.Tensor,
     spot_ids: torch.Tensor,
 ) -> tuple[torch.Tensor, int, int]:
     with torch.autocast(device_type=embedding.device.type, enabled=False):
         embedding = embedding.float()
         target_embedding = target_embedding.detach().float()
-        # 切片 ID 只用于区分 spot 身份, 不限制配对范围.
-        identities = torch.stack((slide_ids, spot_ids), dim=1)
+        # 同一 spot 在不同 crop 中保留各自视图, 只合并 crop 内重复项.
+        identities = torch.stack((crop_ids, spot_ids), dim=1)
         unique_ids, inverse, counts = torch.unique(
             identities, dim=0, return_inverse=True, return_counts=True,
         )
@@ -35,18 +35,30 @@ def relation_distillation_loss(
         if size < 2:
             return embedding.sum() * 0, 0, 0
 
-        # 同一个 spot 在重叠 crop 中有多个视图, 先合并再构造关系.
         image = embedding.new_zeros((size, embedding.shape[1]))
         gene = target_embedding.new_zeros((size, target_embedding.shape[1]))
         image = image.index_add(0, inverse, embedding) / counts[:, None]
         gene = gene.index_add(0, inverse, target_embedding) / counts[:, None]
         image = F.normalize(image, dim=1, eps=1e-8)
         gene = F.normalize(gene, dim=1, eps=1e-8)
-        image_similarity = image @ image.transpose(0, 1)
-        gene_similarity = gene @ gene.transpose(0, 1)
-        rows, columns = torch.triu_indices(size, size, offset=1, device=image.device)
-        loss = (image_similarity[rows, columns] - gene_similarity[rows, columns]).square().mean()
-        return loss, rows.numel(), torch.unique(unique_ids[:, 0]).numel()
+        loss = image.sum() * 0
+        pair_count, crop_count = 0, 0
+        for crop_id in torch.unique(unique_ids[:, 0]):
+            keep = unique_ids[:, 0] == crop_id
+            crop_image, crop_gene = image[keep], gene[keep]
+            size = crop_image.shape[0]
+            if size < 2:
+                continue
+            image_similarity = crop_image @ crop_image.transpose(0, 1)
+            gene_similarity = crop_gene @ crop_gene.transpose(0, 1)
+            rows, columns = torch.triu_indices(size, size, offset=1, device=image.device)
+            loss = loss + (
+                image_similarity[rows, columns] - gene_similarity[rows, columns]
+            ).square().mean()
+            pair_count += rows.numel()
+            crop_count += 1
+        # 每个有效 crop 等权, 避免 spot 多的 crop 主导监督.
+        return loss / max(crop_count, 1), pair_count, crop_count
 
 
 def _masked_mean(values, weights):

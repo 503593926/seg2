@@ -2,11 +2,8 @@ import torch
 from torch import nn
 from torch.nn import functional as F
 
-from ..modules import (
-    PFMDecomposer,
-    Stem,
-)
-from ..modules.segmentation import ConvNeXtUnet
+from segmodel.modules.backbone import ConvNeXtUnet, Stem
+from segmodel.modules.conditioning import PFMDecomposer
 
 def _mask_pfm_features(mask, *feature_groups):
     """把被屏蔽 PFM 的 f1/f2 清零，返回与输入同结构的元组。
@@ -83,7 +80,7 @@ class SegmentationModel(nn.Module):
         self.spatial_classifier = nn.Linear(spatial_dim, self.pfm_count)
 
     def forward(self, image, patch, cls, available=None):
-
+        # PFM 分成任务特征 f1 和身份特征 f2, 屏蔽同时作用于两者。
         task_global, identity_global = self.global_decomposer(
             [value.float().mean(dim=(-2, -1)) for value in cls]
         )
@@ -92,16 +89,18 @@ class SegmentationModel(nn.Module):
         )
         if available is not None:
             task_global, identity_global, task_spatial, identity_spatial = _mask_pfm_features(
-                available, task_global, identity_global, task_spatial,identity_spatial
+                available, task_global, identity_global, task_spatial, identity_spatial
             )
 
         if image.dtype == torch.uint8:
             image = image.float().mul_(2.0 / 255.0).sub_(1.0)
 
+        # H&E 经条件 U-Net 解码, 输出位于标签网格。
         routing = []
         decoded_fm = self.unet(self.stem(image), task_global, task_spatial, available, routing)
 
 
+        # 分割、邻接、动态传播和 PFM 解耦共用本次前向结果。
         propagation = self.propagation(decoded_fm)
         return {
             "logits": self.segmentation_head(propagation),

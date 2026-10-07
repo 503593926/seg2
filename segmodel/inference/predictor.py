@@ -72,7 +72,7 @@ def predict_slide(
         for start in range(0, len(origins), batch_size):
             batch_origins = origins[start : start + batch_size]
             batch_inputs = [
-                slide.inputs(top, left, crop_size, alignment)
+                slide.inputs(top, left, crop_size)
                 for top, left in batch_origins
             ]
             output = model(
@@ -134,14 +134,12 @@ def predict_slide(
     finally:
         model.train(was_training)
 
-    def to_1mpp(grid):
-        return cv2.resize(
-            grid / np.maximum(probability_weight, 1e-6),
-            (width, height),
-            interpolation=cv2.INTER_LINEAR,
-        )
-
     features = None
     if return_features:
         features = feature_sum / np.maximum(feature_weight[..., None], 1e-6)
-    return to_1mpp(probability_sum), features
+    probability = cv2.resize(
+        probability_sum / np.maximum(probability_weight, 1e-6),
+        (width, height),
+        interpolation=cv2.INTER_LINEAR,
+    )
+    return probability, features

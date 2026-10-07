@@ -1,12 +1,36 @@
 import json
 from pathlib import Path
+from typing import cast
 
 import anndata as ad
 import cv2
 import numpy as np
 import scipy.sparse as sp
 
-from .slide import Slide, read_image
+from segmodel.dataset.slide import Slide, TrainingSlide
+
+
+def read_image(path, flag) -> np.ndarray:
+    image = cv2.imread(str(path), flag)
+    if image is None:
+        raise FileNotFoundError(path)
+    return np.asarray(image)
+
+
+def read_slide_inputs(image_path, feature_dirs, cls_scale):
+    """读取训练和推理共用的图像、patch 特征与 CLS 特征。"""
+    image = np.asarray(
+        cv2.cvtColor(read_image(image_path, cv2.IMREAD_COLOR), cv2.COLOR_BGR2RGB),
+        dtype=np.uint8,
+    )
+    patch_maps = tuple(
+        np.load(directory / "patch_map.npy", mmap_mode='r') for directory in feature_dirs
+    )
+    cls_maps = tuple(
+        _pad_cls_map(np.load(directory / "cls_map.npy", mmap_mode='r'), image.shape, cls_scale)
+        for directory in feature_dirs
+    )
+    return image, patch_maps, cls_maps
 
 
 def fold_paths(project_root, dataset_cfg, test_names):
@@ -40,71 +64,50 @@ def load_gene_adata(path, train_names):
 
     expression = gene_adata.X
     if sp.issparse(expression):
-        expression = expression.astype(np.float32, copy=False).toarray()
+        sparse_expression = cast(sp.csr_matrix | sp.csc_matrix, expression)
+        expression = sparse_expression.astype(np.float32, copy=False).toarray()
     else:
         expression = np.asarray(expression, dtype=np.float32)
     gene_adata.X = expression
     return gene_adata
 
 
-def feature_dirs(root, feature_maps, name):
-    """一个切片在各 PFM 下的特征目录。"""
-    return [root / str(feature_map) / name for feature_map in feature_maps]
-
-
 def load_feature_scales(root, feature_maps, resolution_cfg):
-    """各 PFM 的 patch / cls 步长（目标分辨率像素数）。
-
-    各 PFM 的 patch 步长由各自 ViT 的 patch size 决定，可能不同；混用不同网格
-    会破坏取窗对齐，所以在入口处要求它们落在同一张网格上。
-    """
     target_mpp = float(resolution_cfg.target_mpp)
     scales = set()
     for feature_map in feature_maps:
-        metadata = json.loads(
-            (root / str(feature_map) / "metadata.json").read_text(encoding="utf-8")
-        )
-        scales.add(
-            (
-                round(float(metadata["patch_mpp"]) / target_mpp),
-                round(float(metadata["cls_mpp"]) / target_mpp),
-            )
-        )
+        metadata = json.loads((root / str(feature_map) / "metadata.json").read_text(encoding="utf-8"))
+        patch_scale = round(float(metadata["patch_mpp"]) / target_mpp)
+        cls_scale = round(float(metadata["cls_mpp"]) / target_mpp)
+        scales.add((patch_scale, cls_scale))
     if len(scales) != 1:
         raise ValueError(f"PFM feature maps must share one grid, got {sorted(scales)}")
     return scales.pop()
 
 
-def _training_feature_maps(dataset_cfg):
-    feature_maps = list(dataset_cfg.image_feature_maps)
-    if not feature_maps:
-        raise ValueError("image_feature_maps must not be empty")
-    return feature_maps
-
-
-def load_training_slides(roots, names, dataset_cfg, resolution_cfg):
+def load_training_slides(roots, names, dataset_cfg, resolution_cfg) -> dict[str, TrainingSlide]:
 
     target_mpp = float(resolution_cfg.target_mpp)
     label_scale = round(float(resolution_cfg.label_mpp) / target_mpp)
-    feature_maps = _training_feature_maps(dataset_cfg)
-    slide_data = {}
+    spot_radius_px = float(dataset_cfg.spot_diameter_um) / (2.0 * target_mpp)
+    feature_maps = list(dataset_cfg.image_feature_maps)
+    slides = {}
     for name in names:
         root = Path(roots[name])
 
-        patch_scale, cls_scale = load_feature_scales(
+        _, cls_scale = load_feature_scales(
             root, feature_maps, resolution_cfg
         )
 
-        slide = Slide.from_disk(
-            name,
+        image, patch_maps, cls_maps = read_slide_inputs(
             root / "samples" / name / f"spatial/he_{target_mpp:g}mpp.png",
-            feature_dirs(root, feature_maps, name),
+            [root / str(feature_map) / name for feature_map in feature_maps],
             cls_scale,
         )
 
         label_dir = root / "label_mpp" / name
         pseudo_dir = label_dir / str(dataset_cfg.pseudo_label_dir)
-        pseudo_mask = read_image(
+        pseudo_mask_uint8 = read_image(
             pseudo_dir / "pseudo_mask.png",
             cv2.IMREAD_GRAYSCALE,
         )
@@ -118,55 +121,39 @@ def load_training_slides(roots, names, dataset_cfg, resolution_cfg):
         )
         superpixels = np.load(label_dir / "snic/superpixels.npy").astype(np.int32)
 
-        for source, scale, arrays in (
-            (
-                "supervision",
-                label_scale,
-                (pseudo_mask, cancer_probability, tissue_mask, superpixels),
-            ),
-            ("patch map", patch_scale, slide.patch_maps),
-            ("cls map", cls_scale, slide.cls_maps),
-        ):
-            expected_shape = (slide.height // scale, slide.width // scale)
-            if any(value.shape[:2] != expected_shape for value in arrays):
-                raise ValueError(
-                    f"{name}: {source} does not match the "
-                    f"{scale}px grid {expected_shape}"
-                )
-
-        slide_data[name] = {
-            "image": slide.image,  # uint8
-            "patch_map": slide.patch_maps,  # 各 PFM 的 float16 特征图
-            "cls_map": slide.cls_maps,  # 各 PFM 的 float16 CLS 网格
-            "patch_dims": slide.patch_dims,
-            "cls_dims": slide.cls_dims,
-            "patch_scale": patch_scale,
-            "cls_scale": cls_scale,
-            "pseudo_mask": pseudo_mask,  # uint8
-            "cancer_probability": cancer_probability.astype(np.float32)
-            / 65535.0,  # float32
-            "superpixels": superpixels,  # int32
-            "tissue_mask_bl": tissue_mask > 0,  # bool
-        }
-    return slide_data
+        slides[name] = TrainingSlide(
+            name=name,
+            image=image,
+            patch_maps=patch_maps,
+            cls_maps=cls_maps,
+            cls_scale=cls_scale,
+            label_scale=label_scale,
+            spot_radius_px=spot_radius_px,
+            pseudo_mask_uint8=pseudo_mask_uint8,
+            cancer_probability=cancer_probability.astype(np.float32) / 65535.0,
+            superpixels=superpixels,
+            tissue_mask_bl=tissue_mask > 0,
+        )
+    return slides
 
 
-def load_inference_slides(roots, names, dataset_cfg, resolution_cfg):
+def load_inference_slides(roots, names, dataset_cfg, resolution_cfg) -> dict[str, Slide]:
     """只读取 test/predict 所需的图像和离线特征。"""
     target_mpp = float(resolution_cfg.target_mpp)
-    feature_maps = _training_feature_maps(dataset_cfg)
+    label_scale = round(float(resolution_cfg.label_mpp) / target_mpp)
+    feature_maps = list(dataset_cfg.image_feature_maps)
     slides = {}
     for name in names:
         root = Path(roots[name])
         patch_scale, cls_scale = load_feature_scales(
             root, feature_maps, resolution_cfg
         )
-        slide = Slide.from_disk(
-            name,
+        image, patch_maps, cls_maps = read_slide_inputs(
             root / "samples" / name / f"spatial/he_{target_mpp:g}mpp.png",
-            feature_dirs(root, feature_maps, name),
+            [root / str(feature_map) / name for feature_map in feature_maps],
             cls_scale,
         )
+        slide = Slide(name, image, patch_maps, cls_maps, cls_scale, label_scale)
         if slide.patch_scale != (patch_scale, patch_scale):
             raise ValueError(
                 f"{name}: loaded patch scale {slide.patch_scale} does not match "
@@ -174,3 +161,13 @@ def load_inference_slides(roots, names, dataset_cfg, resolution_cfg):
             )
         slides[name] = slide
     return slides
+
+
+def _pad_cls_map(cls_map, image_shape, cls_scale):
+    padding_rows = image_shape[0] // cls_scale - cls_map.shape[0]
+    padding_columns = image_shape[1] // cls_scale - cls_map.shape[1]
+    return np.pad(
+        cls_map,
+        ((0, padding_rows), (0, padding_columns), (0, 0)),
+        mode="edge",
+    )

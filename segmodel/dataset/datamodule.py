@@ -1,30 +1,19 @@
-from math import lcm
 from pathlib import Path
 
 import numpy as np
 import pytorch_lightning as pl
 import torch
 from omegaconf import DictConfig
-from torch.utils.data import DataLoader, Dataset, TensorDataset
+from torch.utils.data import DataLoader, TensorDataset
 
-from .loading import (
+from segmodel.dataset.loading import (
     fold_paths,
     load_gene_adata,
     load_inference_slides,
     load_training_slides,
 )
-from .segmentation import SegmentationDataset, collate_samples
-
-
-class SlideDataset(Dataset):
-    def __init__(self, slides):
-        self.slides = list(slides)
-
-    def __len__(self):
-        return len(self.slides)
-
-    def __getitem__(self, index):
-        return self.slides[index]
+from segmodel.dataset.segmentation import SegmentationDataset, collate_samples
+from segmodel.dataset.slide import SlideDataset
 
 
 class FoldDataModule(pl.LightningDataModule):
@@ -39,9 +28,6 @@ class FoldDataModule(pl.LightningDataModule):
         self.train_names = train_names
         self.test_names = test_names
         self.seed = seed
-        # 验证迭代使用独立随机流，避免验证频率改变训练增强的随机序列。
-        self.val_generator = torch.Generator().manual_seed(seed + 10000)
-        self.vae_val_generator = torch.Generator().manual_seed(seed + 20000)
         self.cfg = cfg
         self.project_root = Path(str(cfg.project_root))
         self.data_roots, self.gene_path = fold_paths(
@@ -49,43 +35,31 @@ class FoldDataModule(pl.LightningDataModule):
             cfg.experiment.dataset,
             test_names,
         )
-        self.train_slide_data = None
+        self.train_slides = None
         self.train_gene_adata = None
         self.train_dataset = None
 
+        self.val_generator = torch.Generator().manual_seed(seed + 10000)
+        self.vae_val_generator = torch.Generator().manual_seed(seed + 20000)
         self.val_gene_adata = None
         self.val_slides = None
 
         self.test_slides = None
         self.predict_slides = None
 
-    def _prepare_geometry(self):
-        """派生网格几何量，整个训练过程只在这里算一次。
-
-        训练切片同源，取第一张的 patch 步长即可。label_scale 是分辨率换算，
-        alignment 取监督网格与特征网格的最小公倍数——取窗起点必须同时落在两张网格上，
-        数据集（候选窗口步长）与推理滑窗都取这一份。
-        """
-        self.patch_scale = next(iter(self.train_slide_data.values()))["patch_scale"]
-        target_mpp = float(self.cfg.resolution.target_mpp)
-        self.spot_radius_px = (
-            float(self.cfg.experiment.dataset.spot_diameter_um) / (2.0 * target_mpp)
-        )
-        self.label_scale = round(
-            float(self.cfg.resolution.label_mpp) / target_mpp
-        )
-        self.alignment = lcm(self.label_scale, self.patch_scale)
-
     def setup(self, stage=None):
         dataset_cfg = self.cfg.experiment.dataset
+        # fit 同时准备训练 crop、VAE 表达矩阵和留出切片的整片验证输入。
         if stage in (None, "fit") and self.train_dataset is None:
-            self.train_slide_data = load_training_slides(
+            self.train_slides = load_training_slides(
                 self.data_roots,
                 self.train_names,
                 dataset_cfg,
                 self.cfg.resolution,
             )
+
             self.train_gene_adata = load_gene_adata(self.gene_path, self.train_names)
+
             self.val_gene_adata = load_gene_adata(self.gene_path, self.test_names)
             self.val_slides = load_inference_slides(
                 self.data_roots,
@@ -93,15 +67,12 @@ class FoldDataModule(pl.LightningDataModule):
                 dataset_cfg,
                 self.cfg.resolution,
             )
-            self._prepare_geometry()
+
             self.train_dataset = SegmentationDataset(
-                self.train_slide_data,
+                self.train_slides,
                 self.train_gene_adata,
                 self.train_names,
                 self.cfg,
-                label_scale=self.label_scale,
-                alignment=self.alignment,
-                spot_radius_px=self.spot_radius_px,
                 seed=self.seed,
             )
 
@@ -124,7 +95,7 @@ class FoldDataModule(pl.LightningDataModule):
     def teardown(self, stage=None):
         """释放当前 stage 的整片数组，避免切换阶段后同时占用内存。"""
         if stage in (None, "fit"):
-            self.train_slide_data = None
+            self.train_slides = None
             self.train_gene_adata = None
             self.val_gene_adata = None
             self.train_dataset = None
@@ -135,6 +106,7 @@ class FoldDataModule(pl.LightningDataModule):
             self.predict_slides = None
 
     def train_dataloader(self):
+        assert self.train_dataset is not None, "Call setup('fit') before train_dataloader()"
         return DataLoader(
             self.train_dataset,
             batch_size=int(self.cfg.experiment.training.image.batch_size),
@@ -145,6 +117,7 @@ class FoldDataModule(pl.LightningDataModule):
         )
 
     def val_dataloader(self):
+        assert self.val_slides is not None, "Call setup('fit') before val_dataloader()"
         return DataLoader(
             SlideDataset(self.val_slides.values()),
             batch_size=None,
@@ -176,6 +149,7 @@ class FoldDataModule(pl.LightningDataModule):
         )
 
     def test_dataloader(self):
+        assert self.test_slides is not None, "Call setup('test') before test_dataloader()"
         return DataLoader(
             SlideDataset(self.test_slides.values()),
             batch_size=None,
@@ -183,6 +157,7 @@ class FoldDataModule(pl.LightningDataModule):
         )
 
     def predict_dataloader(self):
+        assert self.predict_slides is not None, "Call setup('predict') before predict_dataloader()"
         return DataLoader(
             SlideDataset(self.predict_slides.values()),
             batch_size=None,
