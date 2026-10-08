@@ -5,6 +5,19 @@ from torch import nn
 from segmodel.modules.blocks import LayerNorm
 from segmodel.modules.conditioning import ConditionalNorm, JointRouter, SpatialRouter
 
+
+def init_convnext_backbone(module):
+    """只重置图像骨干, 保留条件调制头和路由器的初始化。"""
+    if isinstance(module, (ConditionalNorm, JointRouter, SpatialRouter)):
+        return
+    if isinstance(module, (nn.Conv2d, nn.ConvTranspose2d, nn.Linear)):
+        nn.init.trunc_normal_(module.weight, std=0.02)
+        if module.bias is not None:
+            nn.init.zeros_(module.bias)
+    for child in module.children():
+        init_convnext_backbone(child)
+
+
 class ConvNeXtUnet(nn.Module):
     def __init__(
         self,

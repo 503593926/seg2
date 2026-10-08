@@ -27,8 +27,8 @@ def get_folds(cfg: DictConfig) -> list[dict]:
 def run(cfg: DictConfig, run_output_dir: Path) -> None:
     # 固定先遍历 seed, 再按配置中的切片顺序遍历 fold。
     folds = get_folds(cfg)
-    for seed in cfg.seeds:
-        for fold_index, fold in enumerate(folds):
+    for fold_index, fold in enumerate(folds):
+        for seed in cfg.seeds:
             test_id = "-".join(fold["test"])
             output_dir = (
                 Path(run_output_dir)

@@ -2,7 +2,7 @@ import torch
 from torch import nn
 from torch.nn import functional as F
 
-from segmodel.modules.backbone import ConvNeXtUnet, Stem
+from segmodel.modules.backbone import ConvNeXtUnet, Stem, init_convnext_backbone
 from segmodel.modules.conditioning import PFMDecomposer
 
 def _mask_pfm_features(mask, *feature_groups):
@@ -36,8 +36,11 @@ class SegmentationModel(nn.Module):
         spatial_dim=32,
         skip_drop_path=0.1,
         drop_path=(0.1, 0.1, 0.1),
+        backbone_init="pytorch",
     ):
         super().__init__()
+        if backbone_init not in ("pytorch", "convnext"):
+            raise ValueError(f"Unknown backbone_init: {backbone_init!r}; use 'pytorch' or 'convnext'")
         self.pfm_patch_dims = tuple(pfm_patch_dims)
         self.pfm_cls_dims = tuple(pfm_cls_dims)
         self.pfm_count = len(self.pfm_patch_dims)
@@ -78,6 +81,13 @@ class SegmentationModel(nn.Module):
         )
         self.global_classifier = nn.Linear(global_dim, self.pfm_count)
         self.spatial_classifier = nn.Linear(spatial_dim, self.pfm_count)
+
+        if backbone_init == "convnext":
+            # 先完成原初始化, 再局部重置; 保持其他分支、后续投影头和训练 RNG 不变。
+            # 模型在 CPU 构建, 这里只隔离 CPU 随机数状态。
+            with torch.random.fork_rng(devices=[]):
+                init_convnext_backbone(self.stem)
+                init_convnext_backbone(self.unet)
 
     def forward(self, image, patch, cls, available=None):
         # PFM 分成任务特征 f1 和身份特征 f2, 屏蔽同时作用于两者。

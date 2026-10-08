@@ -123,11 +123,36 @@ python -m segmodel.main
 python -m segmodel.main experiment=her2st seeds='[0]'
 ```
 
-配置仍由 `configs/config.yaml` 组合, 实验参数位于 `cfg.experiment` 下。公共分辨率配置读取项目根的 `config/resolution.yaml`。数据、模型、训练、增强和动态传播的 YAML 均保持原值。
+配置由 `configs/config.yaml` 组合, 实验参数位于 `cfg.experiment` 下。公共分辨率配置读取项目根的 `config/resolution.yaml`。
 
 每个 fold 仍保存 `config.yaml`、`split.json`、`vae/`、`segmentation/`、`final_model.pt`、`test/<slide>/` 和 `metrics.json`; 启用相应流程时还写入 `validation/` 与 `dynamic_pseudo_labels/`。
 
-## 本次重构的等价性边界
+## 图像骨干初始化
+
+当前 YAML 设置 `experiment.model.image.backbone_init=convnext`:
+Stem、编码器和解码器的普通 Conv2d、ConvTranspose2d 和 Linear 权重使用
+`torch.nn.init.trunc_normal_(std=0.02)`, bias 为零。
+转置卷积使用相同策略是本项目对解码器的扩展。
+条件调制头保留全零初始化, 路由器、PFM 解耦层、输出头、Gene VAE 和蒸馏投影头
+保留原初始化。LayerNorm 保持 weight=1、bias=0, 残差 gamma 保持 0.01。
+
+局部重置在模型构建完成后执行, 并隔离 CPU RNG, 因此同一 seed 下其他分支、
+后续投影头的初始权重和训练随机数状态不随此开关变化。
+构造函数默认值仍为 `pytorch`, 兼容缺少此字段的旧模型配置;
+训练保存的模型配置会包含本次选择。
+
+```bash
+# 当前配置: ConvNeXt 风格的局部初始化
+python -m segmodel.main
+# 对照实验: 恢复原始初始化, 其余实验配置保持一致
+python -m segmodel.main experiment.model.image.backbone_init=pytorch
+# 验证局部初始化、随机状态、前反向与权重读写
+python -m unittest discover -s tests -p 'test_model_initialization.py' -v
+```
+
+此开关只选择初始化方式; 复现 main 还需对齐 seed、切片顺序和验证等训练设置。
+
+## 之前重构的等价性记录
 
 - 重构基线是开始操作时的工作区代码, 包含原先尚未提交的修改。
 - 保留参数名称和注册顺序、初始化顺序、随机数调用、损失求和顺序、优化器分组、学习率、EMA、数据加载与增强顺序。

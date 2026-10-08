@@ -1,4 +1,5 @@
 ﻿image:
+  backbone_init: convnext  # convnext: 骨干截断正态 std=0.02; pytorch: 原初始化
   propagation_channels: 32
   spatial_pool: 8
   top_k: 2

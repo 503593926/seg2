@@ -4,7 +4,7 @@ defaults:
   - experiment: her2st
 
 experiment_name: ${hydra:runtime.choices.experiment}
-seeds: [2]
+seeds: [0, 2027, 3407]
 
 project_root: /home/yfm/works/seg2
 output_root: outputs
