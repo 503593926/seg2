@@ -21,6 +21,7 @@ from segmodel.inference.metrics import summarize_metrics
 from segmodel.inference.validation import validate_slide
 from segmodel.models.gene_vae import GeneVAE
 from segmodel.models.segmentation import SegmentationModel
+from segmodel.modules.propagation import DifferentiablePropagation
 from segmodel.training.callbacks import DatasetEpochCallback, MetricsBelowRichProgressBar
 from segmodel.training.distillation import Distiller
 from segmodel.training.gene_module import GeneVAEModule
@@ -131,6 +132,22 @@ def _train_segmentation(cfg, data_module, gene_vae, tiling, output_dir):
         spot_radius_px=slide.spot_radius_px,
         label_scale=label_scale,
     )
+    propagation = None
+    if bool(cfg.experiment.propagation.enabled):
+        if float(train_cfg.loss_weights.get("propagation", 0)) == 0:
+            raise ValueError(
+                "experiment.propagation.enabled=true 但 "
+                "loss_weights.propagation=0, 该项不会进入总损失"
+            )
+        propagation_cfg = cast(
+            dict[str, Any],
+            OmegaConf.to_container(cfg.experiment.propagation, resolve=True),
+        )
+        propagation_cfg.pop("enabled", None)
+        propagation = DifferentiablePropagation(
+            label_scale=label_scale,
+            **propagation_cfg,
+        )
     module = SegmentationModule(
         model,
         distiller,
@@ -141,6 +158,7 @@ def _train_segmentation(cfg, data_module, gene_vae, tiling, output_dir):
         mpp=float(cfg.resolution.target_mpp),
         visualization_dir=output_dir / "validation",
         label_scale=label_scale,
+        propagation=propagation,
     )
     callbacks: list[pl.Callback] = [
         DatasetEpochCallback(),

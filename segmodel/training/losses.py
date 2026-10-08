@@ -79,6 +79,29 @@ def segmentation_loss(logits, target, valid):
     return bce + dice
 
 
+def soft_segmentation_loss(logits, target, valid, weights=None):
+    """软目标版本: 不做阈值化, 梯度可以穿过 target 回到传播算子。
+
+    target 是 [0,1] 的连续值 (传播输出), weights 可选地给出逐像素置信度。
+    与 segmentation_loss 的区别只在 target 不二值化、且 BCE 对软标签求导。
+    """
+    logits, target, valid = logits.float(), target.float(), valid.float()
+    if weights is not None:
+        weights = weights.float()
+    else:
+        weights = torch.ones_like(target)
+    weights = weights * valid
+    bce = _masked_mean(
+        F.binary_cross_entropy_with_logits(logits, target, reduction="none"), weights
+    )
+    probability = logits.sigmoid()
+    intersection = (probability * target * weights).sum()
+    dice = 1 - (2 * intersection + 1) / (
+        (probability * weights).sum() + (target * weights).sum() + 1
+    )
+    return bce + dice
+
+
 def affinity_loss(logits, superpixels, valid):
     ids = superpixels[:, 0]
     usable = valid[:, 0].bool()

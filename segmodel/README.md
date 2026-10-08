@@ -15,6 +15,7 @@
 | 图像模型输入和输出是什么 | [models/segmentation.py](models/segmentation.py): `SegmentationModel` |
 | U-Net 的编码、解码和 skip | [modules/backbone.py](modules/backbone.py): `ConvNeXtUnet` |
 | PFM 如何解耦、选择和注入网络 | [modules/conditioning.py](modules/conditioning.py) |
+| 可微标签传播如何求解、可学什么 | [modules/propagation.py](modules/propagation.py): `DifferentiablePropagation` |
 | 图像 spot 如何接受基因监督 | [training/distillation.py](training/distillation.py): `Distiller` |
 | 每项损失的具体公式 | [training/losses.py](training/losses.py) |
 | 如何读取文件、准备不同训练阶段 | [dataset/loading.py](dataset/loading.py), [dataset/datamodule.py](dataset/datamodule.py) |
@@ -91,6 +92,23 @@ Lightning 负责 backward、梯度裁剪、AdamW 更新和每 epoch 的学习率
 | 最终保存和整片测试 | 普通图像模型 |
 
 动态传播在满足轮次条件时进行整片推理, 按配置重算或复用超像素拓扑, 吸附 spot 并执行随机游走, 然后阈值化概率。只有存在可采样窗口且概率有限时才提交监督更新。该行为沿用原实现。
+
+## 可微标签传播 (实验开关)
+
+`experiment.propagation.enabled=true` 时, `training_step` 会用 `DifferentiablePropagation` 在 crop 内重算软标签, 作为 `loss_weights.propagation` 对应的损失项:
+
+- 图拓扑固定 (crop 内 SNIC 邻接), 只有边上的 gate 可学; base conductance 由 Lab + 模型中间特征差固定且 detach, 梯度只走 gate
+- 求解器是对 Dirichlet 系统跑的 Jacobi 预条件 CG (默认 85 步 / 1e-8 早停); 度分布极不均时裸 CG 与 Jacobi 收敛都不可用, 见 `tools/validate_jacobi_scipy.py` 的对照
+- 软目标经 `soft_segmentation_loss` 反传, 不做阈值化; 无解样本 (种子全在组织外) 被剔除, 原有硬伪标签项继续覆盖
+- 诊断量记录在 `train/propagation/*`: `pcg_steps`、`gate_mean`、`gate_std`、`valid_fraction`
+
+```bash
+# 开启可微传播并与硬标签监督共存
+python -m segmodel.main experiment.propagation.enabled=true \
+    experiment.training.image.loss_weights.propagation=1.0
+# 数值对照: PCG vs scipy、梯度有限差分、端到端训练步
+python -m unittest tests.test_diff_propagation tests.test_propagation_training -v
+```
 
 ## 数据与张量约定
 

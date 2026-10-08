@@ -43,8 +43,9 @@ def predict_slide(
     device,
     batch_size=1,
     return_features=True,
+    feature_key="propagation_features",
 ):
-    """重叠滑窗推理：分割头与 propagation features 在 7mpp 网格加权拼接，
+    """重叠滑窗推理：分割头与 feature_key 指定的特征在 7mpp 网格加权拼接，
     概率最后上采样回 1mpp。返回 (probability, features)。"""
     batch_size = int(batch_size)
     if batch_size <= 0:
@@ -84,7 +85,7 @@ def predict_slide(
             feature_batch = None
             if return_features:
                 feature_batch = (
-                    output["propagation_features"]
+                    output[feature_key]
                     .float()
                     .cpu()
                     .numpy()

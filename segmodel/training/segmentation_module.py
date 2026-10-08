@@ -10,7 +10,12 @@ from torchmetrics.classification import BinaryF1Score, BinaryJaccardIndex
 from segmodel.inference.validation import load_expert_masks, validate_slide
 from segmodel.inference.visualization import save_prediction_result
 from segmodel.training.augment import cutmix_batch, mixup_batch
-from segmodel.training.losses import image_losses, pfm_losses, segmentation_loss
+from segmodel.training.losses import (
+    image_losses,
+    pfm_losses,
+    segmentation_loss,
+    soft_segmentation_loss,
+)
 
 
 class SegmentationModule(pl.LightningModule):
@@ -25,6 +30,7 @@ class SegmentationModule(pl.LightningModule):
         mpp=1.0,
         visualization_dir=None,
         label_scale=1,
+        propagation=None,
     ):
         super().__init__()
         self.model = model
@@ -41,6 +47,7 @@ class SegmentationModule(pl.LightningModule):
             Path(visualization_dir) if visualization_dir is not None else None
         )
         self.label_scale = int(label_scale)
+        self.propagation = propagation
 
         self.train_dice = BinaryF1Score(threshold=0.5)
         self.train_iou = BinaryJaccardIndex(threshold=0.5)
@@ -48,15 +55,46 @@ class SegmentationModule(pl.LightningModule):
     def forward(self, image, patch, cls, pfm_mask=None):
         return self.model(image, patch, cls, pfm_mask)
 
+    def _update_propagated_loss(self, losses, output, batch):
+        """用可微传播重算软标签, 作为 loss_weights.propagation 对应的项。
+
+        只对可解样本计算; 无解样本仍由原来的硬伪标签项覆盖。
+        """
+        if self.propagation is None:
+            return
+        if float(self.image_cfg.loss_weights.get("propagation", 0)) == 0:
+            # 权重为 0 时该项不进总损失, 跳过多余的求解
+            return
+        propagated = self.propagation(
+            batch["superpixels"].to(torch.long),
+            output["features"],
+            batch["image"],
+            batch["spot_labels"],
+            batch["spots"],
+        )
+        if propagated is None:
+            return
+        indices, soft, valid, diagnostics = propagated
+        losses["propagation"] = soft_segmentation_loss(
+            output["logits"][indices], soft, valid
+        )
+        self.log_dict(
+            {f"train/propagation/{name}": value for name, value in diagnostics.items()},
+            on_step=False,
+            on_epoch=True,
+            batch_size=len(indices),
+        )
+
     def training_step(self, batch) -> torch.Tensor:
         output = self(batch["image"], batch["patch"], batch["cls"], batch["pfm_mask"])
         losses = image_losses(output, batch)
         losses.update(pfm_losses(output, batch, self.model.pfm_count))
+        self._update_propagated_loss(losses, output, batch)
 
-        diagnostics = None
+        distillation_diagnostics = None
         relation_enabled = float(self.image_cfg.loss_weights.get('relation', 0)) != 0
         if float(self.image_cfg.loss_weights.molecular) != 0 or relation_enabled:
-            molecular_losses, diagnostics = self.distiller.losses(
+            molecular_losses, distillation_diagnostics = self.distiller.losses(
                 output, batch, relation_enabled=relation_enabled,
             )
             losses.update(molecular_losses)
@@ -78,9 +116,9 @@ class SegmentationModule(pl.LightningModule):
             loss = loss + float(self.augment_cfg.cutmix.weight) * cutmix_loss
 
         logged_losses = {f"train/{name}": value for name, value in losses.items()}
-        if diagnostics is not None:
+        if distillation_diagnostics is not None:
             logged_losses.update(
-                {f"train/{name}": value for name, value in diagnostics.items()}
+                {f"train/{name}": value for name, value in distillation_diagnostics.items()}
             )
         self.log_dict(
             logged_losses,
@@ -104,6 +142,12 @@ class SegmentationModule(pl.LightningModule):
         image_parameters = list(self.model.named_parameters()) + list(
             self.distiller.image_projector.named_parameters()
         )
+        if self.propagation is not None:
+            # gate 参数少, 不参与 weight decay
+            image_parameters += [
+                (f"propagation.{name}", parameter)
+                for name, parameter in self.propagation.named_parameters()
+            ]
         decay, no_decay = [], []
         for name, parameter in image_parameters:
             if not parameter.requires_grad:

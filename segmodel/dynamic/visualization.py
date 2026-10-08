@@ -67,6 +67,20 @@ def _superpixel_overlay(image_bgr, superpixels):
     return overlay
 
 
+def _spot_overlay(image_bgr, spot_x, spot_y, spot_labels, radius=3):
+    """把 spot 种子画成圆点: 蓝=非癌, 红=癌 (与伪标签 overlay 同色系)。"""
+    overlay = image_bgr.copy()
+    height, width = overlay.shape[:2]
+    for x, y, label in zip(spot_x, spot_y, spot_labels):
+        if label == 255:
+            continue
+        if not (0 <= x < width and 0 <= y < height):
+            continue
+        color = (255, 0, 0) if label == 0 else (0, 0, 255)
+        cv2.circle(overlay, (int(x), int(y)), radius, color, -1)
+    return overlay
+
+
 def _learned_feature_norm(learned, tissue):
     values = np.nan_to_num(
         np.asarray(learned, dtype=np.float32),
@@ -262,3 +276,130 @@ def save_dynamic_result(
         json.dumps(record, ensure_ascii=False, indent=2, allow_nan=False) + "\n",
         encoding="utf-8",
     )
+
+
+def save_soft_label_result(
+    output_dir,
+    image_rgb,
+    tissue,
+    soft_probability,
+    superpixels,
+    spot_x,
+    spot_y,
+    spot_labels,
+    non_cancer_threshold,
+    cancer_threshold,
+    metadata,
+    model_probability=None,
+):
+    """保存一张训练切片的一轮软标签图和诊断可视化。
+
+    soft_probability 是标签网格上的连续概率场 (传播模块输出)。
+    spot_labels 里的种子点画在第一个概览面板上, 两种阈值之间的模糊区间
+    在叠加图上保持原图, 用来看这一轮监督实际覆盖了哪里。
+    model_probability 可选, 提供时加一栏原模型概率做对照。
+    """
+    output_dir = Path(output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
+    tissue = np.asarray(tissue, dtype=bool)
+    image_bgr = cv2.cvtColor(np.asarray(image_rgb), cv2.COLOR_RGB2BGR)
+
+    heatmap = _probability_heatmap(soft_probability, tissue)
+    candidate_mask = np.full(soft_probability.shape, 255, dtype=np.uint8)
+    candidate_mask[tissue & (soft_probability <= non_cancer_threshold)] = 0
+    candidate_mask[tissue & (soft_probability >= cancer_threshold)] = 1
+    pseudo_overlay = _pseudo_mask_overlay(image_bgr, candidate_mask)
+    seed_overlay = _spot_overlay(
+        image_bgr,
+        spot_x,
+        spot_y,
+        spot_labels,
+    )
+    superpixel_overlay = _superpixel_overlay(image_bgr, superpixels)
+    # 白=参与监督的确定区域, 黑=模糊区间或组织外
+    supervised_panel = np.where(candidate_mask == 255, 0, 255).astype(np.uint8)
+    supervised_panel = np.repeat(supervised_panel[..., None], 3, axis=2)
+
+    png_parameters = (cv2.IMWRITE_PNG_COMPRESSION, 3)
+    jpg_parameters = (cv2.IMWRITE_JPEG_QUALITY, 90)
+    _write_image(
+        output_dir / "soft_probability.png",
+        _uint16_probability(soft_probability),
+        png_parameters,
+    )
+    _write_image(
+        output_dir / "soft_probability_heatmap.png",
+        heatmap,
+        png_parameters,
+    )
+    _write_image(
+        output_dir / "soft_pseudo_mask.png",
+        candidate_mask,
+        png_parameters,
+    )
+    _write_image(
+        output_dir / "soft_pseudo_mask_overlay.jpg",
+        pseudo_overlay,
+        jpg_parameters,
+    )
+    _write_image(
+        output_dir / "spot_seeds_overlay.jpg",
+        seed_overlay,
+        jpg_parameters,
+    )
+
+    middle_panel = (
+        _overview_panel(_probability_heatmap(model_probability, tissue), "Model probability")
+        if model_probability is not None
+        else _overview_panel(supervised_panel, "Supervised region (white)")
+    )
+    overview = np.vstack(
+        (
+            np.hstack(
+                (
+                    _overview_panel(seed_overlay, "H&E + spot seeds"),
+                    middle_panel,
+                    _overview_panel(heatmap, "Soft label probability"),
+                )
+            ),
+            np.hstack(
+                (
+                    _overview_panel(pseudo_overlay, "Soft pseudo label"),
+                    _overview_panel(superpixel_overlay, "Superpixel boundaries"),
+                    _overview_panel(image_bgr, "H&E"),
+                )
+            ),
+        )
+    )
+    _write_image(output_dir / "overview.jpg", overview, jpg_parameters)
+
+    record = {
+        **metadata,
+        "shape": list(np.asarray(soft_probability).shape),
+        "soft_probability": _probability_statistics(soft_probability, tissue),
+        "soft_class_counts": _class_counts(candidate_mask),
+        "seed_counts": {
+            "non_cancer": int(np.sum(np.asarray(spot_labels) == 0)),
+            "cancer": int(np.sum(np.asarray(spot_labels) == 1)),
+            "unknown": int(np.sum(np.asarray(spot_labels) == 255)),
+        },
+        "thresholds": {
+            "non_cancer": float(non_cancer_threshold),
+            "cancer": float(cancer_threshold),
+        },
+        "files": {
+            "probability_encoding": "uint16_png; probability = value / 65535",
+            "pseudo_mask_encoding": {
+                "0": "non_cancer",
+                "1": "cancer",
+                "255": "fuzzy_or_outside_tissue",
+            },
+            "overlay_colors": {"blue": "non_cancer", "red": "cancer"},
+            "seed_colors": {"blue": "non_cancer spot", "red": "cancer spot"},
+        },
+    }
+    (output_dir / "metadata.json").write_text(
+        json.dumps(record, ensure_ascii=False, indent=2, allow_nan=False) + "\n",
+        encoding="utf-8",
+    )
+    return record

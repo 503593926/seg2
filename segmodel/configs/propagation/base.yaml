@@ -1,0 +1,14 @@
+enabled: true
+steps: 85
+tolerance: 1e-8
+
+# conductance 的固定部分 (与 dynamic 侧同一套公式)
+beta: 0.5
+learned_weight: 1.0
+
+# gate 是有界调制: g = 1 + gate_range * tanh(mlp(features))
+gate_range: 0.0
+
+# 软标签的监督范围: 区间内视为不确定, 不参与损失
+non_cancer_threshold: 0.35
+cancer_threshold: 0.65
