@@ -70,39 +70,13 @@ class SegmentationModule(pl.LightningModule):
         )
 
         mixup_loss = self._mixup_segmentation_loss(batch)
-        self.log(
-            "train/mixup_applied",
-            float(mixup_loss is not None),
-            on_step=False,
-            on_epoch=True,
-            batch_size=len(batch["image"]),
-        )
         if mixup_loss is not None:
             loss = loss + float(self.augment_cfg.mixup.weight) * mixup_loss
-            self.log(
-                "train/mixup_segmentation",
-                mixup_loss,
-                on_step=False,
-                on_epoch=True,
-                batch_size=len(batch["image"]),
-            )
+
         cutmix_loss = self._cutmix_segmentation_loss(batch)
-        self.log(
-            "train/cutmix_applied",
-            float(cutmix_loss is not None),
-            on_step=False,
-            on_epoch=True,
-            batch_size=len(batch["image"]),
-        )
         if cutmix_loss is not None:
             loss = loss + float(self.augment_cfg.cutmix.weight) * cutmix_loss
-            self.log(
-                "train/cutmix_segmentation",
-                cutmix_loss,
-                on_step=False,
-                on_epoch=True,
-                batch_size=len(batch["image"]),
-            )
+
         logged_losses = {f"train/{name}": value for name, value in losses.items()}
         if diagnostics is not None:
             logged_losses.update(
@@ -127,7 +101,6 @@ class SegmentationModule(pl.LightningModule):
 
 
     def configure_optimizers(self) -> OptimizerLRSchedulerConfig:
-        # 图像模型在前、蒸馏投影头在后; 再按原顺序分 weight decay 两组。
         image_parameters = list(self.model.named_parameters()) + list(
             self.distiller.image_projector.named_parameters()
         )

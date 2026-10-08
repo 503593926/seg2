@@ -22,7 +22,7 @@ class SegmentationDataset(Dataset):
         self.slides = slides
         self.gene_expression = torch.from_numpy(gene_adata.X)
         self.spot_labels = torch.from_numpy(gene_adata.obs["spot_label"].to_numpy(dtype=np.int64))
-        self.slide_names = list(slide_names)
+        self.slide_names = sorted(list(slide_names))
         self.slide_ids = {name: index for index, name in enumerate(self.slide_names)}
         self.seed = int(seed)
         self.epoch = 0

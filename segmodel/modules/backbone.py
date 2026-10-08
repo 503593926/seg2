@@ -1,6 +1,5 @@
-# 图像骨干: Stem -> 编码器 -> 解码器, 各 stage 共用自己的 PFM 路由器。
 import torch
-from timm.layers import DropPath
+from timm.layers.drop import DropPath
 from torch import nn
 
 from segmodel.modules.blocks import LayerNorm
@@ -30,7 +29,6 @@ class ConvNeXtUnet(nn.Module):
             s_top_k=s_top_k,
         )
 
-        # 保持先初始化全部编码 stage, 再初始化下采样和解码器的顺序。
         self.encoder_stages = nn.ModuleList()
 
         for channels, rate in zip(encoder_chans, drop_path):
@@ -38,7 +36,6 @@ class ConvNeXtUnet(nn.Module):
                 ConvNeXtStage(channels, rate, blocks, cnorm_kwargs)
             )
 
-        # 相邻编码 stage 之间下采样。
         self.downsamples = nn.ModuleList()
 
         for i in range(len(encoder_chans) - 1):
@@ -46,7 +43,6 @@ class ConvNeXtUnet(nn.Module):
                 Downsample(encoder_chans[i], encoder_chans[i + 1])
             )
 
-        # 解码器按深层到浅层消费 skip。
         self.decoder_stages = nn.ModuleList()
 
         current_chans = encoder_chans[-1]
@@ -77,7 +73,7 @@ class ConvNeXtUnet(nn.Module):
     def forward(self, x, task_global, task_spatial, available, routing):
 
         skips = []
-        # 编码并保留下采样前的特征。
+
         for i, stage in enumerate(self.encoder_stages):
             x = stage(x, task_global, task_spatial, available, routing)
 
@@ -85,7 +81,6 @@ class ConvNeXtUnet(nn.Module):
                 skips.append(x)
                 x = self.downsamples[i](x)
 
-        # 从最深层逐级上采样并融合 skip。
         for stage, skip in zip(self.decoder_stages, reversed(skips)):
             x = stage(x, skip, task_global, task_spatial, available, routing)
 
@@ -143,8 +138,11 @@ class ConvNeXtBlock(nn.Module):
             groups=dim
         )
 
-        self.cnorm = ConditionalNorm(dim, **cnorm_kwargs)
-        # 保留旧模型注册的 norm 参数, 以保持 checkpoint 和优化器参数顺序。
+        self.cnorm = ConditionalNorm(
+            dim,
+            cnorm_kwargs["global_dim"],
+            cnorm_kwargs["spatial_dim"],
+        )
         self.norm = LayerNorm(dim, eps=1e-6)
 
         self.pwconv1 = nn.Conv2d(dim, dim * 4, kernel_size=1)

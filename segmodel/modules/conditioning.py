@@ -1,4 +1,3 @@
-# PFM 条件分支: 特征解耦 -> 全局/空间路由 -> 条件归一化。
 from functools import partial
 
 import torch
@@ -103,7 +102,7 @@ class SpatialRouter(nn.Module):
 
 
 class ConditionalNorm(nn.Module):
-    def __init__(self, channels, global_dim, spatial_dim, pfm_count, g_top_k, s_top_k):
+    def __init__(self, channels, global_dim, spatial_dim):
         super().__init__()
         self.eps = 1e-6
 

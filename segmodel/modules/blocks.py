@@ -1,4 +1,3 @@
-# 基础层: 通道归一化、特征缩放、spot 投影头。
 import torch
 from torch import nn
 from torch.nn import functional as F

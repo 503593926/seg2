@@ -20,18 +20,12 @@ class Distiller(nn.Module):
             model.feature_channels, gene_vae.latent_dim
         )
 
-    @property
-    def image_parameters(self):
-        """跟随图像学习率训练的投影头参数。"""
-        return list(self.image_projector.parameters())
-
     def train(self, mode=True):
         super().train(mode)
         self.gene_teacher.eval()
         return self
 
     def losses(self, output, batch, relation_enabled: bool = False):
-        # 每个 crop 内先按 spot 圆盘池化, 同一 spot 的跨 crop 视图分别保留。
         image_features = []
         expression = []
         slide_ids = []
@@ -62,7 +56,6 @@ class Distiller(nn.Module):
                 'distillation/relation_slides': 0.0,
             }
 
-        # 池化后投影到基因空间; 教师只提供均值 embedding。
         image_embedding = self.image_projector(torch.cat(image_features))
         with torch.no_grad():
             gene_embedding = self.gene_teacher.embedding(torch.cat(expression))
@@ -72,7 +65,7 @@ class Distiller(nn.Module):
             gene_embedding.float(),
             torch.ones(gene_embedding.shape[0], device=gene_embedding.device),
         )
-        # 关系蒸馏只比较同一 crop 内的 spot 对。
+
         relation = image_embedding.sum() * 0
         pair_count, crop_count, slide_count = 0, 0, 0
         if relation_enabled:
@@ -87,7 +80,6 @@ class Distiller(nn.Module):
         diagnostics = {
             "spots": float(len(gene_embedding)),
             "distillation/gene_to_image": molecular.detach(),
-            "distillation/distillation_coverage": 1.0,
             "distillation/gene_embedding_std": gene_embedding.float().std(
                 dim=0, unbiased=False
             ).mean(),
@@ -101,8 +93,6 @@ class Distiller(nn.Module):
         return {"molecular": molecular, 'relation': relation}, diagnostics
 
     def _pool_spots(self, features, coordinates):
-        """按 spot 圆盘均值池化，坐标与半径按 label_scale 换算到特征网格。"""
-        channels = features.shape[0]
         radius = self.spot_radius_px / self.label_scale
         pooled = []
         for center in coordinates:
@@ -117,6 +107,4 @@ class Distiller(nn.Module):
             disk = (columns - center_x).square() + (rows - center_y).square() <= radius**2
             values = features[:, top:bottom, left:right].float()[:, disk]
             pooled.append(values.mean(dim=1))
-        if not pooled:
-            return features.new_empty((0, channels))
         return torch.stack(pooled)
