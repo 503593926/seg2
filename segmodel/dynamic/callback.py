@@ -3,6 +3,7 @@ from pathlib import Path
 import cv2
 import numpy as np
 import pytorch_lightning as pl
+import torch
 
 from tools.propagate_random_walker import build_random_walker_topology
 
@@ -13,7 +14,7 @@ from segmodel.dynamic.propagation import (
     snap_spots,
     weighted_features,
 )
-from segmodel.dynamic.visualization import save_dynamic_result
+from segmodel.dynamic.visualization import save_dynamic_result, save_soft_label_result
 from segmodel.inference.predictor import predict_slide
 
 
@@ -222,3 +223,148 @@ class DynamicPropagationCallback(pl.Callback):
         )
         self.topologies[name] = topology
         return report
+
+
+class SoftLabelVisualizationCallback(pl.Callback):
+    """按轮次对训练切片整片推理, 保存可微传播产出的软标签可视化。
+
+    与 DynamicPropagationCallback 的区别: 只读地用 spot 真值 + 当前模型特征
+    生成软标签图, 不写回数据集、不影响训练。用于人工检查软标签质量随训练
+    的演化 (阈值边界、模糊区间、与模型概率的差异)。
+    """
+
+    def __init__(self, config, tiling, output_dir=None):
+        self.config = config
+        self.tiling = tiling
+        self.output_dir = Path(output_dir) if output_dir is not None else None
+
+    def on_train_epoch_end(self, trainer, pl_module):
+        epoch = trainer.current_epoch + 1
+        if not self._should_run(epoch):
+            return
+        if trainer.world_size != 1:
+            return
+        propagation = pl_module.propagation
+        if propagation is None:
+            return
+        dataset = trainer.datamodule.train_dataset
+        resolution = trainer.datamodule.cfg.resolution
+        for name in dataset.slide_names:
+            report = self._visualize_slide(
+                dataset,
+                name,
+                pl_module,
+                propagation,
+                resolution,
+                epoch,
+            )
+            print(
+                f"soft label epoch {epoch}: {name}, "
+                f"seeds={report['seed_counts']['cancer'] + report['seed_counts']['non_cancer']}, "
+                f"supervised={report['supervised_fraction']:.3f}, "
+                f"pcg={report['pcg_steps']:.0f}",
+                flush=True,
+            )
+
+    def _should_run(self, epoch):
+        if not bool(self.config.enabled) or self.output_dir is None:
+            return False
+        warmup = int(self.config.warmup_epochs)
+        if epoch < warmup:
+            return False
+        return (epoch - warmup) % int(self.config.interval_epochs) == 0
+
+    def _visualize_slide(self, dataset, name, pl_module, propagation, resolution, epoch):
+        slide = dataset.slides[name]
+        model_probability, learned = predict_slide(
+            pl_module.model,
+            slide,
+            crop_size=self.tiling["crop_size"],
+            stride=self.tiling["stride"],
+            alignment=dataset.alignment,
+            device=pl_module.device,
+            batch_size=self.tiling["batch_size"],
+        )
+        tissue = slide.tissue_mask_bl
+        if learned.shape[:2] != tissue.shape:
+            raise ValueError(
+                f"{name}: propagation features {learned.shape[:2]} "
+                f"do not match label grid {tissue.shape}"
+            )
+        height, width = tissue.shape
+        image = cv2.resize(
+            slide.image,
+            (width, height),
+            interpolation=cv2.INTER_AREA,
+        )
+        model_probability = cv2.resize(
+            model_probability,
+            (width, height),
+            interpolation=cv2.INTER_AREA,
+        )
+        superpixels = np.asarray(slide.superpixels, dtype=np.int64)
+
+        # spot 坐标保持目标 mpp 像素单位, 由传播模块自己除以 label_scale;
+        # 叠加图上的种子点画在标签网格上, 因此单独换算一份显示坐标。
+        spot_data = dataset.spots_by_slide[name]
+        labels = dataset.spot_labels.numpy()[spot_data["indices"]]
+        coordinates = np.asarray(spot_data["coords"], dtype=np.float32)
+        display = np.rint(coordinates / dataset.label_scale).astype(np.int64)
+        display[:, 0] = display[:, 0].clip(0, width - 1)
+        display[:, 1] = display[:, 1].clip(0, height - 1)
+
+        device = pl_module.device
+        with torch.no_grad():
+            result = propagation(
+                torch.from_numpy(superpixels)[None, None].to(device),
+                torch.from_numpy(np.ascontiguousarray(learned.transpose(2, 0, 1)))
+                .float()[None]
+                .to(device),
+                torch.from_numpy(np.ascontiguousarray(image.transpose(2, 0, 1)))
+                .float()[None]
+                .to(device),
+                [torch.from_numpy(np.ascontiguousarray(labels)).to(device)],
+                [torch.from_numpy(np.ascontiguousarray(coordinates)).to(device)],
+            )
+        if result is None:
+            return {
+                "seed_counts": {"cancer": 0, "non_cancer": 0},
+                "supervised_fraction": 0.0,
+                "pcg_steps": 0.0,
+            }
+        kept, soft, _, diagnostics = result
+        if kept != [0]:
+            raise ValueError(f"{name}: expected the single sample to be solvable")
+
+        result_dir = self.output_dir / f"epoch_{epoch:04d}" / name
+        record = save_soft_label_result(
+            result_dir,
+            image,
+            tissue,
+            soft[0, 0].cpu().numpy(),
+            superpixels,
+            display[:, 0],
+            display[:, 1],
+            labels,
+            non_cancer_threshold=propagation.non_cancer_threshold,
+            cancer_threshold=propagation.cancer_threshold,
+            metadata={
+                "epoch": int(epoch),
+                "slide": name,
+                "pcg_steps": float(diagnostics["pcg_steps"]),
+                "gate_mean": float(diagnostics["gate_mean"]),
+                "gate_std": float(diagnostics["gate_std"]),
+                "superpixel_count": int(superpixels.max()),
+                "target_mpp": float(resolution.target_mpp),
+                "label_mpp": float(resolution.label_mpp),
+            },
+            model_probability=model_probability,
+        )
+        return {
+            "seed_counts": record["seed_counts"],
+            "supervised_fraction": float(
+                (record["soft_class_counts"]["0"] + record["soft_class_counts"]["1"])
+                / max(int(tissue.sum()), 1)
+            ),
+            "pcg_steps": float(diagnostics["pcg_steps"]),
+        }

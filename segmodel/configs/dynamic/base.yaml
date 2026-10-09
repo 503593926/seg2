@@ -1,4 +1,4 @@
-enabled: true
+enabled: False
 warmup_epochs: 10
 interval_epochs: 10
 max_rounds: 100

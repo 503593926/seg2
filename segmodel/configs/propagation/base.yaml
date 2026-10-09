@@ -9,6 +9,10 @@ learned_weight: 1.0
 # gate 是有界调制: g = 1 + gate_range * tanh(mlp(features))
 gate_range: 0.0
 
+# 档 2: 传播损失是否回传到模型特征 (固定核 + 开特征, 配合 gate_range=0 使用)。
+# 默认 false: base 与特征 detach, 梯度只走 gate, 防止监督信号自指。
+feature_gradients: true
+
 # 软标签的监督范围: 区间内视为不确定, 不参与损失
-non_cancer_threshold: 0.35
-cancer_threshold: 0.65
+non_cancer_threshold: 0.2
+cancer_threshold: 0.8

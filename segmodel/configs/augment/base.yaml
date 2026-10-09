@@ -38,7 +38,7 @@ sampling:
   spot_sampling_fraction: 0.25
 
 mixup:
-  enabled: true         # 与 CutMix 分别做消融时单独开启
+  enabled: False         # 与 CutMix 分别做消融时单独开启
   probability: 0.5
   alpha: 0.8             # Beta(alpha, alpha) 的参数
   weight: 0.5           # 额外分割损失的权重
@@ -46,7 +46,7 @@ mixup:
   max_samples: 4         # 每次最多混合 4 个样本，限制显存
 
 cutmix:
-  enabled: true
+  enabled: False
   probability: 0.5       # 每步额外执行 CutMix 分割前向的概率
   weight: 0.5            # 额外分割损失的权重
   start_epoch: 0         # 从 0 开始计数；0 表示第一个 epoch 即可启用

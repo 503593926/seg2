@@ -16,7 +16,7 @@ image:
   lr: 4e-3
   weight_decay: 0.05
   loss_weights:
-    segmentation: 1.0
+    segmentation: 0.0
     affinity: 0.0
     superpixel: 0.0
     molecular: 0.0

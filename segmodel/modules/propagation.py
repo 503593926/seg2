@@ -2,8 +2,11 @@
 
 设计约束 (与 tools/validate_jacobi_scipy.py 的数值结论一致):
 - 固定拓扑: 超像素邻接由 SNIC 决定, 不参与优化, 避免节点生死带来的非平稳
-- base conductance 由 Lab + 中间特征差固定且 detach, 只学一个 3 维 gate 调制。
-  梯度只走 gate, 防止模型把传播调成对自己有利的退化解
+- base conductance 由 Lab + 中间特征差固定, 默认与特征一起 detach, 只学一个
+  3 维 gate 调制。梯度只走 gate, 防止模型把传播调成对自己有利的退化解
+- feature_gradients=True 时 base 与特征不再 detach, 传播损失回传到模型特征
+  (档 2: 固定核 + 开特征, 配合 gate_range=0 使用)。这会让监督信号依赖模型
+  自己的表示, 有自指风险, 需要监控软标签是否坍缩成模型预测的副本
 - 求解器: 对 Dirichlet 系统跑 Jacobi 预条件 CG。原始度分布不均时裸 CG 500 步
   不收敛, Jacobi 预条件后 ~85 步到机器精度, 不要替换
 """
@@ -46,7 +49,7 @@ class ConductionGate(nn.Module):
 
 def rgb_to_lab(rgb):
     """RGB (0..255) 转 CIE-Lab, 与 SNIC 的 rgbtolab 同一套公式。返回同形状张量。"""
-    values = rgb.float() / 255.0
+    values = rgb.to(torch.promote_types(rgb.dtype, torch.float32)) / 255.0
     linear = torch.where(
         values <= 0.04045,
         values / 12.92,
@@ -231,6 +234,7 @@ class DifferentiablePropagation(nn.Module):
         gate_range=0.3,
         non_cancer_threshold=0.35,
         cancer_threshold=0.65,
+        feature_gradients=False,
     ):
         super().__init__()
         self.label_scale = int(label_scale)
@@ -240,6 +244,7 @@ class DifferentiablePropagation(nn.Module):
         self.tolerance = float(tolerance)
         self.non_cancer_threshold = float(non_cancer_threshold)
         self.cancer_threshold = float(cancer_threshold)
+        self.feature_gradients = bool(feature_gradients)
         self.gate = ConductionGate(gate_range)
 
     def forward(self, superpixels, features, rgb, spot_labels, spot_positions):
@@ -283,13 +288,21 @@ class DifferentiablePropagation(nn.Module):
 
         # 训练图: rgb 是 1mpp 裁剪图, 超像素在标签网格; 先面积下采样再转 Lab,
         # 与 dynamic 侧的加权特征保持同一套颜色空间。
-        image = rgb.float()
+        # 计算精度取 rgb/特征/float32 中最宽的那个: bf16 上采样到 fp32,
+        # fp64 原样保留 (数值梯度检查要用双精度)。
+        compute_dtype = torch.promote_types(
+            torch.promote_types(rgb.dtype, features.dtype), torch.float32
+        )
+        image = rgb.to(compute_dtype)
         if image.shape[-2:] != superpixels.shape:
             image = F.interpolate(
                 image[None], size=tuple(superpixels.shape), mode="area"
             )[0]
         color = node_means(rgb_to_lab(image), superpixels, nodes)
-        learned = node_means(features.float().detach(), superpixels, nodes)
+        learned = features.to(compute_dtype)
+        if not self.feature_gradients:
+            learned = learned.detach()
+        learned = node_means(learned, superpixels, nodes)
         learned = learned * np.sqrt(
             3.0 * self.learned_weight / max(learned.shape[1], 1)
         )
@@ -353,7 +366,9 @@ class DifferentiablePropagation(nn.Module):
         with torch.autocast(device_type=device.type, enabled=False):
             base = torch.exp(-self.beta * delta_squared).clamp_min(1e-6)
             gate = self.gate(delta_squared, delta_l1, base.detach())
-            conductance = base.detach() * gate
+            # 默认只让梯度走 gate (base 与特征已 detach); 打开 feature_gradients
+            # 后传播损失回传到模型特征, 核仍是同一公式
+            conductance = (base if self.feature_gradients else base.detach()) * gate
             seed_values = torch.where(
                 seeded,
                 (global_seed == 1).to(conductance.dtype),
@@ -372,7 +387,7 @@ class DifferentiablePropagation(nn.Module):
 
         # 无解样本 (例如种子落在组织外) 整体剔除, 不回退成 0.5 参与损失
         kept_indices = []
-        soft, valid = [], []
+        soft, valid, foreground = [], [], []
         for index, offset, item in zip(indices, offsets, prepared):
             _, _, nodes, _, _, _ = item
             sample_solvable = solvable[offset : offset + nodes.numel()]
@@ -381,27 +396,39 @@ class DifferentiablePropagation(nn.Module):
             size = int(nodes.max()) + 1
             table = torch.zeros(size, dtype=values.dtype, device=device)
             table[nodes] = values[offset : offset + nodes.numel()]
-            pixel = table[superpixels[index, 0]]
+            grid = superpixels[index, 0]
+            tissue = grid > 0
+            pixel = table[grid]
             kept_indices.append(index)
             soft.append(pixel)
-            # 监督范围与 build_pseudo_mask 一致, 中间的模糊区间不参与
+            foreground.append(tissue)
+            # 监督范围与 build_pseudo_mask 一致: 组织外 (超像素 id 0) 与模糊区间
+            # 都不参与。table[0] 恒为 0, 不加 tissue 约束会把白底当成确定非癌监督。
             valid.append(
-                (pixel <= self.non_cancer_threshold)
-                | (pixel >= self.cancer_threshold)
+                tissue
+                & (
+                    (pixel <= self.non_cancer_threshold)
+                    | (pixel >= self.cancer_threshold)
+                )
             )
 
         if not kept_indices:
             return None
 
+        valid_tensor = torch.stack(valid)
         diagnostics = {
             "pcg_steps": float(used),
             "gate_mean": float(gate.detach().mean()),
             "gate_std": float(gate.detach().std(unbiased=False)),
-            "valid_fraction": float(torch.stack(valid).float().mean()),
+            # 分母是前景像素: 报告"组织内有多大比例拿到了确定监督"
+            "valid_fraction": float(
+                valid_tensor.sum()
+                / torch.stack(foreground).sum().clamp_min(1)
+            ),
         }
         return (
             kept_indices,
             torch.stack(soft).unsqueeze(1),
-            torch.stack(valid).unsqueeze(1),
+            valid_tensor.unsqueeze(1),
             diagnostics,
         )

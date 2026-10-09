@@ -16,7 +16,10 @@ from omegaconf import OmegaConf
 from pytorch_lightning.loggers import CSVLogger
 
 from segmodel.dataset.datamodule import FoldDataModule
-from segmodel.dynamic.callback import DynamicPropagationCallback
+from segmodel.dynamic.callback import (
+    DynamicPropagationCallback,
+    SoftLabelVisualizationCallback,
+)
 from segmodel.inference.metrics import summarize_metrics
 from segmodel.inference.validation import validate_slide
 from segmodel.models.gene_vae import GeneVAE
@@ -172,6 +175,22 @@ def _train_segmentation(cfg, data_module, gene_vae, tiling, output_dir):
                 output_dir / "dynamic_pseudo_labels",
             )
         )
+    if bool(cfg.experiment.soft_label.enabled):
+        if propagation is None:
+            # 关掉 propagation 跑基线是常见操作, 可视化直接跳过而不是报错
+            print(
+                "experiment.soft_label.enabled=true 但 propagation 未启用, "
+                "跳过软标签可视化",
+                flush=True,
+            )
+        else:
+            callbacks.append(
+                SoftLabelVisualizationCallback(
+                    cfg.experiment.soft_label,
+                    tiling,
+                    output_dir / "soft_labels",
+                )
+            )
     runtime_cfg = cfg.experiment.training.runtime
     trainer = pl.Trainer(
         accelerator=str(runtime_cfg.accelerator),

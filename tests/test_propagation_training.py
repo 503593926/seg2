@@ -163,6 +163,65 @@ class PropagationTrainingStepTest(unittest.TestCase):
         print(f"loss={loss.item():.4f}, gate gradient L1={total:.3e}")
         self.assertGreater(total, 0.0, "gate 没有收到梯度")
 
+    def test_background_pixels_excluded_from_supervision(self):
+        """组织外 (超像素 id 0) 的像素不能被当成确定非癌监督。"""
+        propagation = DifferentiablePropagation(
+            label_scale=7, beta=0.5, steps=40, tolerance=1e-8
+        )
+        module = build_module(propagation)
+        batch = build_batch()
+        batch["superpixels"][:, :, :6, :6] = 0  # 左上角设为组织外 (网格共 16x16)
+        output = module(batch["image"], batch["patch"], batch["cls"], batch["pfm_mask"])
+        result = propagation(
+            batch["superpixels"].to(torch.long),
+            output["features"],
+            batch["image"],
+            batch["spot_labels"],
+            batch["spots"],
+        )
+        self.assertIsNotNone(result)
+        _, soft, valid, diagnostics = result
+        self.assertFalse(bool(valid[:, :, :6, :6].any()), "组织外像素不应参与监督")
+        self.assertTrue(bool(valid.any()), "组织内应有可监督像素")
+        # 背景的 soft 仍是 0 (查表默认值), 由 valid 挡掉, 不是靠改值
+        self.assertTrue(bool((soft[:, :, :6, :6] == 0).all()))
+        self.assertGreater(float(diagnostics["valid_fraction"]), 0.0)
+        self.assertLessEqual(float(diagnostics["valid_fraction"]), 1.0)
+
+    def test_feature_gradients_reach_model_parameters(self):
+        """档 2: 打开 feature_gradients 后, 传播损失的回传改变模型参数梯度。"""
+        batch = build_batch()
+        collected = {}
+        for flag in (False, True):
+            propagation = DifferentiablePropagation(
+                label_scale=7,
+                beta=0.5,
+                steps=40,
+                tolerance=1e-8,
+                gate_range=0.0,
+                feature_gradients=flag,
+            )
+            # build_module 内部固定 seed, 两次迭代的模型初始化完全相同
+            module = build_module(propagation)
+            loss = module.training_step(batch)
+            loss.backward()
+            collected[flag] = torch.cat(
+                [
+                    parameter.grad.flatten()
+                    for parameter in module.model.parameters()
+                    if parameter.grad is not None
+                ]
+            ).clone()
+
+        difference = (collected[True] - collected[False]).abs()
+        print(
+            f"feature gradient changes model grads: "
+            f"max={float(difference.max()):.3e} mean={float(difference.mean()):.3e}"
+        )
+        self.assertGreater(
+            float(difference.max()), 1e-8, "开特征后模型梯度没有任何变化"
+        )
+
     def test_propagation_disabled_falls_back_to_baseline(self):
         module = build_module(None)
         batch = build_batch()

@@ -22,6 +22,7 @@
 | crop 如何采样、增强和配对 spot | [dataset/segmentation.py](dataset/segmentation.py), [dataset/augment.py](dataset/augment.py) |
 | MixUp/CutMix 如何同步混合图像和特征 | [training/augment.py](training/augment.py) |
 | 动态伪标签何时更新、如何传播 | [dynamic/callback.py](dynamic/callback.py), [dynamic/propagation.py](dynamic/propagation.py) |
+| 软标签质量如何逐轮可视化 | [dynamic/callback.py](dynamic/callback.py): `SoftLabelVisualizationCallback` |
 | 如何做整片预测和指标计算 | [inference/predictor.py](inference/predictor.py), [inference/validation.py](inference/validation.py) |
 
 ## 目录职责
@@ -100,14 +101,36 @@ Lightning 负责 backward、梯度裁剪、AdamW 更新和每 epoch 的学习率
 - 图拓扑固定 (crop 内 SNIC 邻接), 只有边上的 gate 可学; base conductance 由 Lab + 模型中间特征差固定且 detach, 梯度只走 gate
 - 求解器是对 Dirichlet 系统跑的 Jacobi 预条件 CG (默认 85 步 / 1e-8 早停); 度分布极不均时裸 CG 与 Jacobi 收敛都不可用, 见 `tools/validate_jacobi_scipy.py` 的对照
 - 软目标经 `soft_segmentation_loss` 反传, 不做阈值化; 无解样本 (种子全在组织外) 被剔除, 原有硬伪标签项继续覆盖
-- 诊断量记录在 `train/propagation/*`: `pcg_steps`、`gate_mean`、`gate_std`、`valid_fraction`
+- 诊断量记录在 `train/propagation/*`: `pcg_steps`、`gate_mean`、`gate_std`、`valid_fraction`（组织内拿到确定监督的像素比例, 分母是前景像素; 组织外不参与监督）
+
+| 档位 | 配置 | 检验的假设 |
+| --- | --- | --- |
+| 基线 | `enabled=false` | 纯硬伪标签 |
+| 1 (默认) | `enabled=true` (`gate_range=0.3`, `feature_gradients=false`) | 逐边 gate 修正是否有增益 |
+| 1' | `enabled=true, gate_range=0` | 只换软标签、核固定 |
+| 2 | `enabled=true, gate_range=0, feature_gradients=true` | 表示学习能否替代逐边修正 |
+| 3 | `enabled=true, feature_gradients=true` | 两者同开, 自指风险最高 |
+
+`feature_gradients=true` 时 base 与模型特征不再 detach, 传播损失会回传到 backbone——监督信号的生成器开始被它生成的监督训练。开档 2/3 要盯 `valid_fraction`（监督区域是否萎缩）和软标签可视化（是否坍缩成模型预测的副本）。
 
 ```bash
-# 开启可微传播并与硬标签监督共存
+# 开启可微传播并与硬标签监督共存 (档 1)
 python -m segmodel.main experiment.propagation.enabled=true \
     experiment.training.image.loss_weights.propagation=1.0
-# 数值对照: PCG vs scipy、梯度有限差分、端到端训练步
+# 档 2: 固定核 + 开特征
+python -m segmodel.main experiment.propagation.enabled=true \
+    experiment.training.image.loss_weights.propagation=1.0 \
+    experiment.propagation.gate_range=0.0 \
+    experiment.propagation.feature_gradients=true
+# 数值对照: PCG vs scipy、gate 梯度、特征梯度、端到端训练步
 python -m unittest tests.test_diff_propagation tests.test_propagation_training -v
+```
+
+`experiment.soft_label.enabled=true` 时, `SoftLabelVisualizationCallback` 每 `interval_epochs` 轮对训练切片整片推理, 用当前模型特征和门控重算软标签并保存到 `soft_labels/epoch_XXXX/<slide>/`, 只读诊断、不写回数据集: 概率场 (uint16 PNG)、阈值化伪标签与叠加图、spot 种子图、与模型概率的对照面板和 `metadata.json`。它需要 `propagation.enabled=true`, 每个可视轮次多一次整片推理。
+
+```bash
+# 软标签可视化: her2st 默认开启, 用下面这条关掉
+python -m segmodel.main ... experiment.soft_label.enabled=false
 ```
 
 ## 数据与张量约定
@@ -143,7 +166,7 @@ python -m segmodel.main experiment=her2st seeds='[0]'
 
 配置由 `configs/config.yaml` 组合, 实验参数位于 `cfg.experiment` 下。公共分辨率配置读取项目根的 `config/resolution.yaml`。
 
-每个 fold 仍保存 `config.yaml`、`split.json`、`vae/`、`segmentation/`、`final_model.pt`、`test/<slide>/` 和 `metrics.json`; 启用相应流程时还写入 `validation/` 与 `dynamic_pseudo_labels/`。
+每个 fold 仍保存 `config.yaml`、`split.json`、`vae/`、`segmentation/`、`final_model.pt`、`test/<slide>/` 和 `metrics.json`; 启用相应流程时还写入 `validation/`、`dynamic_pseudo_labels/` 与 `soft_labels/`。
 
 ## 图像骨干初始化
 
