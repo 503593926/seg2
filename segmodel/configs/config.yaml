@@ -1,7 +1,7 @@
 defaults:
   - resolution@resolution
   - _self_
-  - experiment: her2st
+  - experiment: her2st_gene_guided
 
 experiment_name: ${hydra:runtime.choices.experiment}
 seeds: [0, 2027, 3407]

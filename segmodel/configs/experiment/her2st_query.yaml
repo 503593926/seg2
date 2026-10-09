@@ -1,0 +1,31 @@
+defaults:
+  - her2st
+  - _self_
+
+propagation_supervision:
+  enabled: true
+propagation:
+  enabled: true
+  feature_gradients: true
+  gate_range: 0.0
+dynamic:
+  enabled: false
+soft_label:
+  enabled: false  # 原回调使用全片全部种子, 不代表每步随机隐藏后的训练目标
+augment:
+  mixup:
+    enabled: false
+  cutmix:
+    enabled: false
+training:
+  vae:
+    pretrain_epochs: 0
+  image:
+    loss_weights:
+      segmentation: 0.0
+      affinity: 0.0
+      superpixel: 0.0
+      molecular: 0.0
+      relation: 0.0
+      propagation: 1.0
+      propagation_query: 1.0

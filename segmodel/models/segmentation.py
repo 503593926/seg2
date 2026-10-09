@@ -37,6 +37,7 @@ class SegmentationModel(nn.Module):
         skip_drop_path=0.1,
         drop_path=(0.1, 0.1, 0.1),
         backbone_init="pytorch",
+        gene_count=0,
     ):
         super().__init__()
         if backbone_init not in ("pytorch", "convnext"):
@@ -89,6 +90,13 @@ class SegmentationModel(nn.Module):
                 init_convnext_backbone(self.stem)
                 init_convnext_backbone(self.unet)
 
+        self.gene_count = int(gene_count)
+        self.gene_head = None
+        if self.gene_count:
+            # 新分支不改变骨干初始化和后续训练的随机数序列。
+            with torch.random.fork_rng(devices=[]):
+                self.gene_head = nn.Conv2d(self.feature_channels, self.gene_count, 1)
+
     def forward(self, image, patch, cls, available=None):
         # PFM 分成任务特征 f1 和身份特征 f2, 屏蔽同时作用于两者。
         task_global, identity_global = self.global_decomposer(
@@ -112,13 +120,17 @@ class SegmentationModel(nn.Module):
 
         # 分割、邻接、动态传播和 PFM 解耦共用本次前向结果。
         propagation = self.propagation(decoded_fm)
-        return {
+        output = {
             "logits": self.segmentation_head(propagation),
             "affinity_logits": self.affinity_head(decoded_fm),
             "features": decoded_fm,
             "propagation_features": propagation,
             **self._decomposition(task_global, identity_global, task_spatial, identity_spatial),
         }
+        if self.gene_head is not None:
+            # 输出在线性相对表达空间; spot 聚合后才 log1p。
+            output["gene_expression"] = F.softplus(self.gene_head(decoded_fm).float())
+        return output
 
 
     def _decomposition(self, task_global, identity_global, task_spatial, identity_spatial):

@@ -137,7 +137,9 @@ def predict_slide(
 
     features = None
     if return_features:
-        features = feature_sum / np.maximum(feature_weight[..., None], 1e-6)
+        # 稠密基因图通道较多, 原地归一化避免再复制一份整片表达场。
+        feature_sum /= np.maximum(feature_weight[..., None], 1e-6)
+        features = feature_sum
     probability = cv2.resize(
         probability_sum / np.maximum(probability_weight, 1e-6),
         (width, height),

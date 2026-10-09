@@ -1,0 +1,7 @@
+defaults:
+  - her2st_gene_guided
+  - _self_
+
+# 相同的 7mpp 稠密基因头、全部有效 spot 监督, 仅关闭分子边权调制。
+propagation_supervision:
+  gene_edge_strength: 0.0

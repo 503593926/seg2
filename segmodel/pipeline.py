@@ -16,6 +16,7 @@ from omegaconf import OmegaConf
 from pytorch_lightning.loggers import CSVLogger
 
 from segmodel.dataset.datamodule import FoldDataModule
+from segmodel.dataset.loading import load_gene_adata
 from segmodel.dynamic.callback import (
     DynamicPropagationCallback,
     SoftLabelVisualizationCallback,
@@ -28,6 +29,7 @@ from segmodel.modules.propagation import DifferentiablePropagation
 from segmodel.training.callbacks import DatasetEpochCallback, MetricsBelowRichProgressBar
 from segmodel.training.distillation import Distiller
 from segmodel.training.gene_module import GeneVAEModule
+from segmodel.training.propagation_supervision import PropagationSupervision
 from segmodel.training.segmentation_module import SegmentationModule
 
 
@@ -97,6 +99,8 @@ def _pretrain_gene_vae(cfg, data_module, output_dir):
         hidden_dims=tuple(gene_cfg.hidden_dims),
         dropout=float(gene_cfg.dropout),
     )
+    if int(cfg.experiment.training.vae.pretrain_epochs) <= 0:
+        return gene_vae
     module = GeneVAEModule(gene_vae, cfg.experiment.training.vae)
     trainer = pl.Trainer(
         accelerator=str(runtime_cfg.accelerator),
@@ -124,11 +128,17 @@ def _train_segmentation(cfg, data_module, gene_vae, tiling, output_dir):
     label_scale = slide.label_scale
     model_cfg = cfg.experiment.model.image
     train_cfg = cfg.experiment.training.image
+    model_options = cast(dict[str, Any], OmegaConf.to_container(model_cfg, resolve=True))
+    supervision_cfg = cfg.experiment.get("propagation_supervision", {})
+    if supervision_cfg.get("enabled", False) and supervision_cfg.get("gene_mode") == "prediction":
+        model_options["gene_count"] = data_module.train_gene_adata.n_vars
     model = SegmentationModel(
         pfm_patch_dims=slide.patch_dims,
         pfm_cls_dims=slide.cls_dims,
-        **cast(dict[str, Any], OmegaConf.to_container(model_cfg, resolve=True)),
+        **model_options,
     )
+    if model.gene_count:
+        model.gene_names = list(map(str, data_module.train_gene_adata.var_names))
     distiller = Distiller(
         model,
         gene_vae,
@@ -137,10 +147,11 @@ def _train_segmentation(cfg, data_module, gene_vae, tiling, output_dir):
     )
     propagation = None
     if bool(cfg.experiment.propagation.enabled):
-        if float(train_cfg.loss_weights.get("propagation", 0)) == 0:
+        propagation_losses = ("propagation", "propagation_query", "gene_propagation", "gene_auxiliary", "gene_prediction")
+        if not any(float(train_cfg.loss_weights.get(name, 0)) for name in propagation_losses):
             raise ValueError(
                 "experiment.propagation.enabled=true 但 "
-                "loss_weights.propagation=0, 该项不会进入总损失"
+                "所有传播相关 loss_weights 均为 0, 传播不会进入总损失"
             )
         propagation_cfg = cast(
             dict[str, Any],
@@ -151,6 +162,7 @@ def _train_segmentation(cfg, data_module, gene_vae, tiling, output_dir):
             label_scale=label_scale,
             **propagation_cfg,
         )
+    supervision = _build_propagation_supervision(cfg, data_module, model, propagation, slide)
     module = SegmentationModule(
         model,
         distiller,
@@ -162,6 +174,7 @@ def _train_segmentation(cfg, data_module, gene_vae, tiling, output_dir):
         visualization_dir=output_dir / "validation",
         label_scale=label_scale,
         propagation=propagation,
+        propagation_supervision=supervision,
     )
     callbacks: list[pl.Callback] = [
         DatasetEpochCallback(),
@@ -210,6 +223,48 @@ def _train_segmentation(cfg, data_module, gene_vae, tiling, output_dir):
     return module
 
 
+def _build_propagation_supervision(cfg, data_module, model, propagation, slide):
+    supervision_cfg = cfg.experiment.get("propagation_supervision")
+    weights = cfg.experiment.training.image.loss_weights
+    names = ("propagation_query", "gene_auxiliary", "gene_propagation", "gene_prediction")
+    active = supervision_cfg is not None and bool(supervision_cfg.enabled)
+    if not active:
+        if any(float(weights.get(name, 0)) for name in names):
+            raise ValueError("Propagation supervision losses require propagation_supervision.enabled=true")
+        return None
+    if propagation is None:
+        raise ValueError("Propagation supervision requires propagation.enabled=true")
+    if cfg.experiment.dynamic.enabled or any(
+        float(weights.get(name, 0)) for name in ("segmentation", "affinity", "superpixel")
+    ) or any(cfg.experiment.augment[name].enabled for name in ("mixup", "cutmix")):
+        raise ValueError(
+            "Hidden-spot supervision requires dynamic=false, segmentation/affinity/superpixel=0 "
+            "and mixup/cutmix=false: existing full-seed pseudo labels would reveal queries"
+        )
+    mode = str(supervision_cfg.gene_mode)
+    for name, expected in (("gene_auxiliary", "auxiliary"), ("gene_propagation", "propagation"), ("gene_prediction", "prediction")):
+        if bool(float(weights.get(name, 0))) != (mode == expected):
+            raise ValueError(f"{name} weight must be nonzero exactly when gene_mode={expected}")
+    if mode == "prediction" and model.gene_count != data_module.train_gene_adata.n_vars:
+        raise ValueError("gene_mode=prediction requires a dense model gene head matching the selected genes")
+    if any(float(weights.get(name, 0)) for name in ("propagation_query", "gene_propagation")):
+        molecular_gradients = (
+            mode == "prediction" and float(supervision_cfg.gene_edge_strength) > 0
+            and not supervision_cfg.detach_gene_edges
+        )
+        if not propagation.feature_gradients and propagation.gate.gate_range == 0 and not molecular_gradients:
+            raise ValueError("Query losses require feature_gradients=true or a learnable gate")
+    if str(supervision_cfg.expression_transform) == "log1p" and "log1p" not in data_module.train_gene_adata.uns:
+        raise ValueError("expression_transform=log1p requires log1p expression metadata")
+    options = cast(dict[str, Any], OmegaConf.to_container(supervision_cfg, resolve=True))
+    options.pop("enabled")
+    return PropagationSupervision(
+        feature_channels=model.feature_channels, gene_count=data_module.train_gene_adata.n_vars,
+        spot_radius_px=slide.spot_radius_px, label_scale=slide.label_scale,
+        seed=data_module.seed, **options,
+    )
+
+
 def _save_final_model(cfg, model, tiling, output_dir):
     """保存权重与重建所需信息，让 checkpoint 自描述（供外部单跑推理）。"""
     model_config = cast(
@@ -218,6 +273,7 @@ def _save_final_model(cfg, model, tiling, output_dir):
     )
     model_config["pfm_patch_dims"] = list(model.pfm_patch_dims)
     model_config["pfm_cls_dims"] = list(model.pfm_cls_dims)
+    model_config["gene_count"] = model.gene_count
     artifact = {
         "state_dict": {
             name: value.detach().cpu() for name, value in model.state_dict().items()
@@ -226,12 +282,22 @@ def _save_final_model(cfg, model, tiling, output_dir):
         "inference_config": {**tiling, "threshold": 0.5},
         "image_feature_map": list(cfg.experiment.dataset.image_feature_maps),
     }
+    if model.gene_count:
+        artifact["gene_names"] = model.gene_names
+        artifact["gene_expression_space"] = "linear_relative_expression"
     torch.save(artifact, output_dir / "final_model.pt")
 
 
 def _test_final_model(cfg, data_module, model, device, tiling, output_dir):
     """整片测试：逐张预测、落盘概率图与指标，返回汇总指标。"""
     data_module.setup("test")
+    gene_options = {}
+    if model.gene_count:
+        gene_options = {
+            "gene_adata": load_gene_adata(data_module.gene_path, data_module.test_names),
+            "spot_radius_px": float(cfg.experiment.dataset.spot_diameter_um) / (2 * float(cfg.resolution.target_mpp)),
+            "expression_transform": str(cfg.experiment.propagation_supervision.expression_transform),
+        }
     slide_metrics = {}
     try:
         for slide in data_module.test_dataloader():
@@ -242,6 +308,7 @@ def _test_final_model(cfg, data_module, model, device, tiling, output_dir):
                 device,
                 **tiling,
                 mpp=float(cfg.resolution.target_mpp),
+                **gene_options,
             )
             slide_dir = output_dir / "test" / slide.name
             slide_dir.mkdir(parents=True, exist_ok=True)

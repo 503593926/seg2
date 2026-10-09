@@ -17,6 +17,7 @@
 | PFM 如何解耦、选择和注入网络 | [modules/conditioning.py](modules/conditioning.py) |
 | 可微标签传播如何求解、可学什么 | [modules/propagation.py](modules/propagation.py): `DifferentiablePropagation` |
 | 图像 spot 如何接受基因监督 | [training/distillation.py](training/distillation.py): `Distiller` |
+| 隐藏 spot 如何校准传播, 与普通基因辅助任务如何对照 | [training/propagation_supervision.py](training/propagation_supervision.py) |
 | 每项损失的具体公式 | [training/losses.py](training/losses.py) |
 | 如何读取文件、准备不同训练阶段 | [dataset/loading.py](dataset/loading.py), [dataset/datamodule.py](dataset/datamodule.py) |
 | crop 如何采样、增强和配对 spot | [dataset/segmentation.py](dataset/segmentation.py), [dataset/augment.py](dataset/augment.py) |
@@ -93,6 +94,131 @@ Lightning 负责 backward、梯度裁剪、AdamW 更新和每 epoch 的学习率
 | 最终保存和整片测试 | 普通图像模型 |
 
 动态传播在满足轮次条件时进行整片推理, 按配置重算或复用超像素拓扑, 吸附 spot 并执行随机游走, 然后阈值化概率。只有存在可采样窗口且概率有限时才提交监督更新。该行为沿用原实现。
+
+## 隐藏 spot 与分子观测校准传播
+
+新增实验是训练期监督, 不修改图像模型的推理输入。默认 `experiment=her2st`
+关闭这些功能。新实验不使用 VAE 蒸馏, `pretrain_epochs=0` 跳过 VAE 训练。
+
+每步按中心超像素整组隐藏约 25% 的 spot, 尽可能各保留一个癌/非癌 anchor
+节点。同节点 spot 一并隐藏, 避免另一个 spot 的标签直接钳制 query。
+各模式使用相同、独立于训练随机数的划分; 数量不足时 query 可以为零。
+隐藏的是本步传播输入, 并不是额外的测试集; 最终效果仍由留出患者评估。
+
+训练目标为:
+
+`L = L_soft_seg(p, stopgrad(q)) + λ_query BCE(q_query, y_query) + λ_gene L_gene`。
+
+软伪标签只更新分割预测, query 真值损失通过 RW 更新边权及模型特征。
+独立开关 `detach_pseudo_target=false` 可恢复原先的目标侧梯度, 做额外消融。
+旧的硬伪标签项、Mixup/CutMix 与动态 DPR 必须关闭, 防止全种子生成的目标
+重新暴露 query。原全种子软标签可视化回调也在新配置中关闭; 分割验证照常。
+
+| experiment | 作用 | 基因损失权重 |
+| --- | --- | --- |
+| `her2st` | 原来的在线可微 RW 基线 | 0 |
+| `her2st_masked` | 相同隐藏划分和 stop-gradient, 不加 query 真值损失 | 0 |
+| `her2st_query` | 隐藏 spot 类别真值校准传播 | 0 |
+| `her2st_gene_auxiliary` | query 类别监督 + 普通图像→基因辅助头 | 0.1 |
+| `her2st_gene_propagation` | query 类别监督 + 真实表达校准同一组传播边权 | 0.1 |
+| `her2st_gene_shuffle` | 上一项的 anchor 表达在同 crop 内错位置换 | 0.1 |
+
+普通辅助头由未标准化的节点图像均值预测非负表达。分子传播分支则复用
+类别传播**同一次前向的边权** W。令 A 的每行是一个 spot 圆盘内各超像素
+组织面积的比例, 使用 anchor 的线性表达 G 解二次系统:
+
+`(A_anchor.T A_anchor + λ L_W + ε I) Z = A_anchor.T G_anchor + ε Z_prior`。
+
+`Z_prior` 是各 crop 自己的 anchor 表达均值, 不混合不同样本。解后将 Z 截断
+到非负范围, 用 `A_query Z` 预测隐藏 spot, 再与真实表达计算 MSE。该过程是
+二次重建加非负投影, 不是精确的带非负约束最优化。无 anchor 支持的连通
+区域不会贡献 query 损失, 两种基因分支使用相同的可监督 query 范围。
+
+HER2ST 的输入是 CP10k + `log1p`, 因而先 `expm1` 在线性相对表达空间求解、
+按组织面积加权均值聚合, 再 `log1p` 算损失。这里采用等面积相对表达近似,
+不把归一化表达当绝对分子计数, 不在 log 空间直接求均值。隐藏 spot 的
+表达既不进入 RHS 也不进入先验。癌/非癌标签仍监督中心节点的类别,
+不解释成圆盘内癌组织比例。
+
+表达求解使用 batch 块对角稀疏观测与 Jacobi-PCG, 每个 crop × 基因独立
+停止。反向解伴随系统, 不保留全部基因的迭代计算图。日志中的
+`train/propagation/gene_pcg_relative_residual` 是投影前线性系统的最大相对
+残差; 达到迭代上限并不等于收敛, 必要时增大 `gene_steps`。同时记录
+`query_count`、`label_queries`、`label_mixed_queries`、`gene_queries` 和
+`label_query_accuracy`。单类别种子的分量通常不提供边界学习梯度,
+所以要特别检查 `label_mixed_queries`。
+
+节点表达在同一超像素内为常数; 7mpp 网格不等于已验证的 7µm 分子分辨率。
+该分支用于训练传播关系, 不是无需表达种子就能预测基因的推理器。
+
+先比较 masked/query, 再比较 auxiliary/propagation/shuffle, 统一训练轮数、
+种子与 EMA/普通模型的评估口径。RAWKS 原文算法尚未在这里复现。
+
+```bash
+# 从项目根目录运行。seeds=[0] 仍会依次跑当前数据配置的全部 LOOCV folds。
+/home/yfm/miniconda3/envs/seg/bin/python -m segmodel.main experiment=her2st_query 'seeds=[0]'
+/home/yfm/miniconda3/envs/seg/bin/python -m segmodel.main experiment=her2st_gene_propagation 'seeds=[0]'
+```
+
+```bash
+NO_ALBUMENTATIONS_UPDATE=1 MPLCONFIGDIR=/tmp/seg2_mpl OMP_NUM_THREADS=2 \
+  /home/yfm/miniconda3/envs/seg/bin/python -m unittest discover -s tests -p 'test_*propagation*.py'
+```
+
+## 图像预测表达驱动标签传播
+
+在 `configs/config.yaml` 的 defaults 中选择 `experiment: her2st_gene_guided`,
+随后按原方式运行程序。`her2st_gene_prediction` 是同一稠密基因头、同一监督范围,
+仅关闭分子边权调制的对照。原 `her2st_gene_propagation` 配置与观测重建机制保留。
+
+新模式为 `propagation_supervision.gene_mode: prediction`:
+
+1. 模型在 MoMu 解码特征上增加 1×1 Conv + Softplus, 输出 7mpp 稠密线性相对表达。
+   基因数自动取训练 adata 的 n_vars, 不固定为 512。表达图保留超像素内部变化。
+2. 对每个有效训练 spot, 直接按圆盘内组织像素取表达均值; HER2ST 在聚合后
+   log1p, 与真实 log1p 表达计算 MSE。真实表达只作目标, 不作为网络或 RW 输入。
+   表达监督覆盖全部有效训练 spot, 不依赖类别标签是否已知、是否隐藏或图是否有边。
+3. 表达图先按超像素求线性均值, 再 log1p, 得到节点表达 e。相邻节点的
+   `d_ij = mean_gene((e_i-e_j)^2)`, 分子调制为
+   `m_ij = 1 + alpha * (2*exp(-beta_gene*d_ij)-1)`;
+   实际类别 RW 使用 `W_ij = W_visual_ij * m_ij`。
+   相似表达加强连接, 差异表达减弱连接; alpha=0.3 时因子在 [0.7,1.3]。
+   所有基因等权, 不是已验证的生物程序或癌症专用相似度。
+4. 类别 spot 仍按原规则隐藏, 用类别 query 真值训练 RW。软伪标签停止梯度。
+   默认类别 query 损失可经分子调制回传到表达头; 基因真值损失同时约束表达准确性。
+
+主要配置:
+
+```yaml
+propagation_supervision:
+  gene_mode: prediction
+  gene_edge_strength: 0.3  # 0: 关闭调制, 对应 her2st_gene_prediction
+  gene_edge_beta: 1.0
+  detach_gene_edges: false  # true: 切断类别 query 损失到预测表达的梯度
+training:
+  image:
+    loss_weights:
+      propagation: 1.0
+      propagation_query: 1.0
+      gene_prediction: 0.1
+```
+
+训练日志 `train/gene_prediction` 是全部有效 spot 的未加权表达 MSE,
+`train/propagation/gene_spots` 是每 batch 的有效表达 spot 数。
+`train/propagation/molecular_mean/std/min/max` 监控实际调制因子。
+旧 `gene_queries` 指观测重建的隐藏表达监督, 不用于判断新分支是否有监督。
+
+验证和最终测试通过同一次图像推理拼接稠密表达图, 在整片真实 spot 上计算
+`val/gene_prediction` (log1p MSE)、`val/gene_prediction_pcc` (逐基因跨 spot PCC 的均值),
+并记录 `val/gene_spots`、`val/gene_pcc_genes`。常数预测或常数真值基因不进入 PCC;
+没有有效 spot 时误差为 NaN, 不记成零。验证无需表达 anchor 或隐藏表达。
+LOOCV 的 val 仍是外层留出患者, 调参应使用训练患者内部验证。
+整片表达拼接会增加主存占用, 随组织面积和基因数增长。
+
+表达头参与模型 EMA, 随 final_model.pt 保存, artifact 包含 gene_count 和有序 gene_names。
+模型输出 `gene_expression` 为 `(B,G,H/7,W/7)` (HER2ST 几何), 单位是非负线性相对表达。
+分割推理不使用真实表达或类别种子; RW 是训练伪标签生成器。
+7mpp 输出网格不是已验证的 7µm 分子分辨率, 当前 spot 监督不能唯一确定 spot 内细节。
 
 ## 可微标签传播 (实验开关)
 

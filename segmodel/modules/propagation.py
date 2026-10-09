@@ -18,6 +18,8 @@ from scipy.sparse.csgraph import connected_components
 from torch import nn
 from torch.nn import functional as F
 
+from segmodel.modules.graph_measurements import node_average
+
 
 class ConductionGate(nn.Module):
     """每条边一个标量调制, 输入是相邻节点的特征差。初始化接近恒等。
@@ -247,12 +249,17 @@ class DifferentiablePropagation(nn.Module):
         self.feature_gradients = bool(feature_gradients)
         self.gate = ConductionGate(gate_range)
 
-    def forward(self, superpixels, features, rgb, spot_labels, spot_positions):
+    def forward(
+        self, superpixels, features, rgb, spot_labels, spot_positions, *, return_graph=False,
+        molecular_expression=None, molecular_strength=0.0, molecular_beta=1.0,
+        detach_molecular=False,
+    ):
         """superpixels (B,1,H,W) int64, features (B,C,H,W), rgb (B,3,H,W) float,
         spot 列表为 batch 字段 (变长)。
 
         返回 (sample_indices, soft_target, valid, diagnostics), 其中只包含可解样本。
-        全部样本都不可解时返回 None, 调用方回退到硬伪标签监督。
+        全部样本都不可解时返回 None。return_graph=True 另返回本次实际使用的
+        批图, 供隐藏 spot 的独立监督复用边权, 不额外构造第二套传播关系。
         """
         batch = superpixels.shape[0]
         prepared = [
@@ -262,16 +269,24 @@ class DifferentiablePropagation(nn.Module):
                 rgb[index],
                 spot_labels[index],
                 spot_positions[index],
+                allow_unseeded=return_graph,
+                molecular_expression=None if molecular_expression is None else molecular_expression[index],
+                molecular_strength=molecular_strength, molecular_beta=molecular_beta,
+                detach_molecular=detach_molecular,
             )
             for index in range(batch)
         ]
         indices = [index for index, item in enumerate(prepared) if item is not None]
         if not indices:
-            return None
+            return (None, None) if return_graph else None
         prepared = [prepared[index] for index in indices]
-        return self._solve_batch(superpixels, indices, prepared)
+        return self._solve_batch(superpixels, indices, prepared, return_graph=return_graph)
 
-    def _sample_graph(self, superpixels, features, rgb, spot_labels, spot_positions):
+    def _sample_graph(
+        self, superpixels, features, rgb, spot_labels, spot_positions, *, allow_unseeded=False,
+        molecular_expression=None, molecular_strength=0.0, molecular_beta=1.0,
+        detach_molecular=False,
+    ):
         """单样本: 节点/边/边特征/种子。返回 None 表示该样本无有效图。"""
         unique = torch.unique(superpixels)
         nodes = unique[unique > 0]
@@ -311,14 +326,24 @@ class DifferentiablePropagation(nn.Module):
         edge_delta = difference.square().sum(dim=-1)
         edge_l1 = difference.abs().sum(dim=-1)
 
+        molecular = torch.ones_like(edge_delta)
+        if molecular_expression is not None and molecular_strength:
+            # 预测表达在线性空间取节点均值, log1p 后比较相邻节点。
+            expression = node_average(molecular_expression, superpixels, nodes).log1p()
+            if detach_molecular:
+                expression = expression.detach()
+            distance = (expression[local_edges[:, 0]] - expression[local_edges[:, 1]]).square().mean(1)
+            similarity = torch.exp(-molecular_beta * distance)
+            molecular = 1 + molecular_strength * (2 * similarity - 1)
+
         seeds = scatter_seed_values(
             superpixels, spot_labels, spot_positions, nodes, self.label_scale
         )
-        if not bool((seeds != 255).any()):
+        if not allow_unseeded and not bool((seeds != 255).any()):
             return None
-        return lookup, local_edges, nodes, seeds, edge_delta, edge_l1
+        return lookup, local_edges, nodes, seeds, edge_delta, edge_l1, molecular
 
-    def _solve_batch(self, superpixels, indices, prepared):
+    def _solve_batch(self, superpixels, indices, prepared, *, return_graph=False):
         """批级求解: 节点整体偏移后一次 PCG; 不可解节点保持 0.5。
 
         返回 (sample_indices, soft, valid, diagnostics), 只覆盖可解样本。
@@ -330,26 +355,29 @@ class DifferentiablePropagation(nn.Module):
             offsets.append(total)
             total += int(item[2].numel())
 
-        global_edges, global_delta, global_l1 = [], [], []
+        global_edges, global_delta, global_l1, global_molecular = [], [], [], []
         global_seed = torch.full((total,), 255, dtype=torch.long, device=device)
         for offset, item in zip(offsets, prepared):
-            _, local_edges, nodes, seeds, edge_delta, edge_l1 = item
+            _, local_edges, nodes, seeds, edge_delta, edge_l1, molecular = item
             global_edges.append(local_edges + offset)
             global_delta.append(edge_delta)
             global_l1.append(edge_l1)
+            global_molecular.append(molecular)
             global_seed[offset : offset + nodes.numel()] = seeds
 
         edges = torch.cat(global_edges)
         delta_squared = torch.cat(global_delta)
         delta_l1 = torch.cat(global_l1)
+        molecular = torch.cat(global_molecular)
 
         seeded = global_seed != 255
 
         # 连通分量: 只有含种子的连通区域可解, 与现有实现一致
         seeded_numpy = seeded.cpu().numpy()
         solvable_flags = []
+        components, component_offset = [], 0
         for offset, item in zip(offsets, prepared):
-            _, local_edges, nodes, _, _, _ = item
+            _, local_edges, nodes, _, _, _, _ = item
             labels = component_labels(
                 int(nodes.numel()), local_edges[:, 0], local_edges[:, 1]
             )
@@ -357,9 +385,11 @@ class DifferentiablePropagation(nn.Module):
                 labels[seeded_numpy[offset : offset + nodes.numel()]]
             )
             solvable_flags.append(np.isin(labels, seeded_labels))
+            components.append(labels + component_offset)
+            component_offset += int(labels.max()) + 1
         solvable = torch.from_numpy(np.concatenate(solvable_flags)).to(device)
         interior = solvable & ~seeded
-        if not bool(interior.any()):
+        if not return_graph and not bool(interior.any()):
             return None
 
         # bf16-mixed 下 gate 的 Linear 会被 autocast 降精度, 而求解器按 fp32 验证过
@@ -368,7 +398,8 @@ class DifferentiablePropagation(nn.Module):
             gate = self.gate(delta_squared, delta_l1, base.detach())
             # 默认只让梯度走 gate (base 与特征已 detach); 打开 feature_gradients
             # 后传播损失回传到模型特征, 核仍是同一公式
-            conductance = (base if self.feature_gradients else base.detach()) * gate
+            visual_conductance = (base if self.feature_gradients else base.detach()) * gate
+            conductance = visual_conductance * molecular
             seed_values = torch.where(
                 seeded,
                 (global_seed == 1).to(conductance.dtype),
@@ -389,7 +420,7 @@ class DifferentiablePropagation(nn.Module):
         kept_indices = []
         soft, valid, foreground = [], [], []
         for index, offset, item in zip(indices, offsets, prepared):
-            _, _, nodes, _, _, _ = item
+            _, _, nodes, _, _, _, _ = item
             sample_solvable = solvable[offset : offset + nodes.numel()]
             if not bool(sample_solvable.any()):
                 continue
@@ -412,23 +443,35 @@ class DifferentiablePropagation(nn.Module):
                 )
             )
 
-        if not kept_indices:
-            return None
-
-        valid_tensor = torch.stack(valid)
-        diagnostics = {
-            "pcg_steps": float(used),
-            "gate_mean": float(gate.detach().mean()),
-            "gate_std": float(gate.detach().std(unbiased=False)),
-            # 分母是前景像素: 报告"组织内有多大比例拿到了确定监督"
-            "valid_fraction": float(
-                valid_tensor.sum()
-                / torch.stack(foreground).sum().clamp_min(1)
-            ),
+        result = None
+        if kept_indices:
+            valid_tensor = torch.stack(valid)
+            diagnostics = {
+                "pcg_steps": float(used),
+                "gate_mean": float(gate.detach().mean()),
+                "gate_std": float(gate.detach().std(unbiased=False)),
+                "valid_fraction": float(
+                    valid_tensor.sum() / torch.stack(foreground).sum().clamp_min(1)
+                ),
+            }
+            result = (
+                kept_indices,
+                torch.stack(soft).unsqueeze(1),
+                valid_tensor.unsqueeze(1),
+                diagnostics,
+            )
+        if not return_graph:
+            return result
+        return result, {
+            "indices": indices,
+            "nodes": [item[2] for item in prepared],
+            "offsets": offsets,
+            "edges": edges,
+            "conductance": conductance,
+            "visual_conductance": visual_conductance,
+            "molecular_modulation": molecular,
+            "probability": values,
+            "solvable": solvable,
+            "seed_labels": global_seed,
+            "components": torch.from_numpy(np.concatenate(components)).to(device),
         }
-        return (
-            kept_indices,
-            torch.stack(soft).unsqueeze(1),
-            valid_tensor.unsqueeze(1),
-            diagnostics,
-        )

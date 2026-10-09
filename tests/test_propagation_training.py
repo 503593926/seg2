@@ -74,7 +74,7 @@ def build_batch(batch=2, crop=112, label_scale=7, pfm_count=2, spot_count=6):
     }
 
 
-def build_module(propagation=None):
+def build_module(propagation=None, gene_count=0):
     torch.manual_seed(0)
     model = SegmentationModel(
         pfm_patch_dims=(6, 6),
@@ -85,6 +85,7 @@ def build_module(propagation=None):
         spatial_dim=4,
         propagation_channels=4,
         backbone_init="pytorch",
+        gene_count=gene_count,
     )
     distiller = Distiller(
         model,

@@ -1,0 +1,10 @@
+defaults:
+  - her2st_query
+  - _self_
+
+propagation_supervision:
+  gene_mode: propagation
+training:
+  image:
+    loss_weights:
+      gene_propagation: 0.1

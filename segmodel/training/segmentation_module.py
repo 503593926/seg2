@@ -31,6 +31,7 @@ class SegmentationModule(pl.LightningModule):
         visualization_dir=None,
         label_scale=1,
         propagation=None,
+        propagation_supervision=None,
     ):
         super().__init__()
         self.model = model
@@ -48,6 +49,7 @@ class SegmentationModule(pl.LightningModule):
         )
         self.label_scale = int(label_scale)
         self.propagation = propagation
+        self.propagation_supervision = propagation_supervision
 
         self.train_dice = BinaryF1Score(threshold=0.5)
         self.train_iou = BinaryJaccardIndex(threshold=0.5)
@@ -56,25 +58,31 @@ class SegmentationModule(pl.LightningModule):
         return self.model(image, patch, cls, pfm_mask)
 
     def _update_propagated_loss(self, losses, output, batch):
-        """用可微传播重算软标签, 作为 loss_weights.propagation 对应的项。
-
-        只对可解样本计算; 无解样本仍由原来的硬伪标签项覆盖。
-        """
+        """重算软标签; 可选地隐藏 spot, 用独立真值校准同一次传播的边权。"""
         if self.propagation is None:
             return
-        if float(self.image_cfg.loss_weights.get("propagation", 0)) == 0:
-            # 权重为 0 时该项不进总损失, 跳过多余的求解
+        names = ("propagation", "propagation_query", "gene_auxiliary", "gene_propagation", "gene_prediction")
+        if not any(float(self.image_cfg.loss_weights.get(name, 0)) for name in names):
             return
-        propagated = self.propagation(
-            batch["superpixels"].to(torch.long),
-            output["features"],
-            batch["image"],
-            batch["spot_labels"],
-            batch["spots"],
-        )
+        if self.propagation_supervision is None:
+            propagated = self.propagation(
+                batch["superpixels"].long(), output["features"], batch["image"],
+                batch["spot_labels"], batch["spots"],
+            )
+        else:
+            propagated, supervised, diagnostics = self.propagation_supervision(
+                self.propagation, output, batch, step=self.global_step,
+            )
+            losses.update(supervised)
+            self.log_dict(
+                {f"train/propagation/{name}": value for name, value in diagnostics.items()},
+                on_step=False, on_epoch=True, batch_size=len(batch["image"]),
+            )
         if propagated is None:
             return
         indices, soft, valid, diagnostics = propagated
+        if self.propagation_supervision is not None and self.propagation_supervision.detach_pseudo_target:
+            soft = soft.detach()
         losses["propagation"] = soft_segmentation_loss(
             output["logits"][indices], soft, valid
         )
@@ -102,8 +110,9 @@ class SegmentationModule(pl.LightningModule):
         loss = cast(
             torch.Tensor,
             sum(
-                float(weight) * losses.get(name, 0.0)
-                for name, weight in self.image_cfg.loss_weights.items()
+                (float(weight) * losses.get(name, 0.0)
+                 for name, weight in self.image_cfg.loss_weights.items()),
+                output["logits"].sum() * 0,
             ),
         )
 
@@ -147,6 +156,11 @@ class SegmentationModule(pl.LightningModule):
             image_parameters += [
                 (f"propagation.{name}", parameter)
                 for name, parameter in self.propagation.named_parameters()
+            ]
+        if self.propagation_supervision is not None:
+            image_parameters += [
+                (f"propagation_supervision.{name}", parameter)
+                for name, parameter in self.propagation_supervision.named_parameters()
             ]
         decay, no_decay = [], []
         for name, parameter in image_parameters:
@@ -195,6 +209,13 @@ class SegmentationModule(pl.LightningModule):
         # 留出切片验证使用 EMA; 最终测试使用的模型由 pipeline 决定。
         if self.validation_roots is None or self.tiling is None:
             return None
+        gene_options = {}
+        if self.propagation_supervision is not None and self.propagation_supervision.gene_mode == "prediction":
+            gene_options = {
+                "gene_adata": self.trainer.datamodule.val_gene_adata,
+                "spot_radius_px": self.propagation_supervision.spot_radius_px,
+                "expression_transform": self.propagation_supervision.expression_transform,
+            }
         probability, metrics = validate_slide(
             self.ema_model,
             slide,
@@ -202,6 +223,7 @@ class SegmentationModule(pl.LightningModule):
             self.device,
             **self.tiling,
             mpp=self.mpp,
+            **gene_options,
         )
         if self.visualization_dir is not None:
             labels, valid = load_expert_masks(self.validation_roots[slide.name], slide)
@@ -216,7 +238,8 @@ class SegmentationModule(pl.LightningModule):
         self.log_dict(
             {
                 f"val/{name}": float(metrics[name])
-                for name in ("loss", "dice", "iou", "hd95")
+                for name in metrics
+                if name in {"loss", "dice", "iou", "hd95"} or name.startswith("gene_")
             },
             on_step=False,
             on_epoch=True,

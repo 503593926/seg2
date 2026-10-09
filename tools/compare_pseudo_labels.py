@@ -123,8 +123,12 @@ def evaluate(directory, fraction, valid_count, min_pixels, bins=10, band=2):
     band_mask = (
         cv2.dilate(mask_uint8, kernel) - cv2.erode(mask_uint8, kernel)
     ).astype(bool)
-    in_band = covered & band_mask
+    # 分母只取专家标注有效的边界带格子: 无效格本来就不可能被监督, 计入会低估覆盖率
+    band_valid = band_mask & cell_valid
+    in_band = covered & band_valid
+    record["band_cells_valid"] = int(band_valid.sum())
     record["band_cells"] = int(in_band.sum())
+    record["band_coverage"] = float(in_band.sum() / max(int(band_valid.sum()), 1))
     if in_band.any():
         prediction = hard[in_band] == 1
         target = truth[in_band]
@@ -204,7 +208,7 @@ def main():
         f"/ {valid_count.size}, 阳性格子占比 "
         f"{float(((fraction >= 0.5) & (valid_count >= arguments.min_pixels)).sum() / max((valid_count >= arguments.min_pixels).sum(), 1)):.3f}"
     )
-    print(f"{'source':<26} {'coverage':>9} {'dice':>7} {'error':>7} {'band_dice':>9} {'band_err':>8} {'brier':>8} {'ece':>7}")
+    print(f"{'source':<26} {'coverage':>9} {'dice':>7} {'error':>7} {'band_cov':>9} {'band_dice':>9} {'band_err':>8} {'brier':>8} {'ece':>7}")
     records = []
     for name, directory in expand_sources(sources, arguments.slide):
         record = evaluate(
@@ -214,7 +218,8 @@ def main():
         records.append(record)
         print(
             f"{name:<26} {record['coverage']:>9.3f} {record['dice']:>7.4f} "
-            f"{record['error']:>7.4f} {record['band_dice']:>9.4f} "
+            f"{record['error']:>7.4f} {record['band_coverage']:>9.3f} "
+            f"{record['band_dice']:>9.4f} "
             f"{record['band_error']:>8.4f} {record['brier']:>8.5f} {record['ece']:>7.4f}"
         )
     if arguments.json:

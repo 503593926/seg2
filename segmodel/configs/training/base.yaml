@@ -22,6 +22,10 @@ image:
     molecular: 0.0
     relation: 0.0  # crop 内 spot 余弦相似度关系蒸馏
     propagation: 1.0  # 可微传播软标签项, 与 experiment.propagation.enabled 配合
+    propagation_query: 0.0  # 隐藏 spot 类别真值监督传播
+    gene_auxiliary: 0.0  # 普通图像→表达辅助预测对照
+    gene_propagation: 0.0  # 真实表达监督同一套传播边权
+    gene_prediction: 0.0  # 纯图像稠密表达预测, 所有有效训练 spot 监督
 
     pfm_cls_global: 0.0
     pfm_orth_global: 0.0

@@ -5,4 +5,5 @@ defaults:
   - /augment: her2st
   - /dynamic: her2st
   - /propagation: her2st
+  - /propagation_supervision: her2st
   - /soft_label: her2st

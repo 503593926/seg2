@@ -7,7 +7,7 @@ import torch
 from torch import nn
 from torch.nn import functional as F
 
-from segmodel.models.distiller import Distiller
+from segmodel.training.distillation import Distiller
 from segmodel.models.gene_vae import GeneVAE
 from segmodel.training.losses import relation_distillation_loss
 
@@ -72,7 +72,7 @@ class DistillerTest(unittest.TestCase):
         self.distiller.train()
         image_model = nn.Conv2d(1, 2, 1)
         optimizer = torch.optim.AdamW(
-            list(image_model.parameters()) + self.distiller.image_parameters, lr=0.01,
+            list(image_model.parameters()) + list(self.distiller.image_projector.parameters()), lr=0.01,
         )
         image_before = image_model.weight.detach().clone()
         projector_before = self.distiller.image_projector[0].weight.detach().clone()

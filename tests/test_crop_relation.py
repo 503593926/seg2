@@ -4,7 +4,7 @@ from types import SimpleNamespace
 import torch
 from torch.nn import functional as F
 
-from segmodel.models.distiller import Distiller
+from segmodel.training.distillation import Distiller
 from segmodel.models.gene_vae import GeneVAE
 from segmodel.training.losses import relation_distillation_loss
 
@@ -149,6 +149,6 @@ class CropRelationTest(unittest.TestCase):
             torch.testing.assert_close(features.grad[[1, 3]], torch.zeros_like(features.grad[[1, 3]]))
             assert any(
                 value.grad is not None and value.grad.abs().sum() > 0
-                for value in distiller.image_parameters
+                for value in distiller.image_projector.parameters()
             )
             assert all(value.grad is None for value in teacher.parameters())
