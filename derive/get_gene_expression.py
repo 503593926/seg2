@@ -13,6 +13,7 @@ from numpy.typing import NDArray
 from scipy.sparse import csr_matrix
 
 from derive.dataset_config import load_dataset_config
+from segmodel.dataset.splits import patient_folds
 
 
 def rank_genes(
@@ -297,6 +298,7 @@ def process_gene_expression(
     )
     combined = combined[:, common_genes].copy()
     combined.X = csr_matrix(combined.X, dtype=np.float32)
+    combined.obs['normalization_total_counts'] = np.asarray(combined.X.sum(axis=1)).reshape(-1)
     combined.obs_names = (
         combined.obs['name'].astype(str)
         + ':'
@@ -327,12 +329,20 @@ def prepare_tasks(
     svg_n_neighbors: int,
     target_mpp: float,
     union_rank_and_truncate: bool = False,
+    *,
+    patient_loocv: bool = False,
+    evaluation_names: list[str] | None = None,
 ) -> None:
-    task1_root = output_root / 'task1_loocv'
+    task1_root = output_root / ('task1_patient_loocv' if patient_loocv else 'task1_loocv')
     task1_root.mkdir(parents=True, exist_ok=True)
 
-    for test_name in names:
-        train_names = [name for name in names if name != test_name]
+    folds = patient_folds(evaluation_names or names, names) if patient_loocv else [
+        {'train': [name for name in names if name != test_name], 'test': [test_name]}
+        for test_name in names
+    ]
+    for fold in folds:
+        test_name = fold['test'][0]
+        train_names = fold['train']
         train_adatas = {name: sample_adatas[name] for name in train_names}
         common_genes, selected_gene_table = select_genes(
             train_adatas,
@@ -343,8 +353,12 @@ def prepare_tasks(
             union_rank_and_truncate,
         )
         selected_genes: list[str] = selected_gene_table['gene'].tolist()
-        test_genes = set(sample_adatas[test_name].var_names)
-        missing_selected = [gene for gene in selected_genes if gene not in test_genes]
+        test_expression = fold.get('test_expression', fold['test'])
+        missing_by_slide = {
+            name: [gene for gene in selected_genes if gene not in sample_adatas[name].var_names]
+            for name in test_expression
+        }
+        missing_selected = sorted(set().union(*map(set, missing_by_slide.values())))
 
         processed = process_gene_expression(
             sample_adatas,
@@ -358,7 +372,7 @@ def prepare_tasks(
         processed.uns.update(
             {
                 'task': 'image_gene_to_mask',
-                'cross_validation': 'loocv',
+                'cross_validation': 'patient_loocv' if patient_loocv else 'loocv',
                 'test_name': test_name,
                 'train_names': train_names,
                 'gene_selection_mode': selection_mode,
@@ -370,6 +384,17 @@ def prepare_tasks(
                 'missing_test_selected_gene_count': len(missing_selected),
             }
         )
+        if patient_loocv:
+            valid_counts = processed.obs['normalization_total_counts'].to_numpy() > 0
+            excluded_count = int((~valid_counts).sum())
+            processed = processed[valid_counts].copy()
+            processed.uns.update(
+                test_patient=fold['test_patient'],
+                test_segmentation_names=fold['test'],
+                test_expression_names=test_expression,
+                missing_selected_genes_by_slide={name: np.asarray(genes, dtype=str) for name, genes in missing_by_slide.items()},
+                excluded_zero_count_spots=excluded_count,
+            )
         processed.write_h5ad(
             task1_root / f'test_{test_name}.h5ad',
             compression='gzip',
@@ -380,6 +405,9 @@ def prepare_tasks(
             f'shape={processed.shape}',
             flush=True,
         )
+
+    if patient_loocv:
+        return
 
     common_genes, selected_gene_table = select_genes(
         sample_adatas,

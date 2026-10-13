@@ -1,3 +1,14 @@
 defaults:
   - base
   - _self_
+
+# MoMu 输出 F 后预测共享软状态，表达模板与类别倾向全部随机初始化、端到端学习。
+image:
+  tissue_state_count: 32  # K；设为 0 回到原预测路径
+  tissue_state_dim: 96  # 单层 1×1 状态编码器输出通道数；默认与 F 同宽，不是状态数
+  joint_prediction: false  # 原 P0 条件/修正结构，与共享状态结构互斥
+  phenotype_dim: 16
+  molecular_dim: 256
+  detach_phenotype: false
+  use_seg_condition: false  # 以下旧结构参数只在 joint_prediction: true 时生效
+  use_gene_feedback: false

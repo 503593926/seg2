@@ -1,9 +1,0 @@
-defaults:
-  - her2st_query
-  - _self_
-
-# 同样的种子/query 划分与 stop-gradient 软标签, 仅关闭 query 真值损失。
-training:
-  image:
-    loss_weights:
-      propagation_query: 0.0

@@ -30,13 +30,3 @@ class Resize(nn.Module):
             align_corners=False,
             antialias=True,
         )
-
-
-class ProjectionHead(nn.Sequential):
-    def __init__(self, input_features, output_features):
-        super().__init__(
-            nn.Linear(input_features, output_features),
-            nn.LayerNorm(output_features),
-            nn.GELU(),
-            nn.Linear(output_features, output_features),
-        )

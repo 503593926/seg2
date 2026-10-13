@@ -114,8 +114,9 @@ def augment_geometry(sample, rng, size, cfg):
         coordinates[:, 1] = size - 1 - coordinates[:, 1]
     sample["spots"] = coordinates
 
-    for key in ("image", "cancer_probability", "valid", "superpixels"):
-        sample[key] = _transform_geometry(sample[key], turns, flip_x, flip_y)
+    for key in ("image", "cancer_probability", "valid", "superpixels", "tissue"):
+        if key in sample:
+            sample[key] = _transform_geometry(sample[key], turns, flip_x, flip_y)
     for key in ("patch", "cls"):
         sample[key] = tuple(
             _transform_geometry(value, turns, flip_x, flip_y)
@@ -160,9 +161,12 @@ def _low_resolution(image, rng, cfg):
 
 
 def _transform_geometry(value, turns, flip_x, flip_y):
-    value = torch.rot90(value, turns, (-2, -1))
+    # NumPy 旋转/翻转只建立视图，最后一次性复制，避免逐次分配大 PFM 特征图。
+    array = np.rot90(value.numpy(), turns, axes=(-2, -1))
     if flip_x:
-        value = value.flip(-1)
+        array = np.flip(array, axis=-1)
     if flip_y:
-        value = value.flip(-2)
-    return value.contiguous()
+        array = np.flip(array, axis=-2)
+    # 长度为 1 的轴也可能保留负步长，torch.from_numpy 不接受这种视图。
+    array = array.copy(order="C") if any(stride < 0 for stride in array.strides) else np.ascontiguousarray(array)
+    return torch.from_numpy(array)

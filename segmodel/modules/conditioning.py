@@ -107,7 +107,7 @@ class ConditionalNorm(nn.Module):
         self.eps = 1e-6
 
         self.global_head = _zero_modulation(nn.Linear(global_dim, 2 * channels))
-        self.spatial_head = _zero_modulation(nn.Conv2d(spatial_dim, 2, 1))
+        self.spatial_head = _zero_modulation(nn.Conv2d(spatial_dim, 2 * channels, 1))
 
         self.resize = Resize()
 

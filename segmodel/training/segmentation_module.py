@@ -1,4 +1,5 @@
 from copy import deepcopy
+from math import ceil
 from pathlib import Path
 from typing import cast
 
@@ -8,10 +9,12 @@ from pytorch_lightning.utilities.types import OptimizerLRSchedulerConfig
 from torchmetrics.classification import BinaryF1Score, BinaryJaccardIndex
 
 from segmodel.inference.validation import load_expert_masks, validate_slide
+from segmodel.inference.metrics import summarize_expression_metrics
 from segmodel.inference.visualization import save_prediction_result
 from segmodel.training.augment import cutmix_batch, mixup_batch
 from segmodel.training.losses import (
     image_losses,
+    gene_prediction_losses,
     pfm_losses,
     segmentation_loss,
     soft_segmentation_loss,
@@ -22,7 +25,6 @@ class SegmentationModule(pl.LightningModule):
     def __init__(
         self,
         model,
-        distiller,
         image_cfg,
         augment_cfg,
         validation_roots=None,
@@ -30,15 +32,14 @@ class SegmentationModule(pl.LightningModule):
         mpp=1.0,
         visualization_dir=None,
         label_scale=1,
+        spot_radius_px=50.0,
         propagation=None,
-        propagation_supervision=None,
     ):
         super().__init__()
         self.model = model
         self.ema_model = deepcopy(model).requires_grad_(False)
         self.ema_model.eval()
         self._last_ema_step = 0
-        self.distiller = distiller
         self.image_cfg = image_cfg
         self.augment_cfg = augment_cfg
         self.validation_roots = validation_roots
@@ -48,44 +49,50 @@ class SegmentationModule(pl.LightningModule):
             Path(visualization_dir) if visualization_dir is not None else None
         )
         self.label_scale = int(label_scale)
+        self.spot_radius_px = float(spot_radius_px)
+        self.expression_transform = str(image_cfg.expression_transform)
         self.propagation = propagation
-        self.propagation_supervision = propagation_supervision
+        self._validation_metrics = {}
+        self._validation_expression = {}
 
         self.train_dice = BinaryF1Score(threshold=0.5)
         self.train_iou = BinaryJaccardIndex(threshold=0.5)
 
-    def forward(self, image, patch, cls, pfm_mask=None):
-        return self.model(image, patch, cls, pfm_mask)
+    def forward(self, image, patch, cls, pfm_mask=None, *, dense_expression=True):
+        return self.model(image, patch, cls, pfm_mask, dense_expression=dense_expression)
 
     def _update_propagated_loss(self, losses, output, batch):
-        """重算软标签; 可选地隐藏 spot, 用独立真值校准同一次传播的边权。"""
-        if self.propagation is None:
+        """全部有效 spot 监督表达；全部类别种子生成停止梯度的 RW 目标。"""
+        weights = self.image_cfg.loss_weights
+        if any(float(weights.get(name, 0)) for name in ("gene_prediction", "gene_correlation")):
+            expression_losses, count = gene_prediction_losses(
+                output, batch, self.spot_radius_px, self.label_scale, self.expression_transform,
+                weights=weights,
+                correlation_min_spots=int(self.image_cfg.gene_correlation_min_spots),
+            )
+            losses.update(expression_losses)
+            self.log("train/gene_spots", float(count), on_step=True, on_epoch=True,
+                     prog_bar=True, batch_size=len(batch["image"]))
+        if self.propagation is None or not any(
+            float(weights.get(name, 0)) for name in ("propagation", "propagation_initial")
+        ):
             return
-        names = ("propagation", "propagation_query", "gene_auxiliary", "gene_propagation", "gene_prediction")
-        if not any(float(self.image_cfg.loss_weights.get(name, 0)) for name in names):
-            return
-        if self.propagation_supervision is None:
+        with torch.no_grad():
             propagated = self.propagation(
                 batch["superpixels"].long(), output["features"], batch["image"],
-                batch["spot_labels"], batch["spots"],
-            )
-        else:
-            propagated, supervised, diagnostics = self.propagation_supervision(
-                self.propagation, output, batch, step=self.global_step,
-            )
-            losses.update(supervised)
-            self.log_dict(
-                {f"train/propagation/{name}": value for name, value in diagnostics.items()},
-                on_step=False, on_epoch=True, batch_size=len(batch["image"]),
+                batch["spot_labels"], batch["spots"], batch.get("propagation_graphs"),
             )
         if propagated is None:
             return
         indices, soft, valid, diagnostics = propagated
-        if self.propagation_supervision is not None and self.propagation_supervision.detach_pseudo_target:
-            soft = soft.detach()
-        losses["propagation"] = soft_segmentation_loss(
-            output["logits"][indices], soft, valid
-        )
+        if float(self.image_cfg.loss_weights.get("propagation", 0)):
+            losses["propagation"] = soft_segmentation_loss(
+                output["logits"][indices], soft, valid
+            )
+        if "initial_logits" in output and float(self.image_cfg.loss_weights.get("propagation_initial", 0)):
+            losses["propagation_initial"] = soft_segmentation_loss(
+                output["initial_logits"][indices], soft, valid
+            )
         self.log_dict(
             {f"train/propagation/{name}": value for name, value in diagnostics.items()},
             on_step=False,
@@ -94,24 +101,20 @@ class SegmentationModule(pl.LightningModule):
         )
 
     def training_step(self, batch) -> torch.Tensor:
-        output = self(batch["image"], batch["patch"], batch["cls"], batch["pfm_mask"])
-        losses = image_losses(output, batch)
-        losses.update(pfm_losses(output, batch, self.model.pfm_count))
+        output = self(
+            batch["image"], batch["patch"], batch["cls"], batch["pfm_mask"],
+            dense_expression=not bool(self.model.tissue_state_count),
+        )
+        weights = self.image_cfg.loss_weights
+        losses = image_losses(output, batch, weights)
+        losses.update(pfm_losses(output, batch, self.model.pfm_count, weights))
         self._update_propagated_loss(losses, output, batch)
-
-        distillation_diagnostics = None
-        relation_enabled = float(self.image_cfg.loss_weights.get('relation', 0)) != 0
-        if float(self.image_cfg.loss_weights.molecular) != 0 or relation_enabled:
-            molecular_losses, distillation_diagnostics = self.distiller.losses(
-                output, batch, relation_enabled=relation_enabled,
-            )
-            losses.update(molecular_losses)
 
         loss = cast(
             torch.Tensor,
             sum(
                 (float(weight) * losses.get(name, 0.0)
-                 for name, weight in self.image_cfg.loss_weights.items()),
+                 for name, weight in weights.items() if float(weight) != 0),
                 output["logits"].sum() * 0,
             ),
         )
@@ -125,12 +128,25 @@ class SegmentationModule(pl.LightningModule):
             loss = loss + float(self.augment_cfg.cutmix.weight) * cutmix_loss
 
         logged_losses = {f"train/{name}": value for name, value in losses.items()}
-        if distillation_diagnostics is not None:
-            logged_losses.update(
-                {f"train/{name}": value for name, value in distillation_diagnostics.items()}
-            )
+        if "tissue_states" in output:
+            states = output["tissue_states"].detach()
+            usage = states.mean(dim=(0, 2, 3))
+            logged_losses["train/tissue_state_entropy"] = -(states * states.clamp_min(1e-8).log()).sum(dim=1).mean()
+            logged_losses["train/tissue_state_usage_entropy"] = -(usage * usage.clamp_min(1e-8).log()).sum()
+            logged_losses["train/expression_amplitude_mean"] = output["expression_amplitude"].detach().mean()
+        if "refinement_gate" in output:
+            logged_losses["train/refinement_gate_mean"] = output["refinement_gate"].detach().mean()
+            logged_losses["train/refinement_residual_abs"] = output["refinement_residual"].detach().abs().mean()
+        expression_names = {"train/gene_prediction", "train/gene_correlation"}
         self.log_dict(
-            logged_losses,
+            {name: value for name, value in logged_losses.items() if name in expression_names},
+            on_step=True,
+            on_epoch=True,
+            prog_bar=True,
+            batch_size=len(batch["image"]),
+        )
+        self.log_dict(
+            {name: value for name, value in logged_losses.items() if name not in expression_names},
             on_step=False,
             on_epoch=True,
             batch_size=len(batch["image"]),
@@ -139,7 +155,7 @@ class SegmentationModule(pl.LightningModule):
         self.log(
             "train/loss",
             loss,
-            on_step=False,
+            on_step=True,
             on_epoch=True,
             prog_bar=True,
             batch_size=len(batch["image"]),
@@ -148,19 +164,12 @@ class SegmentationModule(pl.LightningModule):
 
 
     def configure_optimizers(self) -> OptimizerLRSchedulerConfig:
-        image_parameters = list(self.model.named_parameters()) + list(
-            self.distiller.image_projector.named_parameters()
-        )
+        image_parameters = list(self.model.named_parameters())
         if self.propagation is not None:
-            # gate 参数少, 不参与 weight decay
+            # 独立调用传播模块时保留其参数分组。
             image_parameters += [
                 (f"propagation.{name}", parameter)
                 for name, parameter in self.propagation.named_parameters()
-            ]
-        if self.propagation_supervision is not None:
-            image_parameters += [
-                (f"propagation_supervision.{name}", parameter)
-                for name, parameter in self.propagation_supervision.named_parameters()
             ]
         decay, no_decay = [], []
         for name, parameter in image_parameters:
@@ -178,43 +187,64 @@ class SegmentationModule(pl.LightningModule):
             lr=float(self.image_cfg.lr),
         )
 
-        scheduler = torch.optim.lr_scheduler.SequentialLR(
-            optimizer,
-            schedulers=[
-                torch.optim.lr_scheduler.LinearLR(
+        # 独立检查优化器参数组时没有 Trainer，不推测训练的总步数。
+        if self._trainer is None:
+            return cast(OptimizerLRSchedulerConfig, {"optimizer": optimizer})
+
+        # 使用实际优化器更新数，包含梯度累积、batch 限制和 max_steps。
+        total_steps = int(self.trainer.estimated_stepping_batches)
+        warmup_ratio = float(self.image_cfg.warmup_steps)
+        if total_steps < 1 or not 0 <= warmup_ratio <= 1:
+            raise ValueError("Training steps must be positive and warmup_steps must be a ratio in [0, 1]")
+        warmup_steps = ceil(total_steps * warmup_ratio)
+
+        if warmup_steps:
+            warmup = torch.optim.lr_scheduler.LinearLR(
+                optimizer, start_factor=0.1, end_factor=1.0, total_iters=warmup_steps,
+            )
+            if warmup_steps >= total_steps:
+                scheduler = warmup
+            else:
+                scheduler = torch.optim.lr_scheduler.SequentialLR(
                     optimizer,
-                    start_factor=0.1,
-                    end_factor=1.0,
-                    total_iters=self.image_cfg.warmup_epochs,
-                ),
-                torch.optim.lr_scheduler.CosineAnnealingLR(
-                    optimizer,
-                    T_max=self.image_cfg.epochs - self.image_cfg.warmup_epochs,
-                    eta_min=1e-6,
-                ),
-            ],
-            milestones=[self.image_cfg.warmup_epochs],
-        )
+                    schedulers=[warmup, torch.optim.lr_scheduler.CosineAnnealingLR(
+                        optimizer, T_max=total_steps - warmup_steps, eta_min=0,
+                    )],
+                    milestones=[warmup_steps],
+                )
+        else:
+            scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+                optimizer, T_max=total_steps, eta_min=0,
+            )
         return {
             "optimizer": optimizer,
             "lr_scheduler": {
                 "scheduler": scheduler,
-                "interval": "epoch",
+                "interval": "step",
                 "frequency": 1,
             },
         }
 
+
+    def on_validation_epoch_start(self):
+        self._validation_metrics = {}
+        self._validation_expression = {}
 
     def validation_step(self, slide, batch_index):
         # 留出切片验证使用 EMA; 最终测试使用的模型由 pipeline 决定。
         if self.validation_roots is None or self.tiling is None:
             return None
         gene_options = {}
-        if self.propagation_supervision is not None and self.propagation_supervision.gene_mode == "prediction":
+        segmentation_results = {}
+        data_module = getattr(self.trainer, "datamodule")
+        evaluate_segmentation = slide.name in getattr(data_module, "test_names", [slide.name])
+        patient_evaluation = len(getattr(data_module, "expression_test_names", [])) > 1
+        if self.model.gene_count:
             gene_options = {
-                "gene_adata": self.trainer.datamodule.val_gene_adata,
-                "spot_radius_px": self.propagation_supervision.spot_radius_px,
-                "expression_transform": self.propagation_supervision.expression_transform,
+                "gene_adata": data_module.val_gene_adata,
+                "spot_radius_px": self.spot_radius_px,
+                "expression_transform": self.expression_transform,
+                "expression_results": self._validation_expression,
             }
         probability, metrics = validate_slide(
             self.ema_model,
@@ -224,8 +254,11 @@ class SegmentationModule(pl.LightningModule):
             **self.tiling,
             mpp=self.mpp,
             **gene_options,
+            evaluate_segmentation=evaluate_segmentation,
+            segmentation_results=segmentation_results,
         )
-        if self.visualization_dir is not None:
+        self._validation_metrics[slide.name] = metrics
+        if self.visualization_dir is not None and evaluate_segmentation:
             labels, valid = load_expert_masks(self.validation_roots[slide.name], slide)
             save_prediction_result(
                 self.visualization_dir / f"epoch_{self.current_epoch + 1:04d}",
@@ -234,12 +267,15 @@ class SegmentationModule(pl.LightningModule):
                 labels,
                 valid,
                 self.label_scale,
+                initial_probability=segmentation_results.get("initial_probability"),
+                refinement_gate=segmentation_results.get("refinement_gate"),
             )
         self.log_dict(
             {
                 f"val/{name}": float(metrics[name])
                 for name in metrics
-                if name in {"loss", "dice", "iou", "hd95"} or name.startswith("gene_")
+                if name in {"loss", "dice", "iou", "hd95", "initial_loss", "initial_dice", "initial_iou", "initial_hd95", "refinement_dice_gain"}
+                or (name.startswith("gene_") and not patient_evaluation)
             },
             on_step=False,
             on_epoch=True,
@@ -247,6 +283,21 @@ class SegmentationModule(pl.LightningModule):
             batch_size=1,
         )
         return metrics
+
+    def on_validation_epoch_end(self):
+        data_module = getattr(self.trainer, "datamodule")
+        if len(getattr(data_module, "expression_test_names", [])) <= 1:
+            return
+        summary = summarize_expression_metrics(self._validation_metrics, self._validation_expression)
+        if not summary:
+            return
+        self.log_dict(
+            {f"val/{key}": value for key, value in summary["micro"].items()},
+            prog_bar=True, batch_size=1,
+        )
+        self.log("val/gene_prediction_pcc_macro", summary["macro"]["gene_prediction_pcc"], batch_size=1)
+        for name, metrics in summary["slides"].items():
+            self.log_dict({f"val/{name}/{key}": value for key, value in metrics.items()}, batch_size=1)
 
 
     def on_train_batch_end(self, outputs, batch, batch_idx):
@@ -275,22 +326,22 @@ class SegmentationModule(pl.LightningModule):
 
     def _update_segmentation_metrics(self, output, batch):
         valid = batch["valid"].bool()
-        if valid.any():
-            probability = output["logits"].detach().sigmoid()[valid]
-            target = (batch["cancer_probability"] >= 0.5)[valid]
-            self.train_dice.update(probability, target)
-            self.train_iou.update(probability, target)
+        # forward 同时计算当前 batch 指标和累积 epoch 统计；保留 batch 维以支持空掩码。
+        probability = output["logits"].detach().sigmoid()[valid].reshape(1, -1)
+        target = (batch["cancer_probability"] >= 0.5)[valid].reshape(1, -1)
+        self.train_dice(probability, target)
+        self.train_iou(probability, target)
         self.log(
             "train/dice",
             self.train_dice,
-            on_step=False,
+            on_step=True,
             on_epoch=True,
             prog_bar=True,
         )
         self.log(
             "train/iou",
             self.train_iou,
-            on_step=False,
+            on_step=True,
             on_epoch=True,
             prog_bar=True,
         )

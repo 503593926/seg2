@@ -5,32 +5,21 @@ import numpy as np
 import torch
 
 from segmodel.dataset.loading import read_image
-from segmodel.inference.metrics import segmentation_metrics
+from segmodel.inference.metrics import expression_metrics, segmentation_metrics
 from segmodel.inference.predictor import predict_slide
-from segmodel.modules.graph_measurements import pool_spot_expression
+from segmodel.modules.spot_pooling import pool_spot_expression
 
 
-def gene_prediction_metrics(field, tissue, spots, truth, radius_px, label_scale, expression_transform="log1p"):
+def gene_prediction_metrics(field, tissue, spots, truth, radius_px, label_scale, expression_transform="log1p", spot_results=None, gene_observed=None):
     """图像预测场在真实 spot 上的独立评估, 真值只参与指标计算。"""
     prediction, valid = pool_spot_expression(field, tissue, spots, radius_px, label_scale)
-    metrics = {"gene_spots": int(valid.sum()), "gene_pcc_genes": 0}
-    if not bool(valid.any()):
-        return {**metrics, "gene_prediction": float("nan"), "gene_prediction_pcc": float("nan")}
     prediction, target = prediction[valid], truth[valid].float()
+    observed = torch.ones_like(target, dtype=torch.bool) if gene_observed is None else gene_observed[valid].bool()
     if expression_transform == "log1p":
         prediction = prediction.log1p()
-    metrics["gene_prediction"] = float((prediction - target).square().mean())
-    centered_prediction = prediction - prediction.mean(0)
-    centered_target = target - target.mean(0)
-    p_std = prediction.std(0, unbiased=False)
-    t_std = target.std(0, unbiased=False)
-    usable = (p_std > 1e-6) & (t_std > 1e-6)
-    metrics["gene_pcc_genes"] = int(usable.sum())
-    metrics["gene_prediction_pcc"] = float(
-        ((centered_prediction[:, usable] * centered_target[:, usable]).mean(0)
-         / (p_std[usable] * t_std[usable])).clamp(-1, 1).mean()
-    ) if bool(usable.any()) else float("nan")
-    return metrics
+    if spot_results is not None:
+        spot_results.update(prediction=prediction.cpu(), target=target.cpu(), observed=observed.cpu(), valid=valid.cpu())
+    return expression_metrics(prediction, target, observed)
 
 
 def load_expert_masks(root, slide):
@@ -66,7 +55,11 @@ def validate_slide(
     gene_adata=None,
     spot_radius_px=None,
     expression_transform="log1p",
+    evaluate_segmentation=True,
+    expression_results=None,
+    segmentation_results=None,
 ):
+    auxiliary = {} if getattr(model, "joint_prediction", False) and evaluate_segmentation else None
     probability, expression = predict_slide(
         model,
         slide,
@@ -77,24 +70,42 @@ def validate_slide(
         batch_size=batch_size,
         return_features=gene_adata is not None,
         feature_key="gene_expression" if gene_adata is not None else "propagation_features",
+        auxiliary_outputs=auxiliary,
     )
-    labels, valid = load_expert_masks(root, slide)
-    metrics = segmentation_metrics(
-        probability,
-        labels,
-        valid,
-        threshold=threshold,
-        mpp=mpp,
-    )
+    metrics = {}
+    if evaluate_segmentation:
+        labels, valid = load_expert_masks(root, slide)
+        metrics.update(segmentation_metrics(
+            probability, labels, valid, threshold=threshold, mpp=mpp,
+        ))
+        if auxiliary:
+            initial_metrics = segmentation_metrics(
+                auxiliary["initial_probability"], labels, valid, threshold=threshold, mpp=mpp,
+            )
+            metrics.update({f"initial_{key}": initial_metrics[key] for key in ("loss", "dice", "iou", "hd95")})
+            metrics["refinement_dice_gain"] = metrics["dice"] - initial_metrics["dice"]
+            if segmentation_results is not None:
+                segmentation_results.update(auxiliary)
     if gene_adata is not None:
         selected = gene_adata.obs["name"].astype(str).to_numpy() == slide.name
         spots = torch.from_numpy(gene_adata.obs.loc[selected, ["pixel_x", "pixel_y"]].to_numpy(dtype=np.float32))
         truth = torch.from_numpy(np.asarray(gene_adata.X[selected], dtype=np.float32))
+        observed = torch.ones_like(truth, dtype=torch.bool)
+        missing = getattr(gene_adata, "uns", {}).get("missing_selected_genes_by_slide", {}).get(slide.name, [])
+        if len(missing):
+            observed[:, torch.from_numpy(np.isin(gene_adata.var_names, missing))] = False
         tissue = torch.from_numpy(read_image(
             Path(root) / "label_mpp" / slide.name / "spatial/tissue_mask.png", cv2.IMREAD_GRAYSCALE,
         ) > 0)
+        spot_results = {} if expression_results is not None else None
         metrics.update(gene_prediction_metrics(
             torch.from_numpy(expression).permute(2, 0, 1), tissue, spots, truth,
-            spot_radius_px, slide.label_scale, expression_transform,
+            spot_radius_px, slide.label_scale, expression_transform, spot_results, observed,
         ))
+        if expression_results is not None:
+            assert spot_results is not None
+            valid = spot_results.pop("valid").numpy()
+            spot_results["spot_ids"] = gene_adata.obs.index[selected].to_numpy(dtype=str)[valid]
+            spot_results["spots"] = spots.numpy()[valid]
+            expression_results[slide.name] = spot_results
     return probability, metrics

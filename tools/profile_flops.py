@@ -17,11 +17,12 @@ import numpy as np
 import torch
 from torch import nn
 from torch.utils.flop_counter import FlopCounterMode
-import yaml
+from hydra import compose, initialize_config_dir
+from omegaconf import OmegaConf
+
+from segmodel.dataset.loading import fold_paths
 
 from segmodel.models.segmentation import SegmentationModel
-from segmodel.models.gene_vae import GeneVAE
-from segmodel.modules.blocks import ProjectionHead
 
 
 def measure(model, args):
@@ -46,6 +47,13 @@ def measure(model, args):
             handles.append(layer.register_forward_hook(
                 lambda layer, inputs, output, name=name: hook(name, layer, inputs, output)
             ))
+    if model.tissue_state_count:
+        def template_hook(layer, inputs, output):
+            # 表达混合使用函数式 1×1 卷积，独立计数以与 operator counter 对照。
+            name = 'tissue_state_decoder.expression_projection'
+            macs[name] += output['gene_expression'].numel() * model.tissue_state_count
+            calls[name] += 1
+        handles.append(model.tissue_state_decoder.register_forward_hook(template_hook))
     try:
         with torch.inference_mode(), FlopCounterMode(display=False) as counter:
             output = model(*args)
@@ -69,16 +77,6 @@ def measure(model, args):
     }, output
 
 
-class TeacherEmbedding(nn.Module):
-    def __init__(self, teacher):
-        super().__init__()
-        self.encoder = teacher.encoder
-
-    def forward(self, expression):
-        mean, _ = self.encoder(expression)
-        return mean
-
-
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--sizes', nargs='+', type=int, default=[224, 448, 896])
@@ -86,10 +84,21 @@ def main():
     opt = parser.parse_args()
     torch.set_num_threads(2)
     torch.manual_seed(0)
-    dataset = yaml.safe_load(Path('segmodel/configs/dataset/her2st.yaml').read_text(encoding='utf-8-sig'))
-    model_cfg = yaml.safe_load(Path('segmodel/configs/model/base.yaml').read_text(encoding='utf-8-sig'))
-    resolution = yaml.safe_load(Path('config/resolution.yaml').read_text())
-    root = Path(dataset['data_root'])
+    project = Path(__file__).resolve().parents[1]
+    with initialize_config_dir(config_dir=str(project / 'segmodel/configs'), version_base=None):
+        cfg = compose(config_name='config')
+    dataset = OmegaConf.to_container(cfg.experiment.dataset, resolve=True)
+    model_options = OmegaConf.to_container(cfg.experiment.model.image, resolve=True)
+    resolution = cfg.resolution
+    root = project / dataset['data_root']
+    if model_options.get('joint_prediction', False) or model_options.get('tissue_state_count', 0) or any(
+        float(cfg.experiment.training.image.loss_weights.get(name, 0))
+        for name in ('gene_prediction', 'gene_correlation')
+    ):
+        import h5py
+        _, gene_path = fold_paths(project, cfg.experiment.dataset, [dataset['all_names'][0]])
+        with h5py.File(gene_path, 'r') as handle:
+            model_options['gene_count'] = handle['var'][handle['var'].attrs['_index']].shape[0]
     feature_info = []
     for directory in dataset['image_feature_maps']:
         folder = root / directory
@@ -104,7 +113,7 @@ def main():
     model = SegmentationModel(
         pfm_patch_dims=[f['patch_dim'] for f in feature_info],
         pfm_cls_dims=[f['cls_dim'] for f in feature_info],
-        **model_cfg['image'],
+        **model_options,
     ).eval()
     report = {
         'torch_version': torch.__version__,
@@ -113,7 +122,7 @@ def main():
         'excluded': ['offline PFM feature extraction', 'normalization', 'activation',
                      'interpolation', 'pooling', 'elementwise operations', 'backward',
                      'optimizer updates', 'SNIC/random walker'],
-        'model_config': model_cfg['image'],
+        'model_config': model_options,
         'features': feature_info,
         'default_crop_size': dataset['crop_size'],
         'measurements': [],
@@ -129,20 +138,6 @@ def main():
         report['measurements'].append(result)
         print(json.dumps({k: v for k, v in result.items() if k != 'layers'}, ensure_ascii=False))
 
-    import h5py
-    gene_path = root / 'gene_expression/task1_loocv/test_C1.h5ad'
-    with h5py.File(gene_path, 'r') as handle:
-        n_genes = handle['var'][handle['var'].attrs['_index']].shape[0]
-    teacher = GeneVAE(n_genes, **model_cfg['gene']).eval().requires_grad_(False)
-    teacher_result, _ = measure(TeacherEmbedding(teacher), (torch.randn(1, n_genes),))
-    projector_result, _ = measure(ProjectionHead(model.feature_channels, teacher.latent_dim).eval(),
-                                  (torch.randn(1, model.feature_channels),))
-    report['training_only_per_spot'] = {
-        'gene_count_for_test_C1_fold': n_genes,
-        'frozen_teacher_encoder': teacher_result,
-        'image_projector': projector_result,
-        'note': 'Forward only; actual additional cost depends on spot count. Pooling/losses/backward excluded.',
-    }
     opt.output.parent.mkdir(parents=True, exist_ok=True)
     opt.output.write_text(json.dumps(report, ensure_ascii=False, indent=2) + '\n')
     print('Saved', opt.output)

@@ -1,4 +1,4 @@
-"""端到端冒烟: 传播接进训练步骤后能前向反向, 梯度流到 gate 参数。"""
+"""RW 软目标监督的前反向、停止梯度和输入配置检查。"""
 
 import sys
 import unittest
@@ -11,17 +11,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from segmodel.models.segmentation import SegmentationModel
 from segmodel.modules.propagation import DifferentiablePropagation
-from segmodel.training.distillation import Distiller
 from segmodel.training.segmentation_module import SegmentationModule
-
-
-class _StubGeneVAE(torch.nn.Module):
-    def __init__(self):
-        super().__init__()
-        self.latent_dim = 4
-
-    def embedding(self, expression):
-        return expression
 
 
 def build_batch(batch=2, crop=112, label_scale=7, pfm_count=2, spot_count=6):
@@ -69,12 +59,10 @@ def build_batch(batch=2, crop=112, label_scale=7, pfm_count=2, spot_count=6):
         "cancer_probability": (image[:, :1, ::label_scale, ::label_scale] > 128).float(),
         "valid": torch.ones(batch, 1, size, size, dtype=torch.bool),
         "gene_expression": [torch.rand(spot_count, 8, generator=generator) for _ in range(batch)],
-        "spot_ids": [torch.arange(spot_count) for _ in range(batch)],
-        "slide_id": torch.zeros(batch, dtype=torch.long),
     }
 
 
-def build_module(propagation=None, gene_count=0):
+def build_module(propagation=None, gene_count=0, **model_options):
     torch.manual_seed(0)
     model = SegmentationModel(
         pfm_patch_dims=(6, 6),
@@ -86,26 +74,21 @@ def build_module(propagation=None, gene_count=0):
         propagation_channels=4,
         backbone_init="pytorch",
         gene_count=gene_count,
-    )
-    distiller = Distiller(
-        model,
-        _StubGeneVAE(),
-        spot_radius_px=50.0,
-        label_scale=7,
+        **model_options,
     )
     image_cfg = OmegaConf.create(
         {
             "lr": 0.001,
             "weight_decay": 0.0,
-            "warmup_epochs": 1,
+            "warmup_steps": 0.5,
             "epochs": 2,
             "ema_decay": 0.9,
+            "expression_transform": "log1p",
+            "gene_correlation_min_spots": 8,
             "loss_weights": {
                 "segmentation": 1.0,
                 "affinity": 0.0,
                 "superpixel": 0.0,
-                "molecular": 0.0,
-                "relation": 0.0,
                 "propagation": 1.0,
                 "pfm_cls_global": 0.0,
                 "pfm_orth_global": 0.0,
@@ -123,10 +106,10 @@ def build_module(propagation=None, gene_count=0):
     )
     return SegmentationModule(
         model,
-        distiller,
         image_cfg,
         augment_cfg,
         label_scale=7,
+        spot_radius_px=5,
         propagation=propagation,
     )
 
@@ -144,6 +127,18 @@ def _to_cuda(value):
 
 
 class PropagationTrainingStepTest(unittest.TestCase):
+    def test_fully_seeded_graph_still_supervises_its_seed_nodes(self):
+        propagation = DifferentiablePropagation(label_scale=1, gate_range=0)
+        grid = torch.tensor([[[[1, 2], [1, 2]]]])
+        result = propagation(
+            grid, torch.rand(1, 4, 2, 2), torch.rand(1, 3, 2, 2) * 255,
+            [torch.tensor([0, 1])], [torch.tensor([[0., 0.], [1., 0.]])],
+        )
+        self.assertIsNotNone(result)
+        self.assertEqual(result[0], [0])
+        torch.testing.assert_close(result[1], torch.tensor([[[[0., 1.], [0., 1.]]]]))
+        self.assertTrue(bool(result[2].all()))
+
     def test_training_step_with_propagation(self):
         propagation = DifferentiablePropagation(
             label_scale=7, beta=0.5, steps=60, tolerance=1e-8
@@ -159,10 +154,9 @@ class PropagationTrainingStepTest(unittest.TestCase):
             for parameter in propagation.gate.parameters()
             if parameter.grad is not None
         ]
-        self.assertEqual(len(gate_gradients), len(list(propagation.gate.parameters())))
-        total = sum(float(gradient.abs().sum()) for gradient in gate_gradients)
-        print(f"loss={loss.item():.4f}, gate gradient L1={total:.3e}")
-        self.assertGreater(total, 0.0, "gate 没有收到梯度")
+        self.assertEqual(gate_gradients, [])
+        total = sum(float(p.grad.abs().sum()) for p in module.model.parameters() if p.grad is not None)
+        self.assertGreater(total, 0.0)
 
     def test_background_pixels_excluded_from_supervision(self):
         """组织外 (超像素 id 0) 的像素不能被当成确定非癌监督。"""
@@ -189,8 +183,8 @@ class PropagationTrainingStepTest(unittest.TestCase):
         self.assertGreater(float(diagnostics["valid_fraction"]), 0.0)
         self.assertLessEqual(float(diagnostics["valid_fraction"]), 1.0)
 
-    def test_feature_gradients_reach_model_parameters(self):
-        """档 2: 打开 feature_gradients 后, 传播损失的回传改变模型参数梯度。"""
+    def test_rw_target_gradient_does_not_change_model_gradients(self):
+        """训练目标停止梯度；求解器内部开关不改变模型梯度。"""
         batch = build_batch()
         collected = {}
         for flag in (False, True):
@@ -214,14 +208,7 @@ class PropagationTrainingStepTest(unittest.TestCase):
                 ]
             ).clone()
 
-        difference = (collected[True] - collected[False]).abs()
-        print(
-            f"feature gradient changes model grads: "
-            f"max={float(difference.max()):.3e} mean={float(difference.mean()):.3e}"
-        )
-        self.assertGreater(
-            float(difference.max()), 1e-8, "开特征后模型梯度没有任何变化"
-        )
+        torch.testing.assert_close(collected[True], collected[False], rtol=0, atol=0)
 
     def test_propagation_disabled_falls_back_to_baseline(self):
         module = build_module(None)
@@ -249,7 +236,7 @@ class PropagationTrainingStepTest(unittest.TestCase):
         config_dir = str((Path(__file__).resolve().parents[1] / "segmodel/configs").resolve())
         with initialize_config_dir(config_dir=config_dir, version_base=None):
             cfg = compose(config_name="config", overrides=["experiment=her2st"])
-        keys = set(cfg.experiment.propagation.keys()) - {"enabled"}
+        keys = set(cfg.experiment.propagation.keys()) - {"enabled", "dynamic_snic"}
         parameters = set(
             inspect.signature(DifferentiablePropagation.__init__).parameters
         )
@@ -262,7 +249,7 @@ class PropagationTrainingStepTest(unittest.TestCase):
             **{
                 key: value
                 for key, value in cfg.experiment.propagation.items()
-                if key != "enabled"
+                if key not in {"enabled", "dynamic_snic"}
             },
         )
 
@@ -282,9 +269,7 @@ class PropagationTrainingStepTest(unittest.TestCase):
             for parameter in propagation.gate.parameters()
             if parameter.grad is not None
         ]
-        self.assertEqual(len(gate_gradients), len(list(propagation.gate.parameters())))
-        total = sum(float(gradient.abs().sum()) for gradient in gate_gradients)
-        self.assertGreater(total, 0.0, "gate 在 CUDA 上没有收到梯度")
+        self.assertEqual(gate_gradients, [])
 
 
 if __name__ == "__main__":

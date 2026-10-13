@@ -30,7 +30,7 @@ low_resolution:
   tissue_only: false
 
 pfm_mask:
-  probability: 0.5
+  probability: 0.0
   min_count: 1
   max_count: null
 

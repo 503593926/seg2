@@ -94,11 +94,7 @@ class TrainingSlide(Slide):
     cancer_probability: NDArray[np.float32]
     superpixels: NDArray[np.int32]
     tissue_mask_bl: NDArray[np.bool_]
-
-    def update_supervision(self, pseudo_mask_uint8, cancer_probability, superpixels):
-        self.pseudo_mask_uint8 = pseudo_mask_uint8
-        self.cancer_probability = cancer_probability
-        self.superpixels = superpixels
+    has_segmentation: bool = True
 
 
 class SlideDataset(Dataset):

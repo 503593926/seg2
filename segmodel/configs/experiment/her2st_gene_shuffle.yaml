@@ -1,6 +1,0 @@
-defaults:
-  - her2st_gene_propagation
-  - _self_
-
-propagation_supervision:
-  shuffle_genes: true

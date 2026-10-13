@@ -230,7 +230,7 @@ class InputAlignmentTest(unittest.TestCase):
             node_means(values, superpixels, torch.arange(1, 5))
 
     def test_rgb_to_lab_matches_snic(self):
-        """自实现 Lab 与 dynamic 侧 SNIC 的 rgbtolab 一致 (同公式)。"""
+        """自实现 Lab 与 SNIC 预处理的 rgbtolab 一致。"""
         from tools.snic_features import prepare_snic_lab
 
         rng = np.random.default_rng(7)

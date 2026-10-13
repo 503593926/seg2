@@ -1,18 +1,26 @@
 enabled: true
-steps: 85
+steps: 100
 tolerance: 1e-8
 
-# conductance 的固定部分 (与 dynamic 侧同一套公式)
+# 颜色与中间特征差构成的边权核
 beta: 0.5
 learned_weight: 1.0
 
 # gate 是有界调制: g = 1 + gate_range * tanh(mlp(features))
 gate_range: 0.0
 
-# 档 2: 传播损失是否回传到模型特征 (固定核 + 开特征, 配合 gate_range=0 使用)。
-# 默认 false: base 与特征 detach, 梯度只走 gate, 防止监督信号自指。
+# 算子内部保留特征梯度接口；当前训练调用固定 no_grad，此项不打开目标侧梯度。
 feature_gradients: true
 
 # 软标签的监督范围: 区间内视为不确定, 不参与损失
-non_cancer_threshold: 0.2
-cancer_threshold: 0.8
+non_cancer_threshold: 0.5
+cancer_threshold: 0.5
+
+# 训练回调参数，不传给 RW 求解器。HER2ST 默认开启。
+dynamic_snic:
+  enabled: false
+  warmup_epochs: 40  # 完成第 40 轮后首次更新，从第 41 轮训练起使用新划分
+  interval_epochs: 20  # 后续在第 60、80、100…轮结束时更新并保存
+  superpixel_size_um: 64.0
+  compactness: 10.0
+  learned_weight: 0.1  # SNIC 中 F 的权重；RW 自身的 learned_weight 位于外层

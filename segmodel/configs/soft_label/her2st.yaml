@@ -1,7 +1,0 @@
-defaults:
-  - base
-  - _self_
-
-# her2st 上用户需要逐轮检查软标签质量, 因此默认开启; 干净对照实验时可
-# 用 experiment.soft_label.enabled=false 关掉 (每个可视轮次多一次整片推理)。
-enabled: true

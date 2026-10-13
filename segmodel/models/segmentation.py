@@ -4,6 +4,7 @@ from torch.nn import functional as F
 
 from segmodel.modules.backbone import ConvNeXtUnet, Stem, init_convnext_backbone
 from segmodel.modules.conditioning import PFMDecomposer
+from segmodel.modules.tissue_states import TissueStateDecoder
 
 def _mask_pfm_features(mask, *feature_groups):
     """把被屏蔽 PFM 的 f1/f2 清零，返回与输入同结构的元组。
@@ -23,6 +24,8 @@ def _mask_pfm_features(mask, *feature_groups):
 
 
 class SegmentationModel(nn.Module):
+    gene_names: list[str]  # 由 pipeline 按当前训练 fold 的基因顺序写入。
+
     def __init__(
         self,
         pfm_patch_dims,
@@ -35,9 +38,17 @@ class SegmentationModel(nn.Module):
         global_dim=256,
         spatial_dim=32,
         skip_drop_path=0.1,
-        drop_path=(0.1, 0.1, 0.1),
+        drop_path=(0.0, 0.0, 0.0),
         backbone_init="pytorch",
         gene_count=0,
+        joint_prediction=False,
+        phenotype_dim=16,
+        molecular_dim=64,
+        detach_phenotype=False,
+        use_seg_condition=True,
+        use_gene_feedback=True,
+        tissue_state_count=0,
+        tissue_state_dim=96,
     ):
         super().__init__()
         if backbone_init not in ("pytorch", "convnext"):
@@ -45,6 +56,11 @@ class SegmentationModel(nn.Module):
         self.pfm_patch_dims = tuple(pfm_patch_dims)
         self.pfm_cls_dims = tuple(pfm_cls_dims)
         self.pfm_count = len(self.pfm_patch_dims)
+        self.tissue_state_count = int(tissue_state_count)
+        if self.tissue_state_count < 0 or self.tissue_state_count == 1:
+            raise ValueError("tissue_state_count must be 0 (disabled) or at least 2")
+        if self.tissue_state_count and joint_prediction:
+            raise ValueError("Tissue states and P0-conditioned joint prediction are alternative architectures")
 
         self.spatial_pool = int(spatial_pool)
         self.stem = Stem(
@@ -67,11 +83,15 @@ class SegmentationModel(nn.Module):
         )
 
         self.feature_channels = int(decoder_chans[-1])
-        self.propagation = nn.Sequential(
+        propagation = nn.Sequential(
             nn.Conv2d(self.feature_channels, propagation_channels, 3, padding=1),
             nn.GELU(),
         )
-        self.segmentation_head = nn.Conv2d(propagation_channels, 1, 1)
+        segmentation_head = nn.Conv2d(propagation_channels, 1, 1)
+        # 保留初始化抽样顺序，使同 seed 的 MoMu 与旧模型一致；新结构不注册旧头。
+        if not self.tissue_state_count:
+            self.propagation = propagation
+            self.segmentation_head = segmentation_head
         self.affinity_head = nn.Conv2d(self.feature_channels, 2, 1)
 
         self.global_decomposer = PFMDecomposer(
@@ -91,13 +111,46 @@ class SegmentationModel(nn.Module):
                 init_convnext_backbone(self.unet)
 
         self.gene_count = int(gene_count)
+        self.joint_prediction = bool(joint_prediction)
+        self.detach_phenotype = bool(detach_phenotype)
+        self.use_seg_condition = bool(use_seg_condition)
+        self.use_gene_feedback = bool(use_gene_feedback)
+        if self.joint_prediction and (self.gene_count <= 0 or phenotype_dim <= 0 or molecular_dim <= 0):
+            raise ValueError("Joint prediction requires a gene head and positive phenotype/molecular dimensions")
         self.gene_head = None
-        if self.gene_count:
+        if self.tissue_state_count:
+            with torch.random.fork_rng(devices=[]):
+                self.tissue_state_decoder = TissueStateDecoder(
+                    self.feature_channels, self.gene_count, self.tissue_state_count, tissue_state_dim,
+                )
+        elif self.gene_count:
             # 新分支不改变骨干初始化和后续训练的随机数序列。
             with torch.random.fork_rng(devices=[]):
-                self.gene_head = nn.Conv2d(self.feature_channels, self.gene_count, 1)
+                gene_channels = self.feature_channels
+                if self.joint_prediction:
+                    # 两列权重对应非癌/癌原型; 软概率加权得到每个位置的类别条件。
+                    self.phenotype_embedding = nn.Conv2d(2, phenotype_dim, 1, bias=False)
+                    self.molecular_encoder = nn.Sequential(
+                        nn.Conv2d(self.feature_channels + phenotype_dim, molecular_dim, 1),
+                        nn.GELU(),
+                        nn.Conv2d(molecular_dim, molecular_dim, 3, padding=1),
+                        nn.GELU(),
+                    )
+                    feedback_channels = self.feature_channels + molecular_dim + 2
+                    self.refinement_head = nn.Sequential(
+                        nn.Conv2d(feedback_channels, molecular_dim, 3, padding=1),
+                        nn.GELU(),
+                        nn.Conv2d(molecular_dim, 1, 1),
+                    )
+                    self.refinement_gate = nn.Conv2d(feedback_channels, 1, 1)
+                    nn.init.zeros_(self.refinement_head[-1].get_parameter("weight"))
+                    nn.init.zeros_(self.refinement_head[-1].get_parameter("bias"))
+                    nn.init.zeros_(self.refinement_gate.weight)
+                    nn.init.zeros_(self.refinement_gate.get_parameter("bias"))
+                    gene_channels = molecular_dim
+                self.gene_head = nn.Conv2d(gene_channels, self.gene_count, 1)
 
-    def forward(self, image, patch, cls, available=None):
+    def forward(self, image, patch, cls, available=None, *, dense_expression=True):
         # PFM 分成任务特征 f1 和身份特征 f2, 屏蔽同时作用于两者。
         task_global, identity_global = self.global_decomposer(
             [value.float().mean(dim=(-2, -1)) for value in cls]
@@ -118,18 +171,50 @@ class SegmentationModel(nn.Module):
         decoded_fm = self.unet(self.stem(image), task_global, task_spatial, available, routing)
 
 
-        # 分割、邻接、动态传播和 PFM 解耦共用本次前向结果。
-        propagation = self.propagation(decoded_fm)
+        # 分割、RW 软标签生成和 PFM 解耦共用本次特征。
         output = {
-            "logits": self.segmentation_head(propagation),
             "affinity_logits": self.affinity_head(decoded_fm),
             "features": decoded_fm,
-            "propagation_features": propagation,
             **self._decomposition(task_global, identity_global, task_spatial, identity_spatial),
         }
+        if self.tissue_state_count:
+            output.update(self.tissue_state_decoder(decoded_fm, dense_expression=dense_expression))
+            output["propagation_features"] = output["tissue_states"]
+            return output
+        propagation = self.propagation(decoded_fm)
+        output.update(
+            logits=self.segmentation_head(propagation),
+            propagation_features=propagation,
+        )
         if self.gene_head is not None:
+            gene_features = decoded_fm
+            if self.joint_prediction:
+                initial_logits = output["logits"]
+                probability = initial_logits.float().sigmoid()
+                posterior = torch.cat((1 - probability, probability), dim=1)
+                if self.detach_phenotype:
+                    posterior = posterior.detach()
+                # 关闭条件时使用零输入, 保留同一表达编码器的深度和宽度。
+                condition = self.phenotype_embedding(
+                    posterior if self.use_seg_condition else torch.zeros_like(posterior)
+                )
+                gene_features = self.molecular_encoder(torch.cat((decoded_fm, condition), dim=1))
+                residual = torch.zeros_like(initial_logits, dtype=torch.float32)
+                gate = torch.zeros_like(residual)
+                if self.use_gene_feedback:
+                    feedback = torch.cat((decoded_fm, gene_features, posterior), dim=1)
+                    residual = self.refinement_head(feedback).float()
+                    gate = self.refinement_gate(feedback).float().sigmoid()
+                output.update(
+                    initial_logits=initial_logits,
+                    initial_probability=probability,
+                    molecular_latent=gene_features,
+                    refinement_residual=residual,
+                    refinement_gate=gate,
+                    logits=initial_logits.float() + gate * residual,
+                )
             # 输出在线性相对表达空间; spot 聚合后才 log1p。
-            output["gene_expression"] = F.softplus(self.gene_head(decoded_fm).float())
+            output["gene_expression"] = F.softplus(self.gene_head(gene_features).float())
         return output
 
 

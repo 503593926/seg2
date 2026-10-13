@@ -44,6 +44,7 @@ def predict_slide(
     batch_size=1,
     return_features=True,
     feature_key="propagation_features",
+    auxiliary_outputs=None,
 ):
     """重叠滑窗推理：分割头与 feature_key 指定的特征在 7mpp 网格加权拼接，
     概率最后上采样回 1mpp。返回 (probability, features)。"""
@@ -65,6 +66,7 @@ def predict_slide(
     grid_scale = None
     feature_sum = None
     feature_weight = None
+    auxiliary_sums = {}
     rows = tile_origins(height, crop_size, stride, alignment)
     columns = tile_origins(width, crop_size, stride, alignment)
     origins = [(top, left) for top in rows for left in columns]
@@ -82,6 +84,12 @@ def predict_slide(
                 _stack_features(batch_inputs, "cls", device),
             )
             probability_grid = output["logits"].float().sigmoid()[:, 0].cpu().numpy()
+            auxiliary_batch = {}
+            if auxiliary_outputs is not None and "initial_logits" in output:
+                auxiliary_batch = {
+                    "initial_probability": output["initial_logits"].float().sigmoid()[:, 0].cpu().numpy(),
+                    "refinement_gate": output["refinement_gate"].float()[:, 0].cpu().numpy(),
+                }
             feature_batch = None
             if return_features:
                 feature_batch = (
@@ -100,18 +108,22 @@ def predict_slide(
                 grid_shape = (height // grid_scale, width // grid_scale)
                 probability_sum = np.zeros(grid_shape, dtype=np.float32)
                 probability_weight = np.zeros(grid_shape, dtype=np.float32)
+                auxiliary_sums = {key: np.zeros(grid_shape, dtype=np.float32) for key in auxiliary_batch}
                 grid_window = cv2.resize(
                     window,
                     (tile, tile),
                     interpolation=cv2.INTER_AREA,
                 )
                 if return_features:
+                    assert feature_batch is not None
                     feature_sum = np.zeros(
                         (*grid_shape, feature_batch[0].shape[-1]),
                         dtype=np.float32,
                     )
                     feature_weight = np.zeros(grid_shape, dtype=np.float32)
 
+            assert grid_scale is not None and grid_window is not None
+            assert probability_sum is not None
             for index, (top, left) in enumerate(batch_origins):
                 grid_top, grid_left = top // grid_scale, left // grid_scale
                 valid_height = min(crop_size, height - top) // grid_scale
@@ -124,8 +136,13 @@ def predict_slide(
                     probability_grid[index][:valid_height, :valid_width]
                     * weight_window
                 )
+                for key, values in auxiliary_batch.items():
+                    auxiliary_sums[key][rows_slice, columns_slice] += (
+                        values[index, :valid_height, :valid_width] * weight_window
+                    )
 
                 if return_features:
+                    assert feature_batch is not None and feature_sum is not None and feature_weight is not None
                     features = feature_batch[index]
                     feature_sum[rows_slice, columns_slice] += (
                         features[:valid_height, :valid_width]
@@ -137,12 +154,20 @@ def predict_slide(
 
     features = None
     if return_features:
+        assert feature_sum is not None and feature_weight is not None
         # 稠密基因图通道较多, 原地归一化避免再复制一份整片表达场。
         feature_sum /= np.maximum(feature_weight[..., None], 1e-6)
         features = feature_sum
+    assert probability_sum is not None and probability_weight is not None
     probability = cv2.resize(
         probability_sum / np.maximum(probability_weight, 1e-6),
         (width, height),
         interpolation=cv2.INTER_LINEAR,
     )
+    if auxiliary_outputs is not None:
+        for key, values in auxiliary_sums.items():
+            values /= np.maximum(probability_weight, 1e-6)
+            if key == "initial_probability":
+                values = cv2.resize(values, (width, height), interpolation=cv2.INTER_LINEAR)
+            auxiliary_outputs[key] = values
     return probability, features

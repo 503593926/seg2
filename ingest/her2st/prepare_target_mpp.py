@@ -70,17 +70,20 @@ def transform_spatial(
     if missing:
         raise ValueError(f"{selection_path}: missing columns {sorted(missing)}")
 
-    annotations = pd.read_csv(annotation_path, sep="\t").dropna(subset=["x", "y"])
-    annotations.rename(
-        columns={"x": "new_x", "y": "new_y", "label": "annotation"},
-        inplace=True,
-    )
-    spatial = spatial.merge(
-        annotations[["new_x", "new_y", "annotation"]],
-        how="left",
-        on=["new_x", "new_y"],
-        validate="one_to_one",
-    )
+    if annotation_path.exists():
+        annotations = pd.read_csv(annotation_path, sep="\t").dropna(subset=["x", "y"])
+        annotations.rename(
+            columns={"x": "new_x", "y": "new_y", "label": "annotation"},
+            inplace=True,
+        )
+        spatial = spatial.merge(
+            annotations[["new_x", "new_y", "annotation"]],
+            how="left",
+            on=["new_x", "new_y"],
+            validate="one_to_one",
+        )
+    else:
+        spatial["annotation"] = "undetermined"
     spatial["spot_label"] = (
         spatial["annotation"].map(spot_label_map).fillna(255).astype(np.uint8)
     )

@@ -1,341 +1,199 @@
-# segmodel 阅读指南
+# segmodel
 
-这里的训练分两阶段: 先用表达矩阵预训练 Gene VAE, 再训练 H&E 分割模型。分割训练同时使用离线 PFM 特征、伪标签和冻结的基因教师。动态传播可以在 epoch 结束时更新训练伪标签。
+当前唯一实验入口为 `her2st`：保持 MoMu 条件 U-Net，在其输出特征上预测共享软组织状态，再解码分割与基因表达，使用患者隔离和混合监督训练。状态、表达模板和类别倾向全部从随机初始化开始学习，不使用 NMF、VAE 或码本。
 
-## 从哪里开始读
-
-建议按 `main.py → pipeline.py → training/segmentation_module.py → models/segmentation.py` 阅读, 然后按需要进入数据、条件分支或动态传播实现。
-
-| 想了解的问题 | 入口 |
-| --- | --- |
-| seed、LOOCV/transfer 和输出目录如何确定 | [main.py](main.py): `get_folds`, `run` |
-| 一个 fold 完整做什么 | [pipeline.py](pipeline.py): `run_fold` |
-| 每步训练如何组成损失、更新模型 | [training/segmentation_module.py](training/segmentation_module.py): `training_step`, `configure_optimizers` |
-| VAE 如何预训练 | [training/gene_module.py](training/gene_module.py) |
-| 图像模型输入和输出是什么 | [models/segmentation.py](models/segmentation.py): `SegmentationModel` |
-| U-Net 的编码、解码和 skip | [modules/backbone.py](modules/backbone.py): `ConvNeXtUnet` |
-| PFM 如何解耦、选择和注入网络 | [modules/conditioning.py](modules/conditioning.py) |
-| 可微标签传播如何求解、可学什么 | [modules/propagation.py](modules/propagation.py): `DifferentiablePropagation` |
-| 图像 spot 如何接受基因监督 | [training/distillation.py](training/distillation.py): `Distiller` |
-| 隐藏 spot 如何校准传播, 与普通基因辅助任务如何对照 | [training/propagation_supervision.py](training/propagation_supervision.py) |
-| 每项损失的具体公式 | [training/losses.py](training/losses.py) |
-| 如何读取文件、准备不同训练阶段 | [dataset/loading.py](dataset/loading.py), [dataset/datamodule.py](dataset/datamodule.py) |
-| crop 如何采样、增强和配对 spot | [dataset/segmentation.py](dataset/segmentation.py), [dataset/augment.py](dataset/augment.py) |
-| MixUp/CutMix 如何同步混合图像和特征 | [training/augment.py](training/augment.py) |
-| 动态伪标签何时更新、如何传播 | [dynamic/callback.py](dynamic/callback.py), [dynamic/propagation.py](dynamic/propagation.py) |
-| 软标签质量如何逐轮可视化 | [dynamic/callback.py](dynamic/callback.py): `SoftLabelVisualizationCallback` |
-| 如何做整片预测和指标计算 | [inference/predictor.py](inference/predictor.py), [inference/validation.py](inference/validation.py) |
-
-## 目录职责
+## 网络与监督
 
 ```text
-segmodel/
-├── main.py                     # Hydra 入口, seed/fold 循环
-├── pipeline.py                 # 单 fold 的准备、两阶段训练、保存和测试
-├── configs/                    # 原有实验配置, 本次未修改
-├── dataset/
-│   ├── loading.py              # 文件路径、表达矩阵和整片数据读取
-│   ├── slide.py                # Slide/TrainingSlide、对齐取窗、SlideDataset
-│   ├── segmentation.py         # 随机 crop、监督/spot 配对、batch collate
-│   ├── augment.py              # 单 crop 的图像/几何增强和 PFM 屏蔽
-│   └── datamodule.py           # Lightning 数据生命周期和 DataLoader
-├── models/
-│   ├── gene_vae.py             # GeneVAE 的构造与前向
-│   ├── segmentation.py         # 分割网络的组装与前向
-│   └── distiller.py            # 旧导入路径兼容, 阅读 training/distillation.py
-├── modules/
-│   ├── backbone.py             # Stem、ConvNeXt、编码器/解码器
-│   ├── conditioning.py         # PFMDecomposer、Router、ConditionalNorm
-│   ├── blocks.py               # LayerNorm、Resize、ProjectionHead
-│   ├── vae.py                  # VAE 的 MLP、编码器和解码器
-│   └── segmentation.py         # 旧导入路径兼容, 阅读 backbone/conditioning
-├── training/
-│   ├── gene_module.py          # VAE 训练步骤与优化器
-│   ├── segmentation_module.py  # 分割训练、优化器、EMA 验证与诊断
-│   ├── distillation.py         # spot 池化、冻结教师、分子/关系蒸馏
-│   ├── losses.py               # 损失公式
-│   ├── augment.py              # batch MixUp/CutMix
-│   └── callbacks.py            # epoch 同步与进度显示
-├── dynamic/                    # 伪标签更新回调、传播算法、可视化
-└── inference/                  # 滑窗预测、专家标注验证、指标、可视化
+H&E + 预计算基础模型特征
+              ↓
+       ConvNeXt U-Net + MoMu
+              ↓
+              F（96 通道，7 mpp）
+                       ↓
+              状态编码器（1×1 Conv，96→96，GELU）
+                       ↓
+          软状态 A（K=32，逐位置 softmax）与幅度 u
+                 ├→ P = Σ_k A_k sigmoid(q_k) → 分割
+                 └→ E_g = u Σ_k A_k B_kg → 非负线性表达图
 ```
 
-`models` 组装完整网络, `modules` 实现网络内部的层, `training` 处理优化和训练专用监督。没有增加新的配置类、注册器或训练抽象层。
+MoMu 的投影、Top-k 路由、通道调制和空间调制保持原结构。状态编码器仅使用一层 1×1 卷积和 GELU，将 F 从 96 通道映射到 96 通道，再由两个 1×1 头分别预测 K 通道状态和 1 通道幅度。每个位置的状态权重非负且和为 1。全局表达模板 B 为 K×G，每行由可学习 logits 的 softmax 得到；类别倾向 q 为 K 个可学习 logits。两种输出必须使用同一张状态图 A，没有独立分割捷径或分割修正头。
 
-## 一个 fold 的执行顺序
+幅度 u = G×softplus(amplitude_logits)，使初始化的逐基因表达保持 O(1)；由于模板逐行归一化，u 等于该位置所选 G 个基因预测表达之和，不代表真实细胞密度或原始 UMI 总数。类别 logits 使用 logsumexp 计算混合类别概率的 log odds，避免 clamp 概率截断梯度；模板混合与相关损失使用 FP32，兼容 bf16-mixed。
 
-```mermaid
-flowchart TD
-    A[main: seed / fold] --> B[run_fold: 保存配置和划分]
-    B --> C[设随机种子, setup fit]
-    C --> D[Gene VAE 预训练]
-    D --> E[重新设同一随机种子]
-    E --> F[构造图像模型, 冻结 VAE, 构造蒸馏投影头]
-    F --> G[分割训练]
-    G --> H[释放 fit 数据, 保存 final_model.pt]
-    H --> I[加载 test 切片, 整片测试并保存指标]
+表达损失更新模板、幅度、状态编码器和 MoMu；分割损失更新类别倾向、状态编码器和 MoMu。共享状态实现任务耦合，但不会保证互相增益。学习到的状态也不能直接认定为细胞类型或真实细胞比例。7 mpp 是输出网格间距，spot 监督不能证明恢复了真实的 7 mpp 分子变化。
+
+表达头输出当前训练 fold 所选基因的稠密非负线性相对表达。对每个有效 spot，在其圆盘内仅对组织像素求均值，再 `log1p`，与真实 CP10k + log1p 表达计算 MSE 和逐基因相关性损失。真实表达只用于监督；表达损失独立于类别种子和 RW 图是否可解。
+
+RW 在每个训练步中使用 crop 内全部有效类别种子，按 SNIC 超像素邻接、Lab 颜色和 F 的节点均值构造边权，以 Jacobi 预条件 CG 求解软标签。训练调用停止梯度，分割损失不通过目标侧更新 RW。只监督组织内概率不高于 0.2 或不低于 0.8 的位置，保留软概率数值。
+
+训练总损失对启用项按 `training.image.loss_weights` 加权。HER2ST 默认同时训练分割和表达：
+
+```text
+L = 1.0 × RW_seg(P)
+  + 1.0 × MSE + 0.5 × mean(1 - PCC)
 ```
 
-分割 `training_step` 固定按以下顺序计算:
+仅有表达的切片计算表达损失；有类别种子的切片还计算分割损失。分割输出的系数由 `propagation` 控制，当前默认为 1.0。以上权重是联合训练的起点，需要分别比较单任务分割和单任务表达基线才能判断是否互相增益。
 
-1. 原始 crop 前向, 得到分割、邻接、传播和 PFM 解耦输出。
-2. 计算图像损失与 PFM 损失, 按开关计算分子/关系蒸馏。
-3. 按 `loss_weights` 的键顺序加权求和。
-4. 尝试 MixUp, 再尝试 CutMix; 分别额外前向并加入分割损失。
-5. 记录原始 crop 指标与各项损失, 返回总损失。
+PCC 在同一 crop 内沿 spot 维度逐基因计算，再对有效的 crop–基因项取平均，不跨切片混合相关性。每个 crop 默认至少需要 8 个有效 spot；少于该数量或真值标准差不超过 1e-6 的基因不贡献相关性损失，仍参与 MSE。常数预测不会被排除：对非恒定真值，相关性项为 1，并保留有限梯度。计算使用 FP32，可配合混合精度训练。
 
-Lightning 负责 backward、梯度裁剪、AdamW 更新和每 epoch 的学习率调度。`on_train_batch_end` 根据 `global_step` 更新 EMA。`DatasetEpochCallback` 在每轮开始更新数据集的 `epoch`。
+RW 目标继续使用 MoMu 特征 F；软状态和预测表达图不参与 RW 边权计算。
 
-| 使用位置 | 使用的模型 |
-| --- | --- |
-| 原始 crop / MixUp / CutMix 训练 | 普通图像模型 |
-| 训练期间留出切片验证 | EMA 模型 |
-| 动态传播重新生成伪标签 | 普通图像模型 |
-| 最终保存和整片测试 | 普通图像模型 |
+## 训练吞吐优化
 
-动态传播在满足轮次条件时进行整片推理, 按配置重算或复用超像素拓扑, 吸附 spot 并执行随机游走, 然后阈值化概率。只有存在可采样窗口且概率有限时才提交监督更新。该行为沿用原实现。
+共享状态结构训练时先在 spot 圆盘内聚合 `u × A`（K 通道），再乘 K×G 表达模板，得到 spot 的线性表达预测，随后计算 log1p、MSE 和 crop 内 PCC。由于模板不随空间位置变化，这与先解码稠密表达再求均值在数学上等价，避免训练时分配 B×G×H×W 基因场及其反向中间张量。普通前向、验证、整片推理和 checkpoint 接口继续返回稠密表达。
 
-## 隐藏 spot 与分子观测校准传播
+数据加载 worker 在几何增强后准备组织圆盘的像素索引、归一化权重和 RW 节点/边/种子/连通分量。GPU 一次聚合整个 batch 的 spot；RW 仍使用当前前向的颜色和 F 计算边权，不缓存随模型变化的特征。CUDA PCG 使用脚本循环降低 Python 调度开销，每步检测并冻结收敛或失效的系统，每 8 步读取一次退出状态；最大迭代次数和容差保持原配置。CPU 求解和算子内部特征梯度接口保留。
 
-新增实验是训练期监督, 不修改图像模型的推理输入。默认 `experiment=her2st`
-关闭这些功能。新实验不使用 VAE 蒸馏, `pretrain_epochs=0` 跳过 VAE 训练。
-
-每步按中心超像素整组隐藏约 25% 的 spot, 尽可能各保留一个癌/非癌 anchor
-节点。同节点 spot 一并隐藏, 避免另一个 spot 的标签直接钳制 query。
-各模式使用相同、独立于训练随机数的划分; 数量不足时 query 可以为零。
-隐藏的是本步传播输入, 并不是额外的测试集; 最终效果仍由留出患者评估。
-
-训练目标为:
-
-`L = L_soft_seg(p, stopgrad(q)) + λ_query BCE(q_query, y_query) + λ_gene L_gene`。
-
-软伪标签只更新分割预测, query 真值损失通过 RW 更新边权及模型特征。
-独立开关 `detach_pseudo_target=false` 可恢复原先的目标侧梯度, 做额外消融。
-旧的硬伪标签项、Mixup/CutMix 与动态 DPR 必须关闭, 防止全种子生成的目标
-重新暴露 query。原全种子软标签可视化回调也在新配置中关闭; 分割验证照常。
-
-| experiment | 作用 | 基因损失权重 |
-| --- | --- | --- |
-| `her2st` | 原来的在线可微 RW 基线 | 0 |
-| `her2st_masked` | 相同隐藏划分和 stop-gradient, 不加 query 真值损失 | 0 |
-| `her2st_query` | 隐藏 spot 类别真值校准传播 | 0 |
-| `her2st_gene_auxiliary` | query 类别监督 + 普通图像→基因辅助头 | 0.1 |
-| `her2st_gene_propagation` | query 类别监督 + 真实表达校准同一组传播边权 | 0.1 |
-| `her2st_gene_shuffle` | 上一项的 anchor 表达在同 crop 内错位置换 | 0.1 |
-
-普通辅助头由未标准化的节点图像均值预测非负表达。分子传播分支则复用
-类别传播**同一次前向的边权** W。令 A 的每行是一个 spot 圆盘内各超像素
-组织面积的比例, 使用 anchor 的线性表达 G 解二次系统:
-
-`(A_anchor.T A_anchor + λ L_W + ε I) Z = A_anchor.T G_anchor + ε Z_prior`。
-
-`Z_prior` 是各 crop 自己的 anchor 表达均值, 不混合不同样本。解后将 Z 截断
-到非负范围, 用 `A_query Z` 预测隐藏 spot, 再与真实表达计算 MSE。该过程是
-二次重建加非负投影, 不是精确的带非负约束最优化。无 anchor 支持的连通
-区域不会贡献 query 损失, 两种基因分支使用相同的可监督 query 范围。
-
-HER2ST 的输入是 CP10k + `log1p`, 因而先 `expm1` 在线性相对表达空间求解、
-按组织面积加权均值聚合, 再 `log1p` 算损失。这里采用等面积相对表达近似,
-不把归一化表达当绝对分子计数, 不在 log 空间直接求均值。隐藏 spot 的
-表达既不进入 RHS 也不进入先验。癌/非癌标签仍监督中心节点的类别,
-不解释成圆盘内癌组织比例。
-
-表达求解使用 batch 块对角稀疏观测与 Jacobi-PCG, 每个 crop × 基因独立
-停止。反向解伴随系统, 不保留全部基因的迭代计算图。日志中的
-`train/propagation/gene_pcg_relative_residual` 是投影前线性系统的最大相对
-残差; 达到迭代上限并不等于收敛, 必要时增大 `gene_steps`。同时记录
-`query_count`、`label_queries`、`label_mixed_queries`、`gene_queries` 和
-`label_query_accuracy`。单类别种子的分量通常不提供边界学习梯度,
-所以要特别检查 `label_mixed_queries`。
-
-节点表达在同一超像素内为常数; 7mpp 网格不等于已验证的 7µm 分子分辨率。
-该分支用于训练传播关系, 不是无需表达种子就能预测基因的推理器。
-
-先比较 masked/query, 再比较 auxiliary/propagation/shuffle, 统一训练轮数、
-种子与 EMA/普通模型的评估口径。RAWKS 原文算法尚未在这里复现。
-
-```bash
-# 从项目根目录运行。seeds=[0] 仍会依次跑当前数据配置的全部 LOOCV folds。
-/home/yfm/miniconda3/envs/seg/bin/python -m segmodel.main experiment=her2st_query 'seeds=[0]'
-/home/yfm/miniconda3/envs/seg/bin/python -m segmodel.main experiment=her2st_gene_propagation 'seeds=[0]'
-```
-
-```bash
-NO_ALBUMENTATIONS_UPDATE=1 MPLCONFIGDIR=/tmp/seg2_mpl OMP_NUM_THREADS=2 \
-  /home/yfm/miniconda3/envs/seg/bin/python -m unittest discover -s tests -p 'test_*propagation*.py'
-```
-
-## 图像预测表达驱动标签传播
-
-在 `configs/config.yaml` 的 defaults 中选择 `experiment: her2st_gene_guided`,
-随后按原方式运行程序。`her2st_gene_prediction` 是同一稠密基因头、同一监督范围,
-仅关闭分子边权调制的对照。原 `her2st_gene_propagation` 配置与观测重建机制保留。
-
-新模式为 `propagation_supervision.gene_mode: prediction`:
-
-1. 模型在 MoMu 解码特征上增加 1×1 Conv + Softplus, 输出 7mpp 稠密线性相对表达。
-   基因数自动取训练 adata 的 n_vars, 不固定为 512。表达图保留超像素内部变化。
-2. 对每个有效训练 spot, 直接按圆盘内组织像素取表达均值; HER2ST 在聚合后
-   log1p, 与真实 log1p 表达计算 MSE。真实表达只作目标, 不作为网络或 RW 输入。
-   表达监督覆盖全部有效训练 spot, 不依赖类别标签是否已知、是否隐藏或图是否有边。
-3. 表达图先按超像素求线性均值, 再 log1p, 得到节点表达 e。相邻节点的
-   `d_ij = mean_gene((e_i-e_j)^2)`, 分子调制为
-   `m_ij = 1 + alpha * (2*exp(-beta_gene*d_ij)-1)`;
-   实际类别 RW 使用 `W_ij = W_visual_ij * m_ij`。
-   相似表达加强连接, 差异表达减弱连接; alpha=0.3 时因子在 [0.7,1.3]。
-   所有基因等权, 不是已验证的生物程序或癌症专用相似度。
-4. 类别 spot 仍按原规则隐藏, 用类别 query 真值训练 RW。软伪标签停止梯度。
-   默认类别 query 损失可经分子调制回传到表达头; 基因真值损失同时约束表达准确性。
-
-主要配置:
+HER2ST 训练 DataLoader 当前配置为：
 
 ```yaml
-propagation_supervision:
-  gene_mode: prediction
-  gene_edge_strength: 0.3  # 0: 关闭调制, 对应 her2st_gene_prediction
-  gene_edge_beta: 1.0
-  detach_gene_edges: false  # true: 切断类别 query 损失到预测表达的梯度
-training:
-  image:
-    loss_weights:
-      propagation: 1.0
-      propagation_query: 1.0
-      gene_prediction: 0.1
+num_workers: 8
+persistent_workers: true
+prefetch_factor: 1
+pin_memory: false
 ```
 
-训练日志 `train/gene_prediction` 是全部有效 spot 的未加权表达 MSE,
-`train/propagation/gene_spots` 是每 batch 的有效表达 spot 数。
-`train/propagation/molecular_mean/std/min/max` 监控实际调制因子。
-旧 `gene_queries` 指观测重建的隐藏表达监督, 不用于判断新分支是否有监督。
+`num_workers=0` 时自动关闭持久化和预取。采样器把 epoch 与样本索引一起发送给 worker，避免预取使用旧的 epoch；有标注切片的超像素图使用共享存储，动态 SNIC 原地更新，因此 worker 复用后仍能读取新拓扑。几何旋转和翻转先建立 NumPy 视图，最后合并成一次连续内存复制。训练结束时显式释放 worker，避免连续运行多个 fold 时保留整片数据。
 
-验证和最终测试通过同一次图像推理拼接稠密表达图, 在整片真实 spot 上计算
-`val/gene_prediction` (log1p MSE)、`val/gene_prediction_pcc` (逐基因跨 spot PCC 的均值),
-并记录 `val/gene_spots`、`val/gene_pcc_genes`。常数预测或常数真值基因不进入 PCC;
-没有有效 spot 时误差为 NaN, 不记成零。验证无需表达 anchor 或隐藏表达。
-LOOCV 的 val 仍是外层留出患者, 调参应使用训练患者内部验证。
-整片表达拼接会增加主存占用, 随组织面积和基因数增长。
+大特征 batch 的多进程预取会同时占用共享内存和主进程中的锁页副本。WSL 的锁页内存可用量有限，HER2ST 使用 `prefetch_factor=1` 和 `pin_memory=false` 降低 Windows 主机内存压力；该开关不改变模型、损失或训练步数。通用 `dataset/base.yaml` 仍提供 `pin_memory=true`，可在其他环境中单独配置。
 
-表达头参与模型 EMA, 随 final_model.pt 保存, artifact 包含 gene_count 和有序 gene_names。
-模型输出 `gene_expression` 为 `(B,G,H/7,W/7)` (HER2ST 几何), 单位是非负线性相对表达。
-分割推理不使用真实表达或类别种子; RW 是训练伪标签生成器。
-7mpp 输出网格不是已验证的 7µm 分子分辨率, 当前 spot 监督不能唯一确定 spot 内细节。
+创建多进程训练 DataLoader 前，先在父进程调用 `cv2.setNumThreads(1)`，避免 fork 后调整继承的 OpenCV 并行池时死锁。每个训练 worker 初始化时再调用 `cv2.setNumThreads(1)` 和 `threadpool_limits(limits=1, user_api="blas")`，将 OpenCV 和已加载的 BLAS 线程池限制为单线程，并保留 `seed_everything(..., workers=True)` 的 Lightning 随机种子初始化。线程限制持续覆盖持久化 worker 的整个生命周期，可与启动前设置的 `OPENBLAS_NUM_THREADS=1`、`MKL_NUM_THREADS=1`、`OMP_NUM_THREADS=1` 配合使用。
 
-## 可微标签传播 (实验开关)
+## 目录
 
-`experiment.propagation.enabled=true` 时, `training_step` 会用 `DifferentiablePropagation` 在 crop 内重算软标签, 作为 `loss_weights.propagation` 对应的损失项:
+| 路径 | 职责 |
+| --- | --- |
+| `main.py` | Hydra 入口，按 fold 和随机种子组织实验 |
+| `pipeline.py` | 准备数据、训练、保存最终模型、整片测试 |
+| `configs/` | 数据、模型、训练、增强、RW 和实验配置 |
+| `dataset/` | 切片加载、患者划分、裁剪、混合监督采样与增强 |
+| `models/segmentation.py` | 完整图像与表达联合预测网络 |
+| `modules/backbone.py` | Stem、ConvNeXt 编码器与解码器 |
+| `modules/conditioning.py` | 基础模型特征投影、路由和条件调制 |
+| `modules/tissue_states.py` | 共享软状态、表达模板、类别倾向与联合解码 |
+| `modules/propagation.py` | RW 图构造、类别种子投票与 PCG 求解 |
+| `modules/spot_pooling.py` | 稠密表达在 spot 圆盘内的组织均值 |
+| `training/segmentation_module.py` | 损失接线、优化器、学习率、EMA 和验证日志 |
+| `training/dynamic_snic.py` | 定期用当前 F 重划分 SNIC，并保存整片 RW 诊断 |
+| `training/losses.py` | 表达 MSE/逐基因 PCC、软标签 BCE + Dice 及可选图像/PFM 损失 |
+| `inference/` | 滑窗拼接、分割/表达指标和结果可视化 |
 
-- 图拓扑固定 (crop 内 SNIC 邻接), 只有边上的 gate 可学; base conductance 由 Lab + 模型中间特征差固定且 detach, 梯度只走 gate
-- 求解器是对 Dirichlet 系统跑的 Jacobi 预条件 CG (默认 85 步 / 1e-8 早停); 度分布极不均时裸 CG 与 Jacobi 收敛都不可用, 见 `tools/validate_jacobi_scipy.py` 的对照
-- 软目标经 `soft_segmentation_loss` 反传, 不做阈值化; 无解样本 (种子全在组织外) 被剔除, 原有硬伪标签项继续覆盖
-- 诊断量记录在 `train/propagation/*`: `pcg_steps`、`gate_mean`、`gate_std`、`valid_fraction`（组织内拿到确定监督的像素比例, 分母是前景像素; 组织外不参与监督）
+## 配置入口
 
-| 档位 | 配置 | 检验的假设 |
+`configs/config.yaml` 默认选择 `experiment: her2st`，按原方式在 IDE 中运行 `main.py`。`configs/experiment/` 只保留 `her2st.yaml`，负责组合下面的配置文件：
+
+| 配置文件 | 内容 |
+| --- | --- |
+| `configs/dataset/her2st.yaml` | 36 张表达切片、8 张标注评估切片、患者隔离和混合采样 |
+| `configs/model/her2st.yaml` | 共享状态数、隐藏维度及旧结构对照开关 |
+| `configs/training/her2st.yaml` | HER2ST 表达 MSE/PCC 与分割损失权重 |
+| `configs/augment/her2st.yaml` | 数据增强 |
+| `configs/propagation/her2st.yaml` | RW 软标签传播、动态 SNIC 开关与更新周期 |
+
+各组的通用参数仍位于对应 `base.yaml`。
+
+表达监督变换设置在 `training.image.expression_transform`，HER2ST 为 `log1p`。MSE 权重为 `training.image.loss_weights.gene_prediction`，相关性权重为 `training.image.loss_weights.gene_correlation`。将后者设为 `0.0` 即关闭相关性监督。最少有效 spot 数设置在 `training.image.gene_correlation_min_spots`，默认 8，最低按 3 处理。基因数从训练表达矩阵读取。
+
+学习率在每次优化器更新后按 step 调度：先从 `0.1 × lr` 线性预热到 `lr`，再余弦衰减到 `1e-6`。`training.image.warmup_steps` 只表示预热占总优化器更新次数的比例，取值范围 `[0, 1]`，实际预热步数为 `ceil(总步数 × warmup_steps)`；例如 `0.1` 表示前 10% 的训练步数用于预热，`0` 表示不预热，`1` 表示全程线性预热。总步数取 Lightning 的实际估计，考虑梯度累积、batch 限制和 `max_steps`。例如 2560 samples/epoch、batch size 16、100 epochs、`warmup_steps=0.1` 在单 GPU、无梯度累积时对应总计 16000 step、预热 1600 step。学习率不再使用 `warmup_epochs`；动态 SNIC 的周期和预热仍按 epoch 计数。
+
+进度条通过 `training.image.progress_every_n_steps` 控制训练指标的显示间隔，默认每 100 个优化器 step 刷新一次，首个 step 和每轮末尾也刷新。显示当前 batch 的 Loss、Dice、IoU、表达 MSE 损失（`gene_prediction`）、相关性损失 1−PCC（`gene_correlation`）、有效 spot 数（`gene_spots`），以及全局 step 和科学计数法显示的当前学习率；表达损失仅显示已启用的项。梯度累积期间按优化器更新次数计数，epoch 汇总日志继续保留，验证指标仍在验证时更新。
+
+当前默认模型设置：`tissue_state_count=32`、`tissue_state_dim=96`、`joint_prediction=false`。G 从当前 fold 的训练表达矩阵读取。模板 `tissue_state_decoder.template_logits` 和类别倾向 `tissue_state_decoder.class_logits` 随模型权重保存，可分别 softmax/sigmoid 后查看。
+
+在 `configs/model/her2st.yaml` 中直接修改参数：
+
+| 结构 | `tissue_state_count` | `joint_prediction` |
 | --- | --- | --- |
-| 基线 | `enabled=false` | 纯硬伪标签 |
-| 1 (默认) | `enabled=true` (`gate_range=0.3`, `feature_gradients=false`) | 逐边 gate 修正是否有增益 |
-| 1' | `enabled=true, gate_range=0` | 只换软标签、核固定 |
-| 2 | `enabled=true, gate_range=0, feature_gradients=true` | 表示学习能否替代逐边修正 |
-| 3 | `enabled=true, feature_gradients=true` | 两者同开, 自指风险最高 |
+| 共享软状态（当前默认） | `32`（也可比较 16/64） | `false` |
+| 原 P₀ 条件/反馈结构 | `0` | `true` |
+| 原分割 + 普通表达头 | `0` | `false` |
 
-`feature_gradients=true` 时 base 与模型特征不再 detach, 传播损失会回传到 backbone——监督信号的生成器开始被它生成的监督训练。开档 2/3 要盯 `valid_fraction`（监督区域是否萎缩）和软标签可视化（是否坍缩成模型预测的副本）。
+共享状态数必须至少为 2，两个联合结构互斥。`tissue_state_dim` 是编码器的隐藏通道数，与模板数量 K 不同。启用共享状态时，`phenotype_dim`、`molecular_dim`、`detach_phenotype`、`use_seg_condition` 和 `use_gene_feedback` 均不参与计算。
 
-```bash
-# 开启可微传播并与硬标签监督共存 (档 1)
-python -m segmodel.main experiment.propagation.enabled=true \
-    experiment.training.image.loss_weights.propagation=1.0
-# 档 2: 固定核 + 开特征
-python -m segmodel.main experiment.propagation.enabled=true \
-    experiment.training.image.loss_weights.propagation=1.0 \
-    experiment.propagation.gate_range=0.0 \
-    experiment.propagation.feature_gradients=true
-# 数值对照: PCG vs scipy、gate 梯度、特征梯度、端到端训练步
-python -m unittest tests.test_diff_propagation tests.test_propagation_training -v
-```
+共享状态的表达单任务对照将全部分割损失设为 0；分割单任务对照将表达 MSE/PCC 都设为 0。后者仍会构造相同状态和模板参数，便于比较；没有表达监督时不能将模板解释为学到的分子模式。
 
-`experiment.soft_label.enabled=true` 时, `SoftLabelVisualizationCallback` 每 `interval_epochs` 轮对训练切片整片推理, 用当前模型特征和门控重算软标签并保存到 `soft_labels/epoch_XXXX/<slide>/`, 只读诊断、不写回数据集: 概率场 (uint16 PNG)、阈值化伪标签与叠加图、spot 种子图、与模型概率的对照面板和 `metadata.json`。它需要 `propagation.enabled=true`, 每个可视轮次多一次整片推理。
+下面两个交互开关用于原 P₀ 条件/反馈结构，需要先设置 `tissue_state_count: 0`、`joint_prediction: true`。该结构的初始/最终 RW 权重可设回 `propagation: 1.0`、`propagation_initial: 0.5`：
 
-```bash
-# 软标签可视化: her2st 默认开启, 用下面这条关掉
-python -m segmodel.main ... experiment.soft_label.enabled=false
-```
 
-## 数据与张量约定
-
-设 `B` 为 batch 大小, `C` 为 crop 边长, `L` 为标签网格相对图像的步长, `S` 为 patch 步长, `T` 为 CLS 步长, `K` 为 PFM 个数。
-
-| batch 字段 | 形状 / 类型 | 用途 |
+| 对照 | `use_seg_condition` | `use_gene_feedback` |
 | --- | --- | --- |
-| `image` | `(B, 3, C, C)`, uint8 | H&E; 前向内归一化到 `[-1, 1]` |
-| `patch` | K 个 `(B, D_i, C/S, C/S)` | PFM 空间特征 |
-| `cls` | K 个 `(B, D_i, C/T, C/T)` | PFM 全局上下文 |
-| `pfm_mask` | `(B, K)`, bool | True 表示该 PFM 可用 |
-| `cancer_probability` | `(B, 1, C/L, C/L)`, float32 | 伪标签概率 |
-| `valid` | `(B, 1, C/L, C/L)`, bool | 伪标签不等于 255 的位置 |
-| `superpixels` | `(B, 1, C/L, C/L)`, int32 | 超像素编号 |
-| `spots` | B 个 `(N_b, 2)` 张量 | crop 内 `(x, y)` 坐标, 单位为图像像素 |
-| `gene_expression` | B 个 `(N_b, G)` 张量 | 对应 spot 表达矩阵 |
-| `spot_labels` / `spot_ids` | B 个 `(N_b,)` 张量 | spot 标签 / 当前表达矩阵行号 |
-| `slide_id` | `(B,)` | 当前 fold 的切片编号 |
+| 共享 F 的两个独立预测分支 | `false` | `false` |
+| 仅 P₀ → 表达 | `true` | `false` |
+| 仅 Z → 分割 | `false` | `true` |
+| 完整条件/反馈结构 | `true` | `true` |
 
-不同 crop 的 spot 数不同, 因此 `collate_samples` 将这四个变长字段保留为列表。关系蒸馏只在同一 crop 内合并重复 spot, 不合并跨 crop 的视图。
+`use_seg_condition: false` 将类别条件置零，保留表达编码器的层数、通道数和参数结构。`detach_phenotype: true` 仍读取 P₀，只阻断其梯度，不能代替这个开关。`use_gene_feedback: false` 跳过修正头，最终分割严格等于 P₀，导出的修正门控和残差为零；修正头参数保留，已训练的修正权重也不会生效。两个开关都会随 `final_model.pt` 保存。
 
-`SegmentationModel` 返回 `logits`、`affinity_logits`、`features`、`propagation_features` 及 `pfm_*` 统计量。分割网格由原有 Stem 的 `down_factor=7` 决定; 本次没有调整分辨率或模型结构。
+关闭反馈后 P₁ 等于 P₀，`propagation` 与 `propagation_initial` 的监督相同，系数 1.0/0.5 对应分割总系数 1.5。比较四种交互模式时保持损失权重一致。共享编码器仍同时接受两个任务的梯度，关闭两个开关只关闭显式交互。
 
-## 运行与配置
+原条件/反馈结构做表达单任务对照时，关闭两个交互开关并将全部分割损失权重设为零，保留表达 MSE/PCC。做“相同联合结构但无表达监督”的容量对照时，保留 `joint_prediction: true`，将 MSE/PCC 权重都设为零；基因数仍由训练表达矩阵读取，不必手填。`tissue_state_count: 0`、`joint_prediction: false` 使用原分割路径和可选的普通线性表达头，表达分支深度不同，不能直接作为仅关闭 P₀ 条件的对照。
 
-仍从项目根运行:
+RW 配置位于 `configs/propagation/base.yaml`，包括核参数、求解精度和监督阈值。内部可微计算接口仍保留，当前训练固定停止目标梯度；门控幅度为 0，不训练传播边权。
 
-```bash
-python -m segmodel.main
-python -m segmodel.main experiment=her2st seeds='[0]'
+## 动态 SNIC 与 RW 可视化
+
+HER2ST 默认开启动态 SNIC。在 `configs/propagation/her2st.yaml` 设置：
+
+```yaml
+dynamic_snic:
+  enabled: true
+  warmup_epochs: 40
+  interval_epochs: 20
 ```
 
-配置由 `configs/config.yaml` 组合, 实验参数位于 `cfg.experiment` 下。公共分辨率配置读取项目根的 `config/resolution.yaml`。
+完成第 40 轮训练后第一次更新，随后在第 60、80、100…轮结束时更新。第 40 轮生成的新划分从第 41 轮训练开始使用。这里的预热只控制 SNIC，与学习率预热独立；更新不依赖验证周期。
 
-每个 fold 仍保存 `config.yaml`、`split.json`、`vae/`、`segmentation/`、`final_model.pt`、`test/<slide>/` 和 `metrics.json`; 启用相应流程时还写入 `validation/`、`dynamic_pseudo_labels/` 与 `soft_labels/`。
+每次仅处理有分割监督的训练切片：使用普通模型当前的 MoMu 特征 F（显式指定 `feature_key="features"`）整片滑窗推理，将 F 在组织内逐通道标准化并与 Lab 颜色组合，重新运行 SNIC。不会使用软状态 A、预测基因图、真实表达或留出患者数据。通用参数在 `configs/propagation/base.yaml` 的 `dynamic_snic` 下：`superpixel_size_um=64.0`、`compactness=10.0`、`learned_weight=1.0`。最后一项仅调节 SNIC 特征，RW 的同名权重仍取外层配置。
 
-## 图像骨干初始化
+新超像素图原地更新训练共享内存中的 `slide.superpixels`，下一轮 crop 使用新拓扑，RW 继续逐 crop 实时生成停止梯度的目标。不写回 `data/` 的预处理文件，不修改原始类别种子、表达目标或采样掩码。持久化 DataLoader worker 通过共享存储读取更新后的划分。关闭 RW 或将两项 RW 分割权重都设为零时，不注册动态 SNIC 回调。
 
-当前 YAML 设置 `experiment.model.image.backbone_init=convnext`:
-Stem、编码器和解码器的普通 Conv2d、ConvTranspose2d 和 Linear 权重使用
-`torch.nn.init.trunc_normal_(std=0.02)`, bias 为零。
-转置卷积使用相同策略是本项目对解码器的扩展。
-条件调制头保留全零初始化, 路由器、PFM 解耦层、输出头、Gene VAE 和蒸馏投影头
-保留原初始化。LayerNorm 保持 weight=1、bias=0, 残差 gamma 保持 0.01。
+同一次更新会在新划分上运行现有 RW 求解器，并保存到：
 
-局部重置在模型构建完成后执行, 并隔离 CPU RNG, 因此同一 seed 下其他分支、
-后续投影头的初始权重和训练随机数状态不随此开关变化。
-构造函数默认值仍为 `pytorch`, 兼容缺少此字段的旧模型配置;
-训练保存的模型配置会包含本次选择。
-
-```bash
-# 当前配置: ConvNeXt 风格的局部初始化
-python -m segmodel.main
-# 对照实验: 恢复原始初始化, 其余实验配置保持一致
-python -m segmodel.main experiment.model.image.backbone_init=pytorch
-# 验证局部初始化、随机状态、前反向与权重读写
-python -m unittest discover -s tests -p 'test_model_initialization.py' -v
+```text
+<fold>/soft_labels/epoch_0040/A1/
+<fold>/soft_labels/epoch_0060/A1/
+...
 ```
 
-此开关只选择初始化方式; 复现 main 还需对齐 seed、切片顺序和验证等训练设置。
+| 文件 | 内容 |
+| --- | --- |
+| `superpixels.npy`、`superpixel_labels.png` | 新超像素编号数组及彩色图 |
+| `superpixel_boundary_overlay.png` | H&E 上的红色 SNIC 边界；label MPP ≥ 4 时细线化，与静态 `snic/snic_boundary_overlay.png` 一致；PNG 无损保存 |
+| `soft_probability.npy`、`soft_probability.png` | RW 连续概率；NPY 为原始 float32，PNG 为 uint16，除以 65535 还原 |
+| `soft_probability_heatmap.png` | RW 概率热图，组织外白色 |
+| `soft_pseudo_mask.png`、`soft_pseudo_mask_overlay.jpg` | 高置信 RW 伪标签；0 非癌、1 癌、255 忽略；蓝色非癌、红色癌 |
+| `supervised_mask.png` | 白色为 RW 监督范围，黑色为忽略区域 |
+| `spot_seeds_overlay.jpg` | 当前训练类别种子 |
+| `model_probability.png`、`model_probability_heatmap.png` | 同一次推理的模型分割概率，供对照 |
+| `overview.jpg`、`metadata.json` | 六面板总览、超像素数量、阈值、覆盖率和 PCG 等诊断 |
 
-## 之前重构的等价性记录
+可视化的 RW 使用整片 F、全部该切片训练类别种子，以及与训练相同的求解器参数，在 CPU 上计算，避免额外占用整片图的 GPU 显存。训练仍在各 crop 上构图，两者的种子范围和标准化统计量不同，所以整片图用于诊断，不等于所有训练 crop 目标的拼接。若整片图不可解，保存的伪标签全部为忽略，元数据标记 `rw_solved=false`。
 
-- 重构基线是开始操作时的工作区代码, 包含原先尚未提交的修改。
-- 保留参数名称和注册顺序、初始化顺序、随机数调用、损失求和顺序、优化器分组、学习率、EMA、数据加载与增强顺序。
-- `ConvNeXtBlock.norm` 虽未用于前向, 仍保留注册, 以免改变 checkpoint 和优化器结构。
-- 删除没有调用方的旧 `ConvBlock`、`BlurPool`、`ResidualBlock`、`ModulatedBlock`; 当前训练网络未使用它们。
-- 内联 CSV logger 包装、Stem 的临时变量和推理结尾的单次 resize 包装; 原有异常检查和监督更新判断保留。
-- 旧 `models.distiller.Distiller` 与 `modules.segmentation` 中现用网络类的导入仍可用。
+## 患者隔离与混合训练
 
-本次验证: 6,349 个张量零容差一致, 原有 14 个单元测试通过; 107 个函数/类的 AST 在忽略方法声明排列后保持一致, 所有 YAML 配置字节一致。语法编译与 Ruff F 类检查通过。
+HER2ST 的 36 张表达切片按患者划分；8 张有分割标注的切片决定 8 个评估 fold。例如留出 C 患者时，C1–C6 全部排除在训练之外，C1 评估分割，C1–C6 都评估表达。
 
-对照脚本使用两份源码分别运行独立进程, 检查 CPU 合成数据上的 VAE 训练、3 个 epoch 分割训练、梯度、优化器/调度器状态、EMA、增强、随机状态和滑窗推理。要求张量 `rtol=0, atol=0`, 字典键和参数顺序也一致。
+其他患者的有标注切片和仅有表达切片混合采样，比例由 `dataset.labeled_sampling_fraction` 控制；设为 `null` 时从全部训练切片等概率抽取。仅表达切片没有类别种子，不贡献分割监督，但其有效 spot 参与表达损失。基因选择和归一化基因集合由训练患者决定，留出患者不参与选择。
 
-```bash
-# before 目录中应包含重构前的 segmodel/。
-python tests/check_segmodel_equivalence.py /path/to/before
-python -m unittest discover -s tests -p 'test_*.py' -v
-```
+## 指标与输出
 
-当前会话基线保存在 `/tmp/segmodel_refactor_20261007/before/segmodel`。这是临时快照, 如需长期保留可另行归档。完整真实数据 GPU 训练未执行; 当前环境无法使用 CUDA, 且 PyTorch 的 CPU 抗锯齿缩放不支持 BF16。BF16 对照仅覆盖 VAE 前向和分子/关系蒸馏, 没有替换训练算子来规避此限制。
+验证与最终测试均以 H&E 和预计算图像特征为输入，不需要真实表达或类别种子。
+
+- 分割：Dice、IoU、HD95。
+- 原条件/反馈结构额外报告初始分割指标和 `refinement_dice_gain`（最终 Dice 减去初始 Dice）；共享状态结构不报告这些指标。
+- `gene_prediction`：有效 spot × 基因观测上的表达 MSE。
+- `gene_prediction_rmse`：表达 MSE 的平方根。
+- `gene_prediction_pcc`：逐基因跨 spot 计算 PCC，再对可计算的基因取均值。
+- `gene_prediction_pcc_max/min`：上述有效基因 PCC 的最大/最小值。
+- 患者表达主指标合并该患者全部切片的有效 spot；同时保存各切片结果和宏平均。
+
+常数预测、常数真值及观测不足的基因不参与 PCC；缺失基因值不当作真实零表达。
+
+训练日志分别记录未加权的 `train/gene_prediction`（MSE）和 `train/gene_correlation`（平均 1-PCC），后者越低越好；没有可计算的相关性项时为 0。总损失 `train/loss` 使用配置权重。另记录 `train/gene_spots`、启用的分割损失、RW 的 PCG/覆盖率诊断。共享状态额外记录逐位置状态熵 `train/tissue_state_entropy`、batch 平均状态用量的熵 `train/tissue_state_usage_entropy` 和平均幅度 `train/expression_amplitude_mean`；两个熵均使用自然对数，取值范围约为 0 到 ln(K)。低用量熵提示少数状态占主导，高位置熵可能表示状态混合接近均匀，不能只凭熵判断质量。原结构仍记录修正门控和残差统计。验证使用 EMA 模型，最终保存和测试使用普通模型。验证表达 MSE、RMSE、PCC 的定义保持不变，训练相关性项使用 crop 内统计，验证 PCC 使用整片或整患者统计。
+
+每个 fold 保存 `config.yaml`、`split.json`、`segmentation/`、`validation/`、`final_model.pt`、`test/<slide>/` 和 `metrics.json`。动态 SNIC 更新时额外保存 `soft_labels/epoch_<轮次>/<训练切片>/`。有分割评估的切片保存概率图和掩码；表达评估保存 `gene_predictions.npz`。仅原条件/反馈结构额外保存初始分割和修正门控。
+
+`final_model.pt` 包含图像模型权重、构造参数、滑窗设置和有序基因名称，可以重建模型并单独推理。

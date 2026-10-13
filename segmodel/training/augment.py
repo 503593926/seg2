@@ -5,7 +5,8 @@ import torch
 
 def mixup_batch(batch, cfg):
     # 布尔 pfm_mask 无法表示插值后的可用程度，只选择所有 PFM 均可用的样本。
-    indices = batch["pfm_mask"].all(dim=1).nonzero(as_tuple=True)[0]
+    eligible = batch["pfm_mask"].all(dim=1) & batch["valid"].flatten(1).any(dim=1)
+    indices = eligible.nonzero(as_tuple=True)[0]
     if indices.numel() < 2:
         return None
     indices = indices[

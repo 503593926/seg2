@@ -7,9 +7,4 @@
   decoder_chans: [128, 96]
   global_dim: 256
   spatial_dim: 32
-  skip_drop_path: 0.1
-
-gene:
-  latent_dim: 64
-  hidden_dims: [128]
-  dropout: 0.1
+  skip_drop_path: 0.0

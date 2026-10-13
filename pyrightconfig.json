@@ -1,5 +1,19 @@
 {
   "venvPath": "/home/yfm/miniconda3/envs",
   "venv": "seg",
-  "pythonVersion": "3.11"
+  "pythonVersion": "3.11",
+  "executionEnvironments": [
+    {
+      "root": "baselines/SpaHGC_",
+      "extraPaths": [
+        "baselines/SpaHGC_",
+        "baselines/SpaHGC_/SpaHGC",
+        ".",
+        "/home/yfm/miniconda3/envs/seg_bls/lib/python3.11/site-packages"
+      ]
+    },
+    {
+      "root": "."
+    }
+  ]
 }

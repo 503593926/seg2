@@ -6,7 +6,6 @@ import torch
 from torch import nn
 
 from segmodel.models.segmentation import SegmentationModel
-from segmodel.modules.blocks import ProjectionHead
 
 
 class ModelInitializationTest(unittest.TestCase):
@@ -27,7 +26,7 @@ class ModelInitializationTest(unittest.TestCase):
             global_dim=8, spatial_dim=4, propagation_channels=4,
             backbone_init=mode,
         )
-        return model, ProjectionHead(model.feature_channels, 4)
+        return model, nn.Linear(model.feature_channels, 4)
 
     def test_only_image_backbone_changes_and_downstream_rng_is_preserved(self):
         baseline, baseline_projector = self.build('pytorch')
@@ -52,7 +51,7 @@ class ModelInitializationTest(unittest.TestCase):
             if '.cnorm.' in name:
                 self.assertEqual(torch.count_nonzero(value).item(), 0, name)
             if name.endswith('.gamma'):
-                torch.testing.assert_close(value, torch.full_like(value, 0.01), rtol=0, atol=0)
+                torch.testing.assert_close(value, torch.full_like(value, 1e-6), rtol=0, atol=0)
         self.assertAlmostEqual(torch.cat(changed_weights).std().item(), 0.02, delta=0.001)
         for name, value in projector.state_dict().items():
             torch.testing.assert_close(value, baseline_projector.state_dict()[name], rtol=0, atol=0)

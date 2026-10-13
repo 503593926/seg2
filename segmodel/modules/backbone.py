@@ -141,7 +141,7 @@ class ConvNeXtStage(nn.Module):
 
 
 class ConvNeXtBlock(nn.Module):
-    def __init__(self, dim, drop_path, cnorm_kwargs, layer_scale_init_value=1e-2):
+    def __init__(self, dim, drop_path, cnorm_kwargs, layer_scale_init_value=1e-6):
         super().__init__()
 
         self.dwconv = nn.Conv2d(

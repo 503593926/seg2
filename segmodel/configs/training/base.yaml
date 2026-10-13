@@ -1,16 +1,11 @@
-﻿vae:
-  pretrain_lr: 0.001
-  weight_decay: 0.01
-  pretrain_epochs: 50
-  pretrain_batch_size: 128
-  rec_loss: 1.0
-  kl_weight: 0.1
-
 image:
-  epochs: 60
-  warmup_epochs: 10
+  epochs: 5
+  warmup_steps: 0.15  # 预热占总优化器 step 的比例 [0, 1]，向上取整；0 表示不预热
+  progress_every_n_steps: 10  # 进度条指标刷新间隔，按优化器更新计数；首步和每轮末尾也刷新
   val_every_n_epochs: 1   # 每 N 个 epoch 验证一次（指标 + validation/ 可视化）；epochs 不被 N 整除时末尾无验证
   batch_size: 16
+  expression_transform: log1p  # 线性表达先做 spot 均值，再 log1p 计算 MSE/PCC
+  gene_correlation_min_spots: 8  # 每 crop 至少包含这些有效 spot 才计算逐基因 PCC，最低按 3 个处理
   ema_decay: 0.999
 
   lr: 4e-3
@@ -19,13 +14,10 @@ image:
     segmentation: 0.0
     affinity: 0.0
     superpixel: 0.0
-    molecular: 0.0
-    relation: 0.0  # crop 内 spot 余弦相似度关系蒸馏
-    propagation: 1.0  # 可微传播软标签项, 与 experiment.propagation.enabled 配合
-    propagation_query: 0.0  # 隐藏 spot 类别真值监督传播
-    gene_auxiliary: 0.0  # 普通图像→表达辅助预测对照
-    gene_propagation: 0.0  # 真实表达监督同一套传播边权
-    gene_prediction: 0.0  # 纯图像稠密表达预测, 所有有效训练 spot 监督
+    propagation: 0.0  # 可微传播软标签项, 与 experiment.propagation.enabled 配合
+    propagation_initial: 0.0  # 联合预测初始分割P0的同一RW软标签监督
+    gene_prediction: 1.0  # 纯图像稠密表达预测, 所有有效训练 spot 监督
+    gene_correlation: 0.5  # 同一 crop 内逐基因的 1-PCC，与 MSE 独立加权
 
     pfm_cls_global: 0.0
     pfm_orth_global: 0.0

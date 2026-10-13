@@ -1,6 +1,9 @@
 import math
+from typing import cast
 
 import numpy as np
+from numpy.typing import NDArray
+import torch
 from scipy.ndimage import binary_erosion, distance_transform_edt
 
 
@@ -27,15 +30,15 @@ def hd95(prediction, truth, valid, mpp=1.0):
         return float("inf")
     if np.array_equal(prediction, truth):
         return 0.0
-    prediction_surface = prediction & ~binary_erosion(prediction | ~valid)
-    truth_surface = truth & ~binary_erosion(truth | ~valid)
+    prediction_surface = prediction & ~cast(NDArray[np.bool_], binary_erosion(prediction | ~valid))
+    truth_surface = truth & ~cast(NDArray[np.bool_], binary_erosion(truth | ~valid))
     if not prediction_surface.any() or not truth_surface.any():
         return float("nan")
     # sampling=mpp：把距离从"像素数"换算成微米，HD95 因此带物理单位
-    forward = distance_transform_edt(~truth_surface, sampling=mpp)[
+    forward = cast(NDArray[np.float64], distance_transform_edt(~truth_surface, sampling=mpp))[
         prediction_surface
     ]
-    backward = distance_transform_edt(~prediction_surface, sampling=mpp)[
+    backward = cast(NDArray[np.float64], distance_transform_edt(~prediction_surface, sampling=mpp))[
         truth_surface
     ]
     return float(np.percentile(np.concatenate((forward, backward)), 95))
@@ -113,8 +116,60 @@ def _summarize_head(metrics_list):
     }
 
 
-def summarize_metrics(slides):
-    values = list(slides.values())
-    summary = _summarize_head(values)
+def expression_metrics(prediction, target, observed=None):
+    """同一基因跨spot的PCC统计均值和极值; 常量预测/目标不计入PCC。"""
+    prediction, target = prediction.float(), target.float()
+    observed = torch.ones_like(target, dtype=torch.bool) if observed is None else observed.bool()
+    metrics: dict[str, int | float] = {
+        "gene_spots": len(prediction), "gene_pcc_genes": 0, "gene_values": int(observed.sum())
+    }
+    if not bool(observed.any()):
+        return {**metrics, "gene_prediction": float("nan"), "gene_prediction_rmse": float("nan"),
+                "gene_prediction_pcc": float("nan"), "gene_prediction_pcc_max": float("nan"),
+                "gene_prediction_pcc_min": float("nan")}
+    mse = float((prediction - target)[observed].square().mean())
+    metrics.update(gene_prediction=mse, gene_prediction_rmse=math.sqrt(mse))
+    counts = observed.sum(0).clamp_min(1)
+    centered_prediction = torch.where(observed, prediction - (prediction * observed).sum(0) / counts, 0.)
+    centered_target = torch.where(observed, target - (target * observed).sum(0) / counts, 0.)
+    p_std = (centered_prediction.square().sum(0) / counts).sqrt()
+    t_std = (centered_target.square().sum(0) / counts).sqrt()
+    usable = (counts >= 2) & (p_std > 1e-6) & (t_std > 1e-6)
+    metrics["gene_pcc_genes"] = int(usable.sum())
+    pcc = (
+        ((centered_prediction[:, usable] * centered_target[:, usable]).sum(0) / counts[usable]
+         / (p_std[usable] * t_std[usable])).clamp(-1, 1)
+    )
+    metrics["gene_prediction_pcc"] = float(pcc.mean()) if pcc.numel() else float("nan")
+    metrics["gene_prediction_pcc_max"] = float(pcc.max()) if pcc.numel() else float("nan")
+    metrics["gene_prediction_pcc_min"] = float(pcc.min()) if pcc.numel() else float("nan")
+    return metrics
+
+
+def summarize_expression_metrics(slides, expression_results):
+    valid = [record for record in expression_results.values() if len(record["prediction"])]
+    if not valid:
+        return {}
+    micro = expression_metrics(
+        torch.cat([record["prediction"] for record in valid]),
+        torch.cat([record["target"] for record in valid]),
+        torch.cat([record.get("observed", torch.ones_like(record["target"], dtype=torch.bool)) for record in valid]),
+    )
+    per_slide = {
+        name: {key: value for key, value in metrics.items() if key.startswith("gene_")}
+        for name, metrics in slides.items() if "gene_prediction" in metrics
+    }
+    macro = {}
+    for key in ("gene_prediction", "gene_prediction_rmse", "gene_prediction_pcc"):
+        values = [metrics[key] for metrics in per_slide.values() if np.isfinite(metrics[key])]
+        macro[key] = float(np.mean(values)) if values else float("nan")
+    return {"micro": micro, "macro": macro, "slides": per_slide}
+
+
+def summarize_metrics(slides, expression_results=None):
+    values = [metrics for metrics in slides.values() if "dice" in metrics]
+    summary = _summarize_head(values) if values else {"macro": {}, "micro": {}}
     summary["slides"] = slides
+    if expression_results:
+        summary["expression"] = summarize_expression_metrics(slides, expression_results)
     return summary
