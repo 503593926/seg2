@@ -33,6 +33,8 @@ def patient_config():
 def write_fixture(directory):
     cfg = patient_config()
     cfg.project_root = str(directory)
+    # 此合成数据不含归一化前 counts；质量过滤在模板初始化测试中单独覆盖。
+    cfg.experiment.training.image.template_init.min_counts = 0
     dataset = cfg.experiment.dataset
     dataset.all_names = ['A1', 'C1']
     dataset.expression_names = ['A1', 'A2', 'C1', 'C2']

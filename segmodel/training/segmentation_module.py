@@ -10,7 +10,7 @@ from torchmetrics.classification import BinaryF1Score, BinaryJaccardIndex
 
 from segmodel.inference.validation import load_expert_masks, validate_slide
 from segmodel.inference.metrics import summarize_expression_metrics
-from segmodel.inference.visualization import save_prediction_result
+from segmodel.inference.visualization import save_prediction_result, save_top_gene_predictions
 from segmodel.training.augment import cutmix_batch, mixup_batch
 from segmodel.training.losses import (
     image_losses,
@@ -37,6 +37,11 @@ class SegmentationModule(pl.LightningModule):
     ):
         super().__init__()
         self.model = model
+        if model.tissue_state_count:
+            template_cfg = image_cfg.get("template_init", {})
+            model.tissue_state_decoder.template_logits.requires_grad_(
+                bool(template_cfg.get("trainable", True))
+            )
         self.ema_model = deepcopy(model).requires_grad_(False)
         self.ema_model.eval()
         self._last_ema_step = 0
@@ -286,10 +291,18 @@ class SegmentationModule(pl.LightningModule):
 
     def on_validation_epoch_end(self):
         data_module = getattr(self.trainer, "datamodule")
-        if len(getattr(data_module, "expression_test_names", [])) <= 1:
-            return
         summary = summarize_expression_metrics(self._validation_metrics, self._validation_expression)
         if not summary:
+            return
+        top_n = int(self.image_cfg.get("gene_visualization_top_n", 10))
+        if self.visualization_dir is not None and top_n > 0 and self.trainer.is_global_zero:
+            save_top_gene_predictions(
+                self.visualization_dir / f"epoch_{self.current_epoch + 1:04d}" / "gene_expression",
+                self._validation_expression, list(map(str, data_module.val_gene_adata.var_names)),
+                data_module.val_slides, top_n=top_n, spot_radius_px=self.spot_radius_px,
+                expression_transform=self.expression_transform,
+            )
+        if len(getattr(data_module, "expression_test_names", [])) <= 1:
             return
         self.log_dict(
             {f"val/{key}": value for key, value in summary["micro"].items()},

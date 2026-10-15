@@ -13,8 +13,8 @@ gate_range: 0.0
 feature_gradients: true
 
 # 软标签的监督范围: 区间内视为不确定, 不参与损失
-non_cancer_threshold: 0.5
-cancer_threshold: 0.5
+non_cancer_threshold: 0.2
+cancer_threshold: 0.8
 
 # 训练回调参数，不传给 RW 求解器。HER2ST 默认开启。
 dynamic_snic:

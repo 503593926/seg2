@@ -52,17 +52,17 @@ labeled_sampling_fraction: null
 spot_diameter_um: 100.0
 
 image_feature_maps:
-  - 'feature_ho0/tile_224_mpp_1_resize_1_overlap_1_cls_overlap_1'
+#  - 'feature_ho0/tile_224_mpp_1_resize_1_overlap_1_cls_overlap_1'
   - 'feature_ho1/tile_224_mpp_1_resize_1_overlap_1_cls_overlap_1'
   - 'feature_uni2/tile_224_mpp_1_resize_1_overlap_1_cls_overlap_1'
-  - 'feature_virchow/tile_224_mpp_1_resize_1_overlap_1_cls_overlap_1'
+#  - 'feature_virchow/tile_224_mpp_1_resize_1_overlap_1_cls_overlap_1'
   - 'feature_virchow2/tile_224_mpp_1_resize_1_overlap_1_cls_overlap_1'
 
 pseudo_label_dir: 'pseudo_label_ratio@100'
 
 crop_size: 896
 inference_batch_size: 8
-samples_per_epoch: 8000
+samples_per_epoch: 4000
 min_valid_fraction: 0.25
 
 num_workers: 8

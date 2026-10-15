@@ -17,7 +17,7 @@ class TissueStateDecoder(nn.Module):
         )
         self.state_head = nn.Conv2d(hidden_dim, state_count, 1)
         self.amplitude_head = nn.Conv2d(hidden_dim, 1, 1)
-        # 全部从随机值学习；每行是一个共享模板，不对应预先指定的细胞类型。
+        # 默认随机初始化；训练入口可用 NMF/K-means 覆盖，并选择是否训练模板。
         self.template_logits = nn.Parameter(torch.empty(state_count, gene_count).normal_(std=0.5))
         # 避免所有类别倾向相同，使首次分割反向就能更新状态权重。
         self.class_logits = nn.Parameter(torch.empty(state_count).uniform_(-2, 2))

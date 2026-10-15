@@ -1,10 +1,15 @@
+import csv
 import json
 from pathlib import Path
+import re
 
 import cv2
 import numpy as np
 from skimage.morphology import thin
 from skimage.segmentation import find_boundaries
+import torch
+
+from segmodel.inference.metrics import gene_pearson_correlations
 
 
 def _write_image(path, image, parameters=()):
@@ -110,6 +115,148 @@ def save_prediction_result(
         save_prediction_result(directory / "initial", image_rgb, initial_probability, labels, valid, scale, threshold)
     if refinement_gate is not None:
         _write_image(directory / "refinement_gate.png", _uint16_probability(refinement_gate), png_parameters)
+
+
+def _expression_background(image_rgb, spots, spot_radius_px, size=512):
+    """每张切片仅缩放一次背景，坐标和 spot 圆盘使用同一缩放比例。"""
+    height, width = image_rgb.shape[:2]
+    scale = min((size - 24) / width, (size - 100) / height)
+    resized = cv2.resize(image_rgb, (max(1, round(width * scale)), max(1, round(height * scale))),
+                         interpolation=cv2.INTER_AREA)
+    resized = cv2.cvtColor((resized.astype(np.float32) * .18 + 255 * .82).astype(np.uint8), cv2.COLOR_RGB2BGR)
+    top = 44 + (size - 100 - resized.shape[0]) // 2
+    left = (size - resized.shape[1]) // 2
+    background = np.full((size, size, 3), 255, dtype=np.uint8)
+    background[top:top + resized.shape[0], left:left + resized.shape[1]] = resized
+    centers = np.rint(np.asarray(spots) * scale + np.array([left, top])).astype(np.int32)
+    return background, centers, max(1, round(spot_radius_px * scale))
+
+
+def _expression_spot_panel(background, centers, radius, values, maximum, title):
+    panel = background.copy()
+    encoded = np.rint(np.clip(values / maximum, 0, 1) * 255).astype(np.uint8)
+    if len(encoded):
+        colors = cv2.applyColorMap(encoded[:, None], cv2.COLORMAP_VIRIDIS)[:, 0]
+        for (x, y), color in zip(centers, colors):
+            cv2.circle(panel, (int(x), int(y)), radius, tuple(map(int, color)), -1, cv2.LINE_AA)
+    else:
+        cv2.putText(panel, "No observed values", (140, 260), cv2.FONT_HERSHEY_SIMPLEX,
+                    .6, (30, 30, 30), 1, cv2.LINE_AA)
+    size = panel.shape[0]
+    cv2.putText(panel, f"{title} ({len(values)} spots)", (12, 25), cv2.FONT_HERSHEY_SIMPLEX,
+                .65, (20, 20, 20), 1, cv2.LINE_AA)
+    gradient = np.tile(np.linspace(0, 255, size - 40).astype(np.uint8), (12, 1))
+    panel[size - 42:size - 30, 20:size - 20] = cv2.applyColorMap(gradient, cv2.COLORMAP_VIRIDIS)
+    for label, x in (("0", 20), (f"{maximum:.3g}", size - 80)):
+        cv2.putText(panel, label, (x, size - 10), cv2.FONT_HERSHEY_SIMPLEX,
+                    .5, (20, 20, 20), 1, cv2.LINE_AA)
+    return panel
+
+
+def save_top_gene_predictions(
+    directory, expression_results, gene_names, slides, *, top_n=10,
+    spot_radius_px=50.0, expression_transform="log1p", source_model="ema",
+):
+    """复用验证 spot 结果，保存共享色标及分别 min-max 归一化的空间对照。"""
+    if top_n <= 0:
+        return {}
+    records = {}
+    for name, source in expression_results.items():
+        if not len(source["prediction"]):
+            continue
+        target = torch.as_tensor(source["target"]).detach().float().cpu()
+        records[name] = {
+            "prediction": torch.as_tensor(source["prediction"]).detach().float().cpu(),
+            "target": target,
+            "observed": torch.as_tensor(source.get("observed", torch.ones_like(target, dtype=torch.bool))).bool().cpu(),
+            "spots": np.asarray(source["spots"]),
+        }
+    if not records:
+        return {}
+    prediction = torch.cat([record["prediction"] for record in records.values()])
+    target = torch.cat([record["target"] for record in records.values()])
+    observed = torch.cat([record["observed"] for record in records.values()])
+    correlations = gene_pearson_correlations(prediction, target, observed).numpy()
+    eligible = np.flatnonzero(np.isfinite(correlations))
+    indices = eligible[np.argsort(-correlations[eligible], kind="stable")[:top_n]]
+    selected = []
+    for rank, index in enumerate(indices, 1):
+        mask = observed[:, index]
+        normalization = {
+            key: {"min": float(values[mask, index].min()), "max": float(values[mask, index].max())}
+            for key, values in (("observed", target), ("predicted", prediction))
+        }
+        maximum = max(bounds["max"] for bounds in normalization.values())
+        selected.append({
+            "rank": rank, "gene": str(gene_names[index]), "gene_index": int(index),
+            "pcc": float(correlations[index]), "observed_spots": int(mask.sum()),
+            "vmin": 0.0, "vmax": max(maximum, 1e-8), "normalization": normalization, "slides": {},
+        })
+
+    directory = Path(directory)
+    directory.mkdir(parents=True, exist_ok=True)
+    for name, record in records.items():
+        if not selected:
+            break
+        slide_dir = directory / name
+        slide_dir.mkdir(exist_ok=True)
+        background, centers, radius = _expression_background(slides[name].image, record["spots"], spot_radius_px)
+        local_pcc = gene_pearson_correlations(record["prediction"][:, indices], record["target"][:, indices],
+                                               record["observed"][:, indices]).numpy()
+        overviews = {"": [], "_normalized": []}
+        for position, gene in enumerate(selected):
+            index = gene["gene_index"]
+            mask = record["observed"][:, index].numpy()
+            values = [record[key][:, index].numpy()[mask] for key in ("target", "prediction")]
+            bounds = [gene["normalization"][key] for key in ("observed", "predicted")]
+            # 使用所有留出切片的范围；绘图创建新数组，原始表达和指标保持不变。
+            normalized_values = [
+                (value - limits["min"]) / (limits["max"] - limits["min"])
+                if limits["max"] > limits["min"] else np.zeros_like(value)
+                for value, limits in zip(values, bounds)
+            ]
+            pcc = float(local_pcc[position]) if np.isfinite(local_pcc[position]) else None
+            local_text = f"{pcc:.3f}" if pcc is not None else "n/a"
+            title = f"{gene['rank']:02d}. {gene['gene']} | {name} | pooled PCC {gene['pcc']:.3f} | slide PCC {local_text}"
+            safe_name = re.sub(r"[^A-Za-z0-9_.-]+", "_", gene["gene"]).strip("._") or "gene"
+            stem = f"{gene['rank']:02d}_{safe_name}"
+            for suffix, display_values, display_maximum, caption in (
+                ("", values, gene["vmax"], "shared color scale across slides"),
+                ("_normalized", normalized_values, 1.0, "independent min-max | pooled across slides"),
+            ):
+                panels = [
+                    _expression_spot_panel(background, centers[mask], radius, value, display_maximum,
+                                           f"{label} normalized" if suffix else label)
+                    for value, label in zip(display_values, ("Observed", "Predicted"))
+                ]
+                pair = np.vstack((np.full((64, 1024, 3), 255, dtype=np.uint8), np.hstack(panels)))
+                cv2.putText(pair, title, (12, 24), cv2.FONT_HERSHEY_SIMPLEX, .6, (20, 20, 20), 1, cv2.LINE_AA)
+                cv2.putText(pair, f"Source: {source_model} | {expression_transform} expression | {caption}",
+                            (12, 49), cv2.FONT_HERSHEY_SIMPLEX, .5, (50, 50, 50), 1, cv2.LINE_AA)
+                _write_image(slide_dir / f"{stem}{suffix}.png", pair, (cv2.IMWRITE_PNG_COMPRESSION, 3))
+                overviews[suffix].append(pair)
+            gene["slides"][name] = {
+                "pcc": pcc, "observed_spots": int(mask.sum()), "file": f"{name}/{stem}.png",
+                "normalized_file": f"{name}/{stem}_normalized.png",
+            }
+        for suffix, overview in overviews.items():
+            _write_image(slide_dir / f"overview{suffix}.jpg", np.vstack(overview), (cv2.IMWRITE_JPEG_QUALITY, 90))
+
+    columns = ("rank", "gene", "gene_index", "pcc", "observed_spots", "vmin", "vmax")
+    with (directory / "top_genes.csv").open("w", newline="", encoding="utf-8") as handle:
+        writer = csv.DictWriter(handle, fieldnames=columns)
+        writer.writeheader()
+        writer.writerows({key: gene[key] for key in columns} for gene in selected)
+    metadata = {
+        "source_model": source_model, "ranking_scope": "pooled_validation_spots",
+        "expression_transform": expression_transform, "requested_top_n": int(top_n),
+        "eligible_genes": len(eligible), "selected_genes": selected,
+        "color_scale": "zero to joint observed/predicted maximum per gene, shared across slides; no clipping",
+        "normalized_color_scale": "independent min-max for observed and predicted per gene, pooled across slides; displayed range [0, 1]",
+    }
+    (directory / "metadata.json").write_text(json.dumps(metadata, ensure_ascii=False, indent=2, allow_nan=False) + "\n",
+                                              encoding="utf-8")
+    return metadata
 
 
 def _superpixel_overlay(image_bgr, superpixels, label_mpp):

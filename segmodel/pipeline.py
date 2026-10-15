@@ -21,6 +21,7 @@ from segmodel.modules.propagation import DifferentiablePropagation
 from segmodel.training.callbacks import DatasetEpochCallback, MetricsBelowRichProgressBar
 from segmodel.training.dynamic_snic import DynamicSNICCallback
 from segmodel.training.segmentation_module import SegmentationModule
+from segmodel.training.template_initialization import initialize_expression_templates
 from segmodel.dataset.splits import patient_id
 
 
@@ -97,6 +98,13 @@ def _train_segmentation(cfg, data_module, tiling, output_dir):
     )
     if model.gene_count:
         model.gene_names = list(map(str, data_module.train_gene_adata.var_names))
+    template_cfg = train_cfg.get("template_init", {})
+    if str(template_cfg.get("method", "random")).lower() != "random":
+        initialize_expression_templates(
+            model, data_module.train_gene_adata, data_module.train_names, template_cfg,
+            expression_transform=str(train_cfg.expression_transform),
+            project_root=Path(str(cfg.project_root)), output_dir=output_dir,
+        )
     propagation = None
     if bool(cfg.experiment.propagation.enabled):
         propagation_cfg = cast(

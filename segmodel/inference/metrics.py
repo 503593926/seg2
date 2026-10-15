@@ -116,6 +116,24 @@ def _summarize_head(metrics_list):
     }
 
 
+def gene_pearson_correlations(prediction, target, observed=None):
+    """逐基因跨 spot 的 PCC；观测不足、常量预测或常量真值返回 NaN。"""
+    prediction, target = prediction.float(), target.float()
+    observed = torch.ones_like(target, dtype=torch.bool) if observed is None else observed.bool()
+    counts = observed.sum(0).clamp_min(1)
+    centered_prediction = torch.where(observed, prediction - (prediction * observed).sum(0) / counts, 0.)
+    centered_target = torch.where(observed, target - (target * observed).sum(0) / counts, 0.)
+    p_std = (centered_prediction.square().sum(0) / counts).sqrt()
+    t_std = (centered_target.square().sum(0) / counts).sqrt()
+    usable = (counts >= 2) & (p_std > 1e-6) & (t_std > 1e-6)
+    pcc = prediction.new_full((prediction.shape[1],), float("nan"))
+    pcc[usable] = (
+        ((centered_prediction[:, usable] * centered_target[:, usable]).sum(0) / counts[usable]
+         / (p_std[usable] * t_std[usable])).clamp(-1, 1)
+    )
+    return pcc
+
+
 def expression_metrics(prediction, target, observed=None):
     """同一基因跨spot的PCC统计均值和极值; 常量预测/目标不计入PCC。"""
     prediction, target = prediction.float(), target.float()
@@ -129,17 +147,9 @@ def expression_metrics(prediction, target, observed=None):
                 "gene_prediction_pcc_min": float("nan")}
     mse = float((prediction - target)[observed].square().mean())
     metrics.update(gene_prediction=mse, gene_prediction_rmse=math.sqrt(mse))
-    counts = observed.sum(0).clamp_min(1)
-    centered_prediction = torch.where(observed, prediction - (prediction * observed).sum(0) / counts, 0.)
-    centered_target = torch.where(observed, target - (target * observed).sum(0) / counts, 0.)
-    p_std = (centered_prediction.square().sum(0) / counts).sqrt()
-    t_std = (centered_target.square().sum(0) / counts).sqrt()
-    usable = (counts >= 2) & (p_std > 1e-6) & (t_std > 1e-6)
-    metrics["gene_pcc_genes"] = int(usable.sum())
-    pcc = (
-        ((centered_prediction[:, usable] * centered_target[:, usable]).sum(0) / counts[usable]
-         / (p_std[usable] * t_std[usable])).clamp(-1, 1)
-    )
+    correlations = gene_pearson_correlations(prediction, target, observed)
+    pcc = correlations[torch.isfinite(correlations)]
+    metrics["gene_pcc_genes"] = pcc.numel()
     metrics["gene_prediction_pcc"] = float(pcc.mean()) if pcc.numel() else float("nan")
     metrics["gene_prediction_pcc_max"] = float(pcc.max()) if pcc.numel() else float("nan")
     metrics["gene_prediction_pcc_min"] = float(pcc.min()) if pcc.numel() else float("nan")

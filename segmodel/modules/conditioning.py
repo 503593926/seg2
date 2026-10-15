@@ -13,15 +13,15 @@ class PFMDecomposer(nn.Module):
         project = partial(nn.Conv2d, kernel_size=1) if spatial else nn.Linear
 
         self.projects = nn.ModuleList(
-            project(int(input_dim), feature_dim * 2) for input_dim in input_dims
+            project(int(input_dim), feature_dim) for input_dim in input_dims
         )
-        self.shared_task_proj = project(feature_dim * 2, feature_dim)
-        self.shared_identity_proj = project(feature_dim * 2, feature_dim)
+        self.shared_task_proj = project(feature_dim, feature_dim)
+        self.shared_identity_proj = project(feature_dim, feature_dim)
 
     def forward(self, values):
         task_f, identity_f = [], []
         for project, value in zip(self.projects, values):
-            value = F.normalize(value.float(), p=2, dim=1, eps=1e-6)
+            # value = F.normalize(value.float(), p=2, dim=1, eps=1e-6)
             projected = project(value)
             task_f.append(self.shared_task_proj(projected))
             identity_f.append(self.shared_identity_proj(projected))

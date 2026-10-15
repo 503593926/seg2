@@ -4,7 +4,7 @@ defaults:
 
 image:
   loss_weights:
-    propagation: 1.0  # 唯一分割输出；沿用原先关闭修正时 1.0 + 0.5 的总权重
+    propagation: 0.0  # 唯一分割输出；沿用原先关闭修正时 1.0 + 0.5 的总权重
     propagation_initial: 0.0  # 共享状态结构没有 P0/分割修正
     gene_prediction: 1.0
     gene_correlation: 0.5
