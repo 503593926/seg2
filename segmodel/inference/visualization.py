@@ -142,8 +142,12 @@ def _expression_spot_panel(background, centers, radius, values, maximum, title):
     else:
         cv2.putText(panel, "No observed values", (140, 260), cv2.FONT_HERSHEY_SIMPLEX,
                     .6, (30, 30, 30), 1, cv2.LINE_AA)
+    return _expression_colorbar(panel, maximum, f"{title} ({len(values)} spots)")
+
+
+def _expression_colorbar(panel, maximum, title):
     size = panel.shape[0]
-    cv2.putText(panel, f"{title} ({len(values)} spots)", (12, 25), cv2.FONT_HERSHEY_SIMPLEX,
+    cv2.putText(panel, title, (12, 25), cv2.FONT_HERSHEY_SIMPLEX,
                 .65, (20, 20, 20), 1, cv2.LINE_AA)
     gradient = np.tile(np.linspace(0, 255, size - 40).astype(np.uint8), (12, 1))
     panel[size - 42:size - 30, 20:size - 20] = cv2.applyColorMap(gradient, cv2.COLORMAP_VIRIDIS)
@@ -153,11 +157,23 @@ def _expression_spot_panel(background, centers, radius, values, maximum, title):
     return panel
 
 
+def _expression_dense_panel(heatmap, maximum, title, size=512):
+    height, width = heatmap.shape[:2]
+    scale = min((size - 24) / width, (size - 100) / height)
+    resized = cv2.resize(heatmap, (max(1, round(width * scale)), max(1, round(height * scale))),
+                         interpolation=cv2.INTER_NEAREST)
+    top = 44 + (size - 100 - resized.shape[0]) // 2
+    left = (size - resized.shape[1]) // 2
+    panel = np.full((size, size, 3), 255, dtype=np.uint8)
+    panel[top:top + resized.shape[0], left:left + resized.shape[1]] = resized
+    return _expression_colorbar(panel, maximum, title)
+
+
 def save_top_gene_predictions(
     directory, expression_results, gene_names, slides, *, top_n=10,
     spot_radius_px=50.0, expression_transform="log1p", source_model="ema",
 ):
-    """复用验证 spot 结果，保存共享色标及分别 min-max 归一化的空间对照。"""
+    """复用验证结果，保存 spot 对照及原生预测网格的表达热力图。"""
     if top_n <= 0:
         return {}
     records = {}
@@ -179,8 +195,23 @@ def save_top_gene_predictions(
     correlations = gene_pearson_correlations(prediction, target, observed).numpy()
     eligible = np.flatnonzero(np.isfinite(correlations))
     indices = eligible[np.argsort(-correlations[eligible], kind="stable")[:top_n]]
+    for name, record in records.items():
+        source = expression_results[name]
+        dense = source.get("dense_expression")
+        if dense is None or not len(indices):
+            continue
+        if "coefficients" in dense:
+            values = np.asarray(dense["coefficients"]) @ np.asarray(dense["templates"])[:, indices]
+        else:
+            values = np.asarray(dense["prediction"])[..., indices].copy()
+        if expression_transform == "log1p":
+            np.log1p(values, out=values)
+        tissue = np.asarray(source["dense_tissue"], dtype=bool)
+        if values.shape[:2] != tissue.shape:
+            raise ValueError(f"{name}: dense expression and tissue grid must match")
+        record.update(dense_prediction=values, dense_tissue=tissue, dense_mpp=float(source["dense_mpp"]))
     selected = []
-    for rank, index in enumerate(indices, 1):
+    for position, index in enumerate(indices):
         mask = observed[:, index]
         normalization = {
             key: {"min": float(values[mask, index].min()), "max": float(values[mask, index].max())}
@@ -188,10 +219,16 @@ def save_top_gene_predictions(
         }
         maximum = max(bounds["max"] for bounds in normalization.values())
         selected.append({
-            "rank": rank, "gene": str(gene_names[index]), "gene_index": int(index),
+            "rank": position + 1, "gene": str(gene_names[index]), "gene_index": int(index),
             "pcc": float(correlations[index]), "observed_spots": int(mask.sum()),
             "vmin": 0.0, "vmax": max(maximum, 1e-8), "normalization": normalization, "slides": {},
         })
+        dense_values = [record["dense_prediction"][..., position][record["dense_tissue"]]
+                        for record in records.values() if "dense_prediction" in record and record["dense_tissue"].any()]
+        if dense_values:
+            minimum, maximum = min(float(value.min()) for value in dense_values), max(float(value.max()) for value in dense_values)
+            selected[-1].update(dense_normalization={"min": minimum, "max": maximum},
+                                dense_vmax=max(selected[-1]["vmax"], maximum))
 
     directory = Path(directory)
     directory.mkdir(parents=True, exist_ok=True)
@@ -204,6 +241,7 @@ def save_top_gene_predictions(
         local_pcc = gene_pearson_correlations(record["prediction"][:, indices], record["target"][:, indices],
                                                record["observed"][:, indices]).numpy()
         overviews = {"": [], "_normalized": []}
+        dense_overviews = {"": [], "_normalized": []}
         for position, gene in enumerate(selected):
             index = gene["gene_index"]
             mask = record["observed"][:, index].numpy()
@@ -239,8 +277,41 @@ def save_top_gene_predictions(
                 "pcc": pcc, "observed_spots": int(mask.sum()), "file": f"{name}/{stem}.png",
                 "normalized_file": f"{name}/{stem}_normalized.png",
             }
+            if "dense_prediction" in record:
+                dense_values = record["dense_prediction"][..., position]
+                limits = gene.get("dense_normalization", {"min": 0.0, "max": 0.0})
+                span = limits["max"] - limits["min"]
+                normalized_dense = (dense_values - limits["min"]) / span if span > 0 else np.zeros_like(dense_values)
+                dense_files = {}
+                for suffix, display_dense, display_spots, maximum, caption in (
+                    ("", dense_values, values, gene.get("dense_vmax", gene["vmax"]), "shared spot/dense color scale across slides"),
+                    ("_normalized", normalized_dense, normalized_values, 1.0, "independent min-max for observed/spot/dense predictions"),
+                ):
+                    encoded = np.rint(np.clip(display_dense / maximum, 0, 1) * 255).astype(np.uint8)
+                    heatmap = cv2.applyColorMap(encoded, cv2.COLORMAP_VIRIDIS)
+                    heatmap[~record["dense_tissue"]] = 255
+                    _write_image(slide_dir / f"{stem}_dense{suffix}.png", heatmap, (cv2.IMWRITE_PNG_COMPRESSION, 3))
+                    dense_title = f"Predicted {record['dense_mpp']:g}mpp" + (" normalized" if suffix else "")
+                    panels = [
+                        _expression_spot_panel(background, centers[mask], radius, value, maximum,
+                                               f"{label} normalized" if suffix else label)
+                        for value, label in zip(display_spots, ("Observed", "Predicted"))
+                    ]
+                    panels.append(_expression_dense_panel(heatmap, maximum, dense_title))
+                    comparison = np.vstack((np.full((64, 1536, 3), 255, dtype=np.uint8), np.hstack(panels)))
+                    cv2.putText(comparison, title, (12, 24), cv2.FONT_HERSHEY_SIMPLEX, .6, (20, 20, 20), 1, cv2.LINE_AA)
+                    cv2.putText(comparison, f"Source: {source_model} | {expression_transform} | PCC from spots | {caption}",
+                                (12, 49), cv2.FONT_HERSHEY_SIMPLEX, .5, (50, 50, 50), 1, cv2.LINE_AA)
+                    _write_image(slide_dir / f"{stem}_dense_comparison{suffix}.png", comparison, (cv2.IMWRITE_PNG_COMPRESSION, 3))
+                    dense_overviews[suffix].append(comparison)
+                    dense_files[f"dense{suffix}_file"] = f"{name}/{stem}_dense{suffix}.png"
+                    dense_files[f"dense_comparison{suffix}_file"] = f"{name}/{stem}_dense_comparison{suffix}.png"
+                gene["slides"][name].update(dense_files, dense_mpp=record["dense_mpp"], dense_shape=list(dense_values.shape))
         for suffix, overview in overviews.items():
             _write_image(slide_dir / f"overview{suffix}.jpg", np.vstack(overview), (cv2.IMWRITE_JPEG_QUALITY, 90))
+        for suffix, overview in dense_overviews.items():
+            if overview:
+                _write_image(slide_dir / f"overview_dense{suffix}.jpg", np.vstack(overview), (cv2.IMWRITE_JPEG_QUALITY, 90))
 
     columns = ("rank", "gene", "gene_index", "pcc", "observed_spots", "vmin", "vmax")
     with (directory / "top_genes.csv").open("w", newline="", encoding="utf-8") as handle:
@@ -253,6 +324,8 @@ def save_top_gene_predictions(
         "eligible_genes": len(eligible), "selected_genes": selected,
         "color_scale": "zero to joint observed/predicted maximum per gene, shared across slides; no clipping",
         "normalized_color_scale": "independent min-max for observed and predicted per gene, pooled across slides; displayed range [0, 1]",
+        "dense_color_scale": "zero to joint observed/spot-predicted/dense-predicted maximum per gene, shared across slides; tissue pixels only",
+        "dense_normalized_color_scale": "independent dense min-max per gene over tissue pixels across slides; displayed range [0, 1]",
     }
     (directory / "metadata.json").write_text(json.dumps(metadata, ensure_ascii=False, indent=2, allow_nan=False) + "\n",
                                               encoding="utf-8")

@@ -58,8 +58,10 @@ def validate_slide(
     evaluate_segmentation=True,
     expression_results=None,
     segmentation_results=None,
+    save_dense_expression=False,
 ):
     auxiliary = {} if getattr(model, "joint_prediction", False) and evaluate_segmentation else None
+    factors = {} if save_dense_expression and gene_adata is not None and expression_results is not None else None
     probability, expression = predict_slide(
         model,
         slide,
@@ -71,6 +73,7 @@ def validate_slide(
         return_features=gene_adata is not None,
         feature_key="gene_expression" if gene_adata is not None else "propagation_features",
         auxiliary_outputs=auxiliary,
+        **({"expression_factors": factors} if factors is not None else {}),
     )
     metrics = {}
     if evaluate_segmentation:
@@ -107,5 +110,9 @@ def validate_slide(
             valid = spot_results.pop("valid").numpy()
             spot_results["spot_ids"] = gene_adata.obs.index[selected].to_numpy(dtype=str)[valid]
             spot_results["spots"] = spots.numpy()[valid]
+            if factors is not None:
+                spot_results["dense_expression"] = factors or {"prediction": expression}
+                spot_results["dense_tissue"] = tissue.numpy()
+                spot_results["dense_mpp"] = float(mpp) * slide.label_scale
             expression_results[slide.name] = spot_results
     return probability, metrics

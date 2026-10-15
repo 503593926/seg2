@@ -82,14 +82,14 @@ class TemplateInitializationTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as root:
             for method in ('nmf', 'kmeans', 'mix'):
                 with self.subTest(method=method):
-                    model = model_for(adata, count=4 if method == 'mix' else 2)
+                    model = model_for(adata, count=6 if method == 'mix' else 2)
                     record = initialize(model, adata, root, method, min_counts=100)
                     self.assertEqual(record['input_spots'], 18)
                     self.assertEqual(record['excluded_low_count_spots'], 1)
                     self.assertEqual(record['excluded_zero_expression_spots'], 1)
                     self.assertEqual(record['fit_spots'], 16)  # counts 恰为 100 的 s0 被保留。
                     templates = model.tissue_state_decoder.template_logits.softmax(dim=1).detach().numpy()
-                    for block in (templates[:2], templates[2:]) if method == 'mix' else (templates,):
+                    for block in (templates[2:4], templates[4:]) if method == 'mix' else (templates,):
                         order = np.argsort(block[:, 0])[::-1]
                         np.testing.assert_allclose(block[order], .99 * expected + .01 / 4, atol=2e-3)
                     saved = json.loads((Path(root) / 'fold/template_initialization.json').read_text())
@@ -127,7 +127,7 @@ class TemplateInitializationTest(unittest.TestCase):
                     initialize(model_for(adata), adata, root, 'nmf', min_counts=threshold)
             adata.obs['normalization_total_counts'] = 1.
             with self.assertRaisesRegex(ValueError, 'No nonzero.*min_counts=100'):
-                initialize(model_for(adata), adata, root, 'mix', min_counts=100)
+                initialize(model_for(adata, count=3), adata, root, 'mix', min_counts=100)
             for value in (-1, float('nan'), float('inf')):
                 adata.obs.loc['s0', 'normalization_total_counts'] = value
                 with self.subTest(counts=value), self.assertRaisesRegex(ValueError, 'finite and nonnegative'):
@@ -164,33 +164,62 @@ class TemplateInitializationTest(unittest.TestCase):
             self.assertLess(record['reconstruction_error'], .05)
             self.assertEqual(record['fit_spots'], 18)
 
-    def test_mix_combines_nmf_programs_and_kmeans_means_for_even_and_odd_counts(self):
+    def test_mix_balances_random_nmf_and_kmeans_including_remainders(self):
         adata, expected = expression_case()
         with tempfile.TemporaryDirectory() as root:
-            for count in (4, 3):
+            for count, counts in ((3, (1, 1, 1)), (5, (2, 2, 1)),
+                                  (6, (2, 2, 2)), (7, (3, 2, 2))):
                 with self.subTest(state_count=count):
                     model = model_for(adata, count=count)
                     record = initialize(model, adata, root, 'mix')
                     templates = model.tissue_state_decoder.template_logits.softmax(dim=1).detach().numpy()
                     self.assertEqual(templates.shape, (count, adata.n_vars))
-                    self.assertEqual(record['nmf_state_count'], 2)
-                    self.assertEqual(record['kmeans_state_count'], count - 2)
-                    self.assertLess(record['nmf']['reconstruction_error'], .05)
+                    self.assertEqual(record['version'], 3)
+                    self.assertEqual(tuple(record[f'{part}_state_count'] for part in ('random', 'nmf', 'kmeans')), counts)
+                    random_count, nmf_count, kmeans_count = counts
+                    nmf = templates[random_count:random_count + nmf_count]
+                    kmeans = templates[random_count + nmf_count:]
+                    self.assertGreater(float(templates[:random_count].std()), 0)
                     self.assertGreater(record['kmeans']['iterations'], 0)
-                    nmf_order = np.argsort(templates[:2, 0])[::-1]
-                    np.testing.assert_allclose(templates[:2][nmf_order], .99 * expected + .01 / 4, atol=2e-3)
-                    if count == 4:
-                        kmeans_order = np.argsort(templates[2:, 0])[::-1]
-                        np.testing.assert_allclose(templates[2:][kmeans_order], .99 * expected + .01 / 4, atol=1e-6)
+                    if nmf_count == 2:
+                        self.assertLess(record['nmf']['reconstruction_error'], .05)
+                        nmf_order = np.argsort(nmf[:, 0])[::-1]
+                        np.testing.assert_allclose(nmf[nmf_order], .99 * expected + .01 / 4, atol=2e-3)
+                    if kmeans_count == 2:
+                        kmeans_order = np.argsort(kmeans[:, 0])[::-1]
+                        np.testing.assert_allclose(kmeans[kmeans_order], .99 * expected + .01 / 4, atol=1e-6)
                     else:
-                        np.testing.assert_allclose(templates[2], .99 * expected.mean(axis=0) + .01 / 4, atol=1e-6)
+                        np.testing.assert_allclose(kmeans[0], .99 * expected.mean(axis=0) + .01 / 4, atol=1e-6)
                     np.testing.assert_allclose(templates.sum(axis=1), 1, atol=1e-6)
                     self.assertTrue(np.all(templates > 0))
+
+    def test_mix_random_templates_use_initialization_seed_and_preserve_global_rng(self):
+        adata, _ = expression_case()
+        with tempfile.TemporaryDirectory() as root:
+            results = []
+            for model_seed in (17, 93):
+                with torch.random.fork_rng(devices=[]):
+                    torch.manual_seed(model_seed)
+                    model = model_for(adata, count=6)
+                torch_before = torch.random.get_rng_state().clone()
+                numpy_before = np.random.get_state()
+                record = initialize(model, adata, Path(root) / str(model_seed), 'mix')
+                self.assertFalse(record['cache_hit'])  # 两次独立拟合，不依赖缓存确保相同。
+                results.append(model.tissue_state_decoder.template_logits.detach().clone())
+                torch.testing.assert_close(torch.random.get_rng_state(), torch_before, rtol=0, atol=0)
+                numpy_after = np.random.get_state()
+                np.testing.assert_array_equal(numpy_before[1], numpy_after[1])
+                self.assertEqual(numpy_before[2:], numpy_after[2:])
+            torch.testing.assert_close(results[0], results[1], rtol=0, atol=0)
+            changed = initialize(model, adata, Path(root) / 'changed_seed', 'mix', seed=1)
+            self.assertFalse(changed['cache_hit'])
+            self.assertNotEqual(record['cache_key'], changed['cache_key'])
+            self.assertFalse(torch.equal(results[1][:2], model.tissue_state_decoder.template_logits[:2]))
 
     def test_mix_cache_tracks_kmeans_restarts_and_ignores_heldout_expression(self):
         adata, _ = expression_case()
         with tempfile.TemporaryDirectory() as root:
-            model = model_for(adata, count=4)
+            model = model_for(adata, count=6)
             first = initialize(model, adata, root, 'mix')
             initial = model.tissue_state_decoder.template_logits.detach().clone()
             adata.X[-2:] = 100
@@ -254,6 +283,8 @@ class TemplateInitializationTest(unittest.TestCase):
                     initialize(model_for(adata), adata, root, method, **options)
             with self.assertRaisesRegex(ValueError, 'requires tissue_state_count'):
                 initialize(SimpleNamespace(tissue_state_count=0), adata, root, 'nmf')
+            with self.assertRaisesRegex(ValueError, 'requires tissue_state_count >= 3'):
+                initialize(model_for(adata, count=2), adata, root, 'mix')
             with self.assertRaisesRegex(ValueError, 'must not exceed'):
                 initialize(model_for(adata, count=5), adata, root, 'nmf')
             invalid = adata.copy()
@@ -283,6 +314,7 @@ class TemplateInitializationTest(unittest.TestCase):
             cache_keys = {}
             for method, trainable in product(('random', 'nmf', 'kmeans', 'mix'), (True, False)):
                 with self.subTest(method=method, trainable=trainable):
+                    cfg.experiment.model.image.tissue_state_count = 6 if method == 'mix' else 2
                     cfg.experiment.training.image.template_init.method = method
                     cfg.experiment.training.image.template_init.trainable = trainable
                     output_dir = Path(root) / f'{method}_{trainable}'

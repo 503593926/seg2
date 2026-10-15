@@ -45,6 +45,7 @@ def predict_slide(
     return_features=True,
     feature_key="propagation_features",
     auxiliary_outputs=None,
+    expression_factors=None,
 ):
     """重叠滑窗推理：分割头与 feature_key 指定的特征在 7mpp 网格加权拼接，
     概率最后上采样回 1mpp。返回 (probability, features)。"""
@@ -66,6 +67,8 @@ def predict_slide(
     grid_scale = None
     feature_sum = None
     feature_weight = None
+    coefficient_sum = None
+    templates = None
     auxiliary_sums = {}
     rows = tile_origins(height, crop_size, stride, alignment)
     columns = tile_origins(width, crop_size, stride, alignment)
@@ -99,6 +102,14 @@ def predict_slide(
                     .numpy()
                     .transpose(0, 2, 3, 1)
                 )
+            coefficient_batch = None
+            if expression_factors is not None and "tissue_states" in output:
+                coefficient_batch = (
+                    (output["tissue_states"].float() * output["expression_amplitude"].float())
+                    .cpu().numpy().transpose(0, 2, 3, 1)
+                )
+                if templates is None:
+                    templates = model.tissue_state_decoder.template_logits.float().softmax(dim=1).cpu().numpy()
 
             if probability_weight is None:
                 tile = probability_grid.shape[-1]
@@ -114,6 +125,8 @@ def predict_slide(
                     (tile, tile),
                     interpolation=cv2.INTER_AREA,
                 )
+                if coefficient_batch is not None:
+                    coefficient_sum = np.zeros((*grid_shape, coefficient_batch.shape[-1]), dtype=np.float32)
                 if return_features:
                     assert feature_batch is not None
                     feature_sum = np.zeros(
@@ -140,6 +153,10 @@ def predict_slide(
                     auxiliary_sums[key][rows_slice, columns_slice] += (
                         values[index, :valid_height, :valid_width] * weight_window
                     )
+                if coefficient_batch is not None:
+                    coefficient_sum[rows_slice, columns_slice] += (
+                        coefficient_batch[index, :valid_height, :valid_width] * weight_window[..., None]
+                    )
 
                 if return_features:
                     assert feature_batch is not None and feature_sum is not None and feature_weight is not None
@@ -159,6 +176,10 @@ def predict_slide(
         feature_sum /= np.maximum(feature_weight[..., None], 1e-6)
         features = feature_sum
     assert probability_sum is not None and probability_weight is not None
+    if coefficient_sum is not None:
+        # 仅缓存 K 通道系数；确定最高 PCC 基因后再解码所需通道。
+        coefficient_sum /= np.maximum(probability_weight[..., None], 1e-6)
+        expression_factors.update(coefficients=coefficient_sum, templates=templates)
     probability = cv2.resize(
         probability_sum / np.maximum(probability_weight, 1e-6),
         (width, height),

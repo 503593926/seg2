@@ -1,6 +1,6 @@
 # segmodel
 
-当前唯一实验入口为 `her2st`：保持 MoMu 条件 U-Net，在其输出特征上预测共享软组织状态，再解码分割与基因表达，使用患者隔离和混合监督训练。表达模板支持随机、NMF、K-means 及 NMF/K-means 各半的混合初始化，并可选择继续训练或固定；状态预测与类别倾向仍随机初始化并参与训练。
+当前唯一实验入口为 `her2st`：保持 MoMu 条件 U-Net，在其输出特征上预测共享软组织状态，再解码分割与基因表达，使用患者隔离和混合监督训练。表达模板支持随机、NMF、K-means 及三种方式均分的混合初始化，并可选择继续训练或固定；状态预测与类别倾向仍随机初始化并参与训练。
 
 ## 网络与监督
 
@@ -101,7 +101,7 @@ pin_memory: false
 
 ```yaml
 template_init:
-  method: nmf  # kmeans：聚类均值；mix：一半 NMF、一半 K-means；random：随机初始化
+  method: mix  # 三种方式均分；也支持单独使用 random、nmf、kmeans
   trainable: true  # false：初始化后固定表达模板
   min_counts: 100  # 仅模板拟合过滤低计数 spot；0 关闭
   seed: 0
@@ -115,7 +115,7 @@ template_init:
 
 `template_init.min_counts` 默认 100，NMF、K-means 和 mix 拟合时仅使用 `obs['normalization_total_counts'] >= min_counts` 的训练 spot，阈值相等时保留，0 表示关闭此过滤。该字段记录归一化前、训练公共基因范围内的总 counts，不能从 CP10k/log1p 表达反推。启用过滤时若缺少该字段或训练计数非有限/为负，会明确报错。先过滤低 counts，再排除所选基因表达全零的 spot；若最终没有有效表达则停止并报告阈值。日志及初始化 JSON 记录输入数、低计数排除数、全零排除数和最终拟合数，阈值与过滤后表达内容进入缓存键，新配置自动使用新缓存。过滤仅作用于拟合输入，不修改 h5ad、训练/验证 spot、类别种子、采样或表达损失；random 初始化不读取计数或执行此过滤。
 
-`mix` 将状态数 K 分成 `ceil(K/2)` 个 NMF 成分和 `floor(K/2)` 个 K-means 中心；例如 K=32 时为 16+16，K=33 时为 17+16。两种算法都在同一份经过上述过滤的训练表达上拟合，分别生成所需数量的模板，再按 NMF 在前、K-means 在后的顺序合并，逐行归一化并应用相同 smoothing。`max_iter` 分别限制两种算法的迭代次数，`kmeans_n_init` 控制其中的 K-means 拟合。混合模式使用独立缓存，记录两种模板的数量和各自的拟合诊断。
+`mix` 要求 K >= 3，将模板数量尽量均分给 random、NMF、K-means；不能整除时余数依次分配给 random、NMF。模板按随机、NMF、K-means 的顺序合并。例如 K=32 时为 11+11+10，K=63 时为 21+21+21，K=64 时为 22+21+21。随机部分使用 `template_init.seed` 的独立随机数生成器，按与解码器默认初始化相同的 `Normal(0, 0.5)` logit 分布生成；NMF/K-means 在同一份经过上述过滤的训练表达上拟合。三部分均逐行归一化并应用相同 smoothing，因此同一 fold/参数可以跨模型训练 seed 复用完整混合模板。`max_iter` 分别限制两种拟合算法的迭代次数，`kmeans_n_init` 控制其中的 K-means 拟合。初始化 JSON 记录三种模板数量和各自的生成/拟合诊断；新 mix 缓存版本自动与旧的 NMF/K-means 各半缓存区分，单独 nmf/kmeans 的已有缓存仍可复用。
 
 `template_init.trainable` 默认 `true`，模板随训练更新；设为 `false` 时，在创建 EMA 和优化器前冻结 `tissue_state_decoder.template_logits`，并将其排除在优化器参数组之外。四种初始化方式均支持该开关。固定模板时，表达损失仍通过模板更新状态/幅度头和骨干，类别倾向仍可训练；EMA 的模板也保持固定。该开关不改变拟合结果和缓存键，因此切换可训练性可以复用已有模板缓存；最终模型继续保存模板权重。
 
@@ -214,6 +214,8 @@ HER2ST 的 36 张表达切片按患者划分；8 张有分割标注的切片决�
 - `gene_prediction_pcc_max/min`：上述有效基因 PCC 的最大/最小值。
 - 患者表达主指标合并该患者全部切片的有效 spot；同时保存各切片结果和宏平均。
 
+进度条额外显示 `val/gene_prediction_pcc_macro`：先计算每张留出切片的逐基因平均 PCC，再对可计算的切片等权平均；每轮验证结束后更新，单切片时等于该切片的 PCC。它沿用验证指标定义，不是当前训练 batch 的相关性损失。
+
 常数预测、常数真值及观测不足的基因不参与 PCC；缺失基因值不当作真实零表达。
 
 训练日志分别记录未加权的 `train/gene_prediction`（MSE）和 `train/gene_correlation`（平均 1-PCC），后者越低越好；没有可计算的相关性项时为 0。总损失 `train/loss` 使用配置权重。另记录 `train/gene_spots`、启用的分割损失、RW 的 PCG/覆盖率诊断。共享状态额外记录逐位置状态熵 `train/tissue_state_entropy`、batch 平均状态用量的熵 `train/tissue_state_usage_entropy` 和平均幅度 `train/expression_amplitude_mean`；两个熵均使用自然对数，取值范围约为 0 到 ln(K)。低用量熵提示少数状态占主导，高位置熵可能表示状态混合接近均匀，不能只凭熵判断质量。原结构仍记录修正门控和残差统计。验证使用 EMA 模型，最终保存和测试使用普通模型。验证表达 MSE、RMSE、PCC 的定义保持不变，训练相关性项使用 crop 内统计，验证 PCC 使用整片或整患者统计。
@@ -225,5 +227,9 @@ HER2ST 的 36 张表达切片按患者划分；8 张有分割标注的切片决�
 结果位于 `validation/epoch_0001/gene_expression/`：`top_genes.csv` 保存该轮排名，`metadata.json` 保存排名口径、色标范围和每张切片的 PCC；每张留出切片目录下有 `01_<gene>.png` 等真值/预测 spot 空间对照，以及 `overview.jpg` 总览。图像使用 EMA 验证结果，标题同时给出 pooled PCC 和该切片自身的 PCC；同一基因的真值、预测及不同切片共享从 0 到联合最大值的色标。缺失表达不画成零值。表达尺度沿用训练配置，HER2ST 为 log1p(CP10k)。绘图复用已经计算的 spot 预测与坐标，不增加模型推理。
 
 每轮同时保存 `01_<gene>_normalized.png` 和 `overview_normalized.jpg`：对每个基因，分别在所有留出切片的有效真值和有效预测上计算 min/max，再用 `(value-min)/(max-min)` 映射到 0～1。同一来源的所有切片使用统一范围，以保留切片间的相对差异；未观测值不参与范围估计或绘图，常量范围映射为 0。该视图用于对比空间模式，原共享色标图继续保留以检查表达量偏差。各基因的原始 min/max 记录在 `metadata.json` 的 `normalization` 中。归一化仅作用于绘图数组，PCC 排名、RMSE 和训练目标均使用原始表达。
+
+同一目录还保存入选基因在原生预测网格上的稠密热力图，HER2ST 为 7mpp。`01_<gene>_dense.png` 和 `01_<gene>_dense_normalized.png` 保持整片预测网格尺寸，每个图像像素对应一个预测格，使用 viridis 色图，组织外显示白色。它们来自滑窗融合后的模型表达场，未经 spot 圆盘聚合，也不从 spot 预测插值生成。`01_<gene>_dense_comparison.png` 与 `_dense_comparison_normalized.png` 将 spot 真值、spot 预测和稠密预测并排展示，并标注色条；`overview_dense.jpg` 和 `overview_dense_normalized.jpg` 汇总本轮入选基因。真值仍只显示实际测量的 spot，PCC 排名和标题数值仍基于 spot 级评价。
+
+稠密共享色标对每个基因取所有留出切片的有效 spot 真值、spot 预测及组织内稠密预测的联合最大值，避免组织外极值影响色标；原有两列 spot 图的色标保持原定义。归一化稠密图则使用该基因在所有留出切片组织内稠密预测的独立 min/max，常量场映射为 0。`metadata.json` 记录 `dense_vmax`、`dense_normalization`、每张切片的 `dense_mpp`、`dense_shape` 和输出路径。HER2ST 的稠密绘图使用逐格 `log1p(线性预测)`；spot 预测使用 `log1p(圆盘内线性均值)`，两者的变换/聚合顺序不同。当前共享状态模型仅暂存 CPU 状态系数及模板，排名后只解码入选基因；绘图结束即释放稠密缓存。旧稠密预测头复用已经算出的表达场，均不增加模型推理；设置 `gene_visualization_top_n: 0` 时不缓存或生成这些图。
 
 `final_model.pt` 包含图像模型权重、构造参数、滑窗设置和有序基因名称，可以重建模型并单独推理。

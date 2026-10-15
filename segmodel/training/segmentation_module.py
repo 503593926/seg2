@@ -250,6 +250,11 @@ class SegmentationModule(pl.LightningModule):
                 "spot_radius_px": self.spot_radius_px,
                 "expression_transform": self.expression_transform,
                 "expression_results": self._validation_expression,
+                "save_dense_expression": (
+                    self.visualization_dir is not None
+                    and int(self.image_cfg.get("gene_visualization_top_n", 10)) > 0
+                    and self.trainer.is_global_zero
+                ),
             }
         probability, metrics = validate_slide(
             self.ema_model,
@@ -302,13 +307,17 @@ class SegmentationModule(pl.LightningModule):
                 data_module.val_slides, top_n=top_n, spot_radius_px=self.spot_radius_px,
                 expression_transform=self.expression_transform,
             )
+            for record in self._validation_expression.values():
+                record.pop("dense_expression", None)
+                record.pop("dense_tissue", None)
+        self.log("val/gene_prediction_pcc_macro", summary["macro"]["gene_prediction_pcc"],
+                 prog_bar=True, batch_size=1)
         if len(getattr(data_module, "expression_test_names", [])) <= 1:
             return
         self.log_dict(
             {f"val/{key}": value for key, value in summary["micro"].items()},
             prog_bar=True, batch_size=1,
         )
-        self.log("val/gene_prediction_pcc_macro", summary["macro"]["gene_prediction_pcc"], batch_size=1)
         for name, metrics in summary["slides"].items():
             self.log_dict({f"val/{name}/{key}": value for key, value in metrics.items()}, batch_size=1)
 

@@ -11,20 +11,29 @@ import torch
 from threadpoolctl import threadpool_limits
 
 
+def _mix_state_counts(state_count):
+    if state_count < 3:
+        raise ValueError("mix initialization requires tissue_state_count >= 3")
+    count, remainder = divmod(state_count, 3)
+    return {"random": count + (remainder > 0), "nmf": count + (remainder > 1),
+            "kmeans": count}
+
+
 def _fit_patterns(expression, state_count, method, seed, max_iter, n_init):
+    if method == "random":
+        # 与解码器默认初始化使用相同的 logit 分布；局部 RNG 不改变训练随机状态。
+        logits = np.random.default_rng(seed).normal(
+            scale=0.5, size=(state_count, expression.shape[1]),
+        ).astype(np.float32)
+        return np.exp(logits - logits.max(axis=1, keepdims=True)), {"logit_std": 0.5}
     if method == "mix":
-        nmf_count = (state_count + 1) // 2
-        kmeans_count = state_count // 2
-        # 两种方法都使用完整的训练表达；模板顺序为 NMF 在前、K-means 在后。
-        nmf_patterns, nmf_diagnostics = _fit_patterns(
-            expression, nmf_count, "nmf", seed, max_iter, n_init,
-        )
-        kmeans_patterns, kmeans_diagnostics = _fit_patterns(
-            expression, kmeans_count, "kmeans", seed, max_iter, n_init,
-        )
-        return np.concatenate((nmf_patterns, kmeans_patterns), axis=0), {
-            "nmf": nmf_diagnostics, "kmeans": kmeans_diagnostics,
-        }
+        patterns, diagnostics = [], {}
+        # NMF/K-means 使用同一份训练表达；模板顺序为随机、NMF、K-means。
+        for part, count in _mix_state_counts(state_count).items():
+            values, details = _fit_patterns(expression, count, part, seed, max_iter, n_init)
+            patterns.append(values)
+            diagnostics[part] = details
+        return np.concatenate(patterns, axis=0), diagnostics
 
     from sklearn.cluster import KMeans
     from sklearn.decomposition import NMF
@@ -67,6 +76,7 @@ def initialize_expression_templates(
         return None
     if not model.tissue_state_count:
         raise ValueError("NMF/K-means template initialization requires tissue_state_count >= 2")
+    mix_counts = _mix_state_counts(model.tissue_state_count) if method == "mix" else None
 
     import sklearn
 
@@ -129,7 +139,8 @@ def initialize_expression_templates(
     )
 
     specification = {
-        "version": 2, "method": method, "state_count": model.tissue_state_count,
+        "version": 3 if method == "mix" else 2,
+        "method": method, "state_count": model.tissue_state_count,
         "gene_names": gene_names, "train_names": train_names, "input_spots": input_spots,
         "fit_spots": len(expression), "expression_transform": expression_transform,
         "seed": seed, "max_iter": max_iter, "smoothing": smoothing,
@@ -140,9 +151,8 @@ def initialize_expression_templates(
     }
     if method in {"kmeans", "mix"}:
         specification["kmeans_n_init"] = n_init
-    if method == "mix":
-        specification["nmf_state_count"] = (model.tissue_state_count + 1) // 2
-        specification["kmeans_state_count"] = model.tissue_state_count // 2
+    if mix_counts is not None:
+        specification.update({f"{part}_state_count": count for part, count in mix_counts.items()})
     key = hashlib.sha256(json.dumps(specification, sort_keys=True).encode()).hexdigest()
     cache_dir = Path(project_root) / str(config.get("cache_dir", "outputs/template_initialization"))
     cache_dir.mkdir(parents=True, exist_ok=True)
