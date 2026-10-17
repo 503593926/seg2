@@ -29,7 +29,7 @@ def process_sample(
     processing_root: Path,
     samples_root: Path,
     name: str,
-    label_mpp: float,
+    target_mpp: float,
     ratio: float,
     max_snap_distance_um: float,
     beta: float,
@@ -37,16 +37,17 @@ def process_sample(
     cancer_threshold: float,
     qc_spot_diameter_um: float,
 ) -> None:
-    sample_dir = processing_root / name / "spatial"
+    sample_dir = samples_root / name / "spatial"
     snic_dir = processing_root / name / "snic"
     output_dir = processing_root / name / f"pseudo_label_ratio@{ratio*100:g}"
     output_dir.mkdir(parents=True, exist_ok=True)
 
     image_bgr = cv2.imread(
-        str(sample_dir / f"he_{label_mpp:g}mpp.png"),
+        str(sample_dir / f"he_{target_mpp:g}mpp.png"),
         cv2.IMREAD_COLOR,
     )
     assert image_bgr is not None, f"{sample_dir}: H&E image is not readable"
+    image_bgr = cast(NDArray[np.uint8], image_bgr)
 
     tissue_mask_uint8 = cv2.imread(
         str(sample_dir / "tissue_mask.png"),
@@ -57,7 +58,7 @@ def process_sample(
     tissue_mask_bl: NDArray[np.bool_] = tissue_mask_uint8 > 0
     superpixels: NDArray[np.int32] = np.load(snic_dir / "superpixels.npy")
 
-    spatial = pd.read_csv(sample_dir / f"spatial_{label_mpp:g}mpp.tsv", sep="\t")
+    spatial = pd.read_csv(sample_dir / f"spatial_{target_mpp:g}mpp.tsv", sep="\t")
     spatial = spatial.loc[spatial["selected"].eq(1) & spatial["in_content"]]
 
     spot_x: NDArray[np.int64] = np.rint(
@@ -74,7 +75,7 @@ def process_sample(
     )
 
     point_selection = pd.read_csv(
-        samples_root / name / "spatial" / "point_selection.tsv",
+        sample_dir / "point_selection.tsv",
         sep="\t",
     )
     ratio_column = f"ratio@{ratio:g}"
@@ -86,7 +87,7 @@ def process_sample(
     supervised = spatial["spot_id"].isin(supervised_ids).to_numpy()
     spot_labels[~supervised] = 255
 
-    max_snap_distance_px = round(max_snap_distance_um / label_mpp)
+    max_snap_distance_px = round(max_snap_distance_um / target_mpp)
     propagation_spot_x, propagation_spot_y = snap_spots_to_tissue(
         spot_x,
         spot_y,
@@ -138,7 +139,7 @@ def process_sample(
         spot_x,
         spot_y,
         spot_labels,
-        label_mpp,
+        target_mpp,
         qc_spot_diameter_um,
     )
 
@@ -160,13 +161,13 @@ def main() -> None:
     processing_root.mkdir(parents=True, exist_ok=True)
     ratio = float(dataset_file["radio"])
 
-    for name in dataset_config["names"]:
+    for name in dataset_config["labeled_names"]:
         print(f"[{name}] generating pseudo label", flush=True)
         process_sample(
             processing_root,
             samples_root,
             name,
-            label_mpp=float(resolution["label_mpp"]),
+            target_mpp=target_mpp,
             ratio=ratio,
             max_snap_distance_um=float(pseudo_mask_config["max_snap_distance_um"]),
             beta=float(pseudo_mask_config["rw_beta"]),

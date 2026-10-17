@@ -12,21 +12,22 @@ class LayerNorm(nn.Module):
         self.normalized_shape = (normalized_shape,)
 
     def forward(self, x):
-        u = x.mean(1, keepdim=True)
-        s = (x - u).pow(2).mean(1, keepdim=True)
-        x_hat = (x - u) / torch.sqrt(s + self.eps)
-
-        x_hat = self.weight[:, None, None] * x_hat + self.bias[:, None, None]
-
-        return x_hat
+        # 参数仅在前向转换；原生 LayerNorm 内部用 FP32 累积。
+        with torch.autocast(device_type=x.device.type, enabled=False):
+            x = F.layer_norm(
+                x.permute(0, 2, 3, 1), self.normalized_shape,
+                self.weight.to(dtype=x.dtype), self.bias.to(dtype=x.dtype), self.eps,
+            )
+        return x.permute(0, 3, 1, 2)
 
 
 class Resize(nn.Module):
     def forward(self, value, size):
+        # 抗锯齿插值使用 FP32，结果恢复为条件特征的精度。
         return F.interpolate(
-            value,
+            value.float(),
             size=size,
             mode="bilinear",
             align_corners=False,
             antialias=True,
-        )
+        ).to(dtype=value.dtype)

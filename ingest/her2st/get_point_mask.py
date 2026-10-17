@@ -48,6 +48,7 @@ def process_sample(
     sample_dir = samples_root / name
     spatial_dir = sample_dir / 'spatial'
     masks_dir = sample_dir / 'masks'
+    masks_dir.mkdir(parents=True, exist_ok=True)
 
     image_mat = cv2.imread(str(spatial_dir / f'he_{target_mpp:g}mpp.png'), cv2.IMREAD_COLOR)
     assert image_mat is not None, f'{name}: he_{target_mpp:g}mpp.png not found'

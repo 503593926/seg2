@@ -17,6 +17,7 @@ class Slide:
     cls_maps: tuple[NDArray[np.float16], ...]
     cls_scale: int
     label_scale: int
+    has_segmentation: bool
 
     @property
     def height(self) -> int:
@@ -36,7 +37,7 @@ class Slide:
 
     @property
     def alignment(self) -> int:
-        return lcm(self.label_scale, self.patch_scale[0])
+        return lcm(self.label_scale, self.patch_scale[0], self.cls_scale)
 
     @property
     def patch_dims(self) -> tuple[int, ...]:
@@ -68,8 +69,8 @@ class Slide:
         cls_maps = tuple(
             _crop_array(
                 cls_map,
-                (top + self.cls_scale // 2) // self.cls_scale,
-                (left + self.cls_scale // 2) // self.cls_scale,
+                top // self.cls_scale,
+                left // self.cls_scale,
                 size // self.cls_scale,
                 size // self.cls_scale,
             )
@@ -94,7 +95,6 @@ class TrainingSlide(Slide):
     cancer_probability: NDArray[np.float32]
     superpixels: NDArray[np.int32]
     tissue_mask_bl: NDArray[np.bool_]
-    has_segmentation: bool = True
 
 
 class SlideDataset(Dataset):

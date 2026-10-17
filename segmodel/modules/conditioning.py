@@ -6,7 +6,7 @@ from torch.nn import functional as F
 
 from segmodel.modules.blocks import Resize
 
-class PFMDecomposer(nn.Module):
+class PFMProjector(nn.Module):
     def __init__(self, input_dims, feature_dim, spatial):
         super().__init__()
 
@@ -15,17 +15,10 @@ class PFMDecomposer(nn.Module):
         self.projects = nn.ModuleList(
             project(int(input_dim), feature_dim) for input_dim in input_dims
         )
-        self.shared_task_proj = project(feature_dim, feature_dim)
-        self.shared_identity_proj = project(feature_dim, feature_dim)
+        self.shared_proj = project(feature_dim, feature_dim)
 
     def forward(self, values):
-        task_f, identity_f = [], []
-        for project, value in zip(self.projects, values):
-            # value = F.normalize(value.float(), p=2, dim=1, eps=1e-6)
-            projected = project(value)
-            task_f.append(self.shared_task_proj(projected))
-            identity_f.append(self.shared_identity_proj(projected))
-        return task_f, identity_f
+        return [self.shared_proj(project(value)) for project, value in zip(self.projects, values)]
 
 
 class JointRouter(nn.Module):
@@ -102,37 +95,46 @@ class SpatialRouter(nn.Module):
 
 
 class ConditionalNorm(nn.Module):
-    def __init__(self, channels, global_dim, spatial_dim):
+    def __init__(self, channels, global_dim, spatial_dim, use_spatial=False):
         super().__init__()
         self.eps = 1e-6
+        self.use_spatial = bool(use_spatial)
 
         self.global_head = _zero_modulation(nn.Linear(global_dim, 2 * channels))
-        self.spatial_head = _zero_modulation(nn.Conv2d(spatial_dim, 2 * channels, 1))
+        self.spatial_head = _zero_modulation(nn.Conv2d(spatial_dim, 2 * channels, 3, padding=1))
 
         self.resize = Resize()
 
     def forward(self, x, task_global, task_spatial, available, routing, global_router, spatial_router):
-        u = x.mean(1, keepdim=True)
-        s = (x - u).pow(2).mean(1, keepdim=True)
-        x_hat = (x - u) / torch.sqrt(s + self.eps)
+        # 归一化用 FP32，输出转回特征精度后再施加条件调制。
+        with torch.autocast(device_type=x.device.type, enabled=False):
+            x_hat = F.layer_norm(
+                x.float().permute(0, 2, 3, 1), (x.shape[1],), eps=self.eps,
+            )
+        x_hat = x_hat.permute(0, 3, 1, 2).to(dtype=x.dtype)
 
         weight = global_router(x.mean(dim=(2, 3)), task_global, available)
         routing.append(weight.detach())
         c_g = sum(weight[:, i : i + 1] * f for i, f in enumerate(task_global))
         gamma_g, beta_g = self.global_head(c_g).chunk(2, dim=-1)
 
-        grid = x.shape[-2:]
-        f1_spatial = [
-            f if f.shape[-2:] == grid else self.resize(f, grid)
-            for f in task_spatial
-        ]
-        alpha = spatial_router(x, f1_spatial, available)
-        c_s = sum(alpha[:, i : i + 1] * f for i, f in enumerate(f1_spatial))
-        gamma_s, beta_s = self.spatial_head(c_s).chunk(2, dim=1)
-        gamma = gamma_s + gamma_g[:, :, None, None]
-        beta = beta_s + beta_g[:, :, None, None]
+        gamma = gamma_g[:, :, None, None]
+        beta = beta_g[:, :, None, None]
 
-        return (1.0 + gamma) * x_hat + beta
+        # 仅在当前 block 开启时计算空间路由和调制。
+        if self.use_spatial:
+            grid = x.shape[-2:]
+            spatial_features = [
+                f if f.shape[-2:] == grid else self.resize(f, grid)
+                for f in task_spatial
+            ]
+            alpha = spatial_router(x, spatial_features, available)
+            c_s = sum(alpha[:, i : i + 1] * f for i, f in enumerate(spatial_features))
+            gamma_s, beta_s = self.spatial_head(c_s).chunk(2, dim=1)
+            gamma = gamma + gamma_s
+            beta = beta + beta_s
+
+        return (1.0 + gamma.to(dtype=x.dtype)) * x_hat + beta.to(dtype=x.dtype)
 
 
 def _zero_modulation(module):

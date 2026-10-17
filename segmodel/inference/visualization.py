@@ -5,8 +5,6 @@ import re
 
 import cv2
 import numpy as np
-from skimage.morphology import thin
-from skimage.segmentation import find_boundaries
 import torch
 
 from segmodel.inference.metrics import gene_pearson_correlations
@@ -71,8 +69,6 @@ def save_prediction_result(
     valid,
     scale,
     threshold=0.5,
-    initial_probability=None,
-    refinement_gate=None,
 ):
     """保存一个 epoch 的留出切片预测可视化，全部落在标签网格上。"""
     directory = Path(directory)
@@ -111,10 +107,6 @@ def save_prediction_result(
         )
     )
     _write_image(directory / "overview.jpg", overview, jpg_parameters)
-    if initial_probability is not None:
-        save_prediction_result(directory / "initial", image_rgb, initial_probability, labels, valid, scale, threshold)
-    if refinement_gate is not None:
-        _write_image(directory / "refinement_gate.png", _uint16_probability(refinement_gate), png_parameters)
 
 
 def _expression_background(image_rgb, spots, spot_radius_px, size=512):
@@ -173,7 +165,7 @@ def save_top_gene_predictions(
     directory, expression_results, gene_names, slides, *, top_n=10,
     spot_radius_px=50.0, expression_transform="log1p", source_model="ema",
 ):
-    """复用验证结果，保存 spot 对照及原生预测网格的表达热力图。"""
+    """复用验证结果，每个基因仅保存归一化的 spot/dense 三列对照图。"""
     if top_n <= 0:
         return {}
     records = {}
@@ -217,31 +209,27 @@ def save_top_gene_predictions(
             key: {"min": float(values[mask, index].min()), "max": float(values[mask, index].max())}
             for key, values in (("observed", target), ("predicted", prediction))
         }
-        maximum = max(bounds["max"] for bounds in normalization.values())
         selected.append({
             "rank": position + 1, "gene": str(gene_names[index]), "gene_index": int(index),
             "pcc": float(correlations[index]), "observed_spots": int(mask.sum()),
-            "vmin": 0.0, "vmax": max(maximum, 1e-8), "normalization": normalization, "slides": {},
+            "normalization": normalization, "slides": {},
         })
         dense_values = [record["dense_prediction"][..., position][record["dense_tissue"]]
                         for record in records.values() if "dense_prediction" in record and record["dense_tissue"].any()]
         if dense_values:
             minimum, maximum = min(float(value.min()) for value in dense_values), max(float(value.max()) for value in dense_values)
-            selected[-1].update(dense_normalization={"min": minimum, "max": maximum},
-                                dense_vmax=max(selected[-1]["vmax"], maximum))
+            selected[-1]["dense_normalization"] = {"min": minimum, "max": maximum}
 
     directory = Path(directory)
     directory.mkdir(parents=True, exist_ok=True)
     for name, record in records.items():
-        if not selected:
-            break
+        if not selected or "dense_prediction" not in record:
+            continue
         slide_dir = directory / name
         slide_dir.mkdir(exist_ok=True)
         background, centers, radius = _expression_background(slides[name].image, record["spots"], spot_radius_px)
         local_pcc = gene_pearson_correlations(record["prediction"][:, indices], record["target"][:, indices],
                                                record["observed"][:, indices]).numpy()
-        overviews = {"": [], "_normalized": []}
-        dense_overviews = {"": [], "_normalized": []}
         for position, gene in enumerate(selected):
             index = gene["gene_index"]
             mask = record["observed"][:, index].numpy()
@@ -258,62 +246,32 @@ def save_top_gene_predictions(
             title = f"{gene['rank']:02d}. {gene['gene']} | {name} | pooled PCC {gene['pcc']:.3f} | slide PCC {local_text}"
             safe_name = re.sub(r"[^A-Za-z0-9_.-]+", "_", gene["gene"]).strip("._") or "gene"
             stem = f"{gene['rank']:02d}_{safe_name}"
-            for suffix, display_values, display_maximum, caption in (
-                ("", values, gene["vmax"], "shared color scale across slides"),
-                ("_normalized", normalized_values, 1.0, "independent min-max | pooled across slides"),
-            ):
-                panels = [
-                    _expression_spot_panel(background, centers[mask], radius, value, display_maximum,
-                                           f"{label} normalized" if suffix else label)
-                    for value, label in zip(display_values, ("Observed", "Predicted"))
-                ]
-                pair = np.vstack((np.full((64, 1024, 3), 255, dtype=np.uint8), np.hstack(panels)))
-                cv2.putText(pair, title, (12, 24), cv2.FONT_HERSHEY_SIMPLEX, .6, (20, 20, 20), 1, cv2.LINE_AA)
-                cv2.putText(pair, f"Source: {source_model} | {expression_transform} expression | {caption}",
-                            (12, 49), cv2.FONT_HERSHEY_SIMPLEX, .5, (50, 50, 50), 1, cv2.LINE_AA)
-                _write_image(slide_dir / f"{stem}{suffix}.png", pair, (cv2.IMWRITE_PNG_COMPRESSION, 3))
-                overviews[suffix].append(pair)
+            dense_values = record["dense_prediction"][..., position]
+            limits = gene.get("dense_normalization", {"min": 0.0, "max": 0.0})
+            span = limits["max"] - limits["min"]
+            normalized_dense = (dense_values - limits["min"]) / span if span > 0 else np.zeros_like(dense_values)
+            encoded = np.rint(np.clip(normalized_dense, 0, 1) * 255).astype(np.uint8)
+            heatmap = cv2.applyColorMap(encoded, cv2.COLORMAP_VIRIDIS)
+            heatmap[~record["dense_tissue"]] = 255
+            panels = [
+                _expression_spot_panel(background, centers[mask], radius, value, 1.0, f"{label} normalized")
+                for value, label in zip(normalized_values, ("Observed", "Predicted"))
+            ]
+            panels.append(_expression_dense_panel(heatmap, 1.0, f"Predicted {record['dense_mpp']:g}mpp normalized"))
+            comparison = np.vstack((np.full((64, 1536, 3), 255, dtype=np.uint8), np.hstack(panels)))
+            cv2.putText(comparison, title, (12, 24), cv2.FONT_HERSHEY_SIMPLEX, .6, (20, 20, 20), 1, cv2.LINE_AA)
+            cv2.putText(comparison, f"Source: {source_model} | {expression_transform} | PCC from spots | "
+                        "independent min-max for observed/spot/dense predictions",
+                        (12, 49), cv2.FONT_HERSHEY_SIMPLEX, .5, (50, 50, 50), 1, cv2.LINE_AA)
+            filename = f"{stem}_dense_comparison_normalized.png"
+            _write_image(slide_dir / filename, comparison, (cv2.IMWRITE_PNG_COMPRESSION, 3))
             gene["slides"][name] = {
-                "pcc": pcc, "observed_spots": int(mask.sum()), "file": f"{name}/{stem}.png",
-                "normalized_file": f"{name}/{stem}_normalized.png",
+                "pcc": pcc, "observed_spots": int(mask.sum()),
+                "dense_comparison_normalized_file": f"{name}/{filename}",
+                "dense_mpp": record["dense_mpp"], "dense_shape": list(dense_values.shape),
             }
-            if "dense_prediction" in record:
-                dense_values = record["dense_prediction"][..., position]
-                limits = gene.get("dense_normalization", {"min": 0.0, "max": 0.0})
-                span = limits["max"] - limits["min"]
-                normalized_dense = (dense_values - limits["min"]) / span if span > 0 else np.zeros_like(dense_values)
-                dense_files = {}
-                for suffix, display_dense, display_spots, maximum, caption in (
-                    ("", dense_values, values, gene.get("dense_vmax", gene["vmax"]), "shared spot/dense color scale across slides"),
-                    ("_normalized", normalized_dense, normalized_values, 1.0, "independent min-max for observed/spot/dense predictions"),
-                ):
-                    encoded = np.rint(np.clip(display_dense / maximum, 0, 1) * 255).astype(np.uint8)
-                    heatmap = cv2.applyColorMap(encoded, cv2.COLORMAP_VIRIDIS)
-                    heatmap[~record["dense_tissue"]] = 255
-                    _write_image(slide_dir / f"{stem}_dense{suffix}.png", heatmap, (cv2.IMWRITE_PNG_COMPRESSION, 3))
-                    dense_title = f"Predicted {record['dense_mpp']:g}mpp" + (" normalized" if suffix else "")
-                    panels = [
-                        _expression_spot_panel(background, centers[mask], radius, value, maximum,
-                                               f"{label} normalized" if suffix else label)
-                        for value, label in zip(display_spots, ("Observed", "Predicted"))
-                    ]
-                    panels.append(_expression_dense_panel(heatmap, maximum, dense_title))
-                    comparison = np.vstack((np.full((64, 1536, 3), 255, dtype=np.uint8), np.hstack(panels)))
-                    cv2.putText(comparison, title, (12, 24), cv2.FONT_HERSHEY_SIMPLEX, .6, (20, 20, 20), 1, cv2.LINE_AA)
-                    cv2.putText(comparison, f"Source: {source_model} | {expression_transform} | PCC from spots | {caption}",
-                                (12, 49), cv2.FONT_HERSHEY_SIMPLEX, .5, (50, 50, 50), 1, cv2.LINE_AA)
-                    _write_image(slide_dir / f"{stem}_dense_comparison{suffix}.png", comparison, (cv2.IMWRITE_PNG_COMPRESSION, 3))
-                    dense_overviews[suffix].append(comparison)
-                    dense_files[f"dense{suffix}_file"] = f"{name}/{stem}_dense{suffix}.png"
-                    dense_files[f"dense_comparison{suffix}_file"] = f"{name}/{stem}_dense_comparison{suffix}.png"
-                gene["slides"][name].update(dense_files, dense_mpp=record["dense_mpp"], dense_shape=list(dense_values.shape))
-        for suffix, overview in overviews.items():
-            _write_image(slide_dir / f"overview{suffix}.jpg", np.vstack(overview), (cv2.IMWRITE_JPEG_QUALITY, 90))
-        for suffix, overview in dense_overviews.items():
-            if overview:
-                _write_image(slide_dir / f"overview_dense{suffix}.jpg", np.vstack(overview), (cv2.IMWRITE_JPEG_QUALITY, 90))
 
-    columns = ("rank", "gene", "gene_index", "pcc", "observed_spots", "vmin", "vmax")
+    columns = ("rank", "gene", "gene_index", "pcc", "observed_spots")
     with (directory / "top_genes.csv").open("w", newline="", encoding="utf-8") as handle:
         writer = csv.DictWriter(handle, fieldnames=columns)
         writer.writeheader()
@@ -322,25 +280,12 @@ def save_top_gene_predictions(
         "source_model": source_model, "ranking_scope": "pooled_validation_spots",
         "expression_transform": expression_transform, "requested_top_n": int(top_n),
         "eligible_genes": len(eligible), "selected_genes": selected,
-        "color_scale": "zero to joint observed/predicted maximum per gene, shared across slides; no clipping",
         "normalized_color_scale": "independent min-max for observed and predicted per gene, pooled across slides; displayed range [0, 1]",
-        "dense_color_scale": "zero to joint observed/spot-predicted/dense-predicted maximum per gene, shared across slides; tissue pixels only",
         "dense_normalized_color_scale": "independent dense min-max per gene over tissue pixels across slides; displayed range [0, 1]",
     }
     (directory / "metadata.json").write_text(json.dumps(metadata, ensure_ascii=False, indent=2, allow_nan=False) + "\n",
                                               encoding="utf-8")
     return metadata
-
-
-def _superpixel_overlay(image_bgr, superpixels, label_mpp):
-    """与静态 SNIC QC 一致：红色边界，低分辨率标签网格使用细线。"""
-    boundary = find_boundaries(superpixels, connectivity=2, mode="thick")
-    boundary &= superpixels > 0
-    if label_mpp >= 4.0:
-        boundary = thin(boundary)
-    overlay = image_bgr.copy()
-    overlay[boundary] = (0, 0, 255)
-    return overlay
 
 
 def _probability_heatmap(probability, tissue):
@@ -351,18 +296,14 @@ def _probability_heatmap(probability, tissue):
 
 
 def save_soft_label_result(
-    directory, image_rgb, tissue, probability, supervised, superpixels, spots, spot_labels,
+    directory, image_rgb, tissue, probability, mask, spots, spot_labels,
     *, model_probability, non_cancer_threshold, cancer_threshold, metadata,
 ):
-    """保存新 SNIC 上的 RW 场及红色细线边界；不读取评估像素标注。"""
+    """保存种子、模型概率、RW 概率和实际伪标签的四面板总览及统计。"""
     directory = Path(directory)
     directory.mkdir(parents=True, exist_ok=True)
     image_bgr = cv2.cvtColor(image_rgb, cv2.COLOR_RGB2BGR)
-    mask = np.full(tissue.shape, 255, dtype=np.uint8)
-    mask[tissue & supervised & (probability <= non_cancer_threshold)] = 0
-    mask[tissue & supervised & (probability >= cancer_threshold)] = 1
     pseudo_overlay = _mask_overlay(image_bgr, mask, tissue)
-    snic_overlay = _superpixel_overlay(image_bgr, superpixels, float(metadata["label_mpp"]))
     heatmap = _probability_heatmap(probability, tissue)
     model_heatmap = _probability_heatmap(model_probability, tissue)
     seed_overlay = image_bgr.copy()
@@ -371,40 +312,16 @@ def save_soft_label_result(
         if label in (0, 1) and 0 <= x < width and 0 <= y < height:
             cv2.circle(seed_overlay, (int(x), int(y)), 3, (255, 0, 0) if label == 0 else (0, 0, 255), -1)
 
-    # 固定局部随机源，不改变训练的 NumPy/Torch 随机状态。
-    colors = np.random.default_rng(0).integers(32, 224, size=(int(superpixels.max()) + 1, 3), dtype=np.uint8)
-    colors[0] = 255
-    png = (cv2.IMWRITE_PNG_COMPRESSION, 3)
     jpg = (cv2.IMWRITE_JPEG_QUALITY, 90)
-    images = {
-        "soft_probability.png": _uint16_probability(probability),
-        "soft_probability_heatmap.png": heatmap,
-        "soft_pseudo_mask.png": mask,
-        "supervised_mask.png": (mask != 255).astype(np.uint8) * 255,
-        "superpixel_labels.png": colors[superpixels],
-        "superpixel_boundary_overlay.png": snic_overlay,
-        "model_probability.png": _uint16_probability(model_probability),
-        "model_probability_heatmap.png": model_heatmap,
-    }
-    for filename, values in images.items():
-        _write_image(directory / filename, values, png)
-    for filename, values in {
-        "soft_pseudo_mask_overlay.jpg": pseudo_overlay,
-        "spot_seeds_overlay.jpg": seed_overlay,
-    }.items():
-        _write_image(directory / filename, values, jpg)
     panels = [
         (seed_overlay, "H&E + spot seeds"), (model_heatmap, "Model probability"),
         (heatmap, "RW probability"), (pseudo_overlay, "RW pseudo label"),
-        (snic_overlay, "Dynamic SNIC boundaries"), (image_bgr, "H&E"),
     ]
     overview = np.vstack([
-        np.hstack([_overview_panel(values, title) for values, title in panels[start:start + 3]])
-        for start in (0, 3)
+        np.hstack([_overview_panel(values, title) for values, title in panels[start:start + 2]])
+        for start in (0, 2)
     ])
     _write_image(directory / "overview.jpg", overview, jpg)
-    np.save(directory / "superpixels.npy", superpixels)
-    np.save(directory / "soft_probability.npy", probability)
     values = probability[tissue]
     record = {
         **metadata, "shape": list(tissue.shape),
@@ -419,14 +336,8 @@ def save_soft_label_result(
             **{f"p{percentile}": float(np.percentile(values, percentile)) for percentile in (10, 50, 90)},
         },
         "thresholds": {"non_cancer": float(non_cancer_threshold), "cancer": float(cancer_threshold)},
-        "files": {
-            "probability_encoding": "uint16_png; probability = value / 65535; npy stores unquantized float32",
-            "pseudo_mask_encoding": {"0": "non_cancer", "1": "cancer", "255": "fuzzy_or_outside_tissue"},
-            "overlay_colors": {"blue": "non_cancer", "red": "cancer"},
-            "snic_boundary_color": "red", "snic_boundary_file": "superpixel_boundary_overlay.png",
-            "snic_boundary_thinned": float(metadata["label_mpp"]) >= 4.0,
-            "superpixels_encoding": "int32_npy; 0=background, 1..K=nodes",
-        },
+        "overlay_colors": {"blue": "non_cancer", "red": "cancer"},
+        "files": {"overview": "overview.jpg"},
     }
     (directory / "metadata.json").write_text(json.dumps(record, ensure_ascii=False, indent=2, allow_nan=False) + "\n", encoding="utf-8")
     return record

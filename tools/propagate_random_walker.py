@@ -214,7 +214,7 @@ def propagate_random_walker(
         (weights, (rows, columns)),
         shape=(len(foreground_labels), len(foreground_labels)),
     ).tocsr()
-    laplacian = diags(np.asarray(adjacency.sum(axis=1)).ravel()) - adjacency
+    laplacian = (diags(np.asarray(adjacency.sum(axis=1)).ravel()) - adjacency).tocsr()
 
     # 同一超像素内标签一致时作为种子, 标签冲突时不作为种子
     votes = compute_seed_votes(superpixels, spot_x, spot_y, spot_labels, topology)
@@ -231,9 +231,9 @@ def propagate_random_walker(
     solvable = ~labeled & np.isin(component_labels, seeded_components)
     if np.any(solvable):
         right_hand_side = -laplacian[solvable][:, labeled] @ probability[labeled]
-        probability[solvable] = spsolve(
-            laplacian[solvable][:, solvable],
-            right_hand_side,
+        probability[solvable] = cast(
+            NDArray[np.float64],
+            spsolve(laplacian[solvable][:, solvable], right_hand_side),
         )
     probability = np.clip(probability, 0.0, 1.0)
 

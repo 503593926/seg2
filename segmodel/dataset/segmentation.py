@@ -3,7 +3,6 @@ import numpy as np
 import torch
 from torch.utils.data import Dataset, Sampler, default_collate
 
-from segmodel.modules.propagation import prepare_graph
 from segmodel.modules.spot_pooling import collate_spot_pools, prepare_spot_pool
 
 from segmodel.dataset.augment import (
@@ -38,36 +37,37 @@ class SegmentationDataset(Dataset):
         slide_names,
         cfg,
         seed=0,
-        labeled_names=None,
     ):
         self.slides = slides
+        self.slide_names = sorted(list(slide_names))
+        self.labeled_names = [name for name in self.slide_names if slides[name].has_segmentation]
+        self.expression_only_names = [name for name in self.slide_names if not slides[name].has_segmentation]
         self.gene_expression = torch.from_numpy(gene_adata.X)
         if "spot_label" in gene_adata.obs:
             labels = gene_adata.obs["spot_label"].fillna(255).to_numpy(dtype=np.int64)
         else:
             labels = np.full(gene_adata.n_obs, 255, dtype=np.int64)
-        labeled_names = set(slide_names if labeled_names is None else labeled_names)
         labels = labels.copy()
-        labels[~gene_adata.obs["name"].astype(str).isin(labeled_names).to_numpy()] = 255
+        labels[~gene_adata.obs["name"].astype(str).isin(self.labeled_names).to_numpy()] = 255
         self.spot_labels = torch.from_numpy(labels)
-        self.slide_names = sorted(list(slide_names))
-        self.labeled_names = [name for name in self.slide_names if name in labeled_names]
-        self.expression_only_names = [name for name in self.slide_names if name not in labeled_names]
         self.seed = int(seed)
         self.epoch = 0
-        self.shared_superpixels = {}
+        self.shared_supervision = {}
+        self.shared_crop_origins = {}
         if int(cfg.experiment.dataset.num_workers) > 0:
-            for name, slide in self.slides.items():
-                if slide.has_segmentation:
-                    shared = torch.from_numpy(slide.superpixels).share_memory_()
-                    self.shared_superpixels[name] = shared
-                    slide.superpixels = shared.numpy()
+            # 固定超像素也共享存储，避免 spawn worker 复制整片数组。
+            for name in self.labeled_names:
+                slide = self.slides[name]
+                self.shared_supervision[name] = {}
+                for key, attribute in (("valid", "pseudo_mask_uint8"),
+                                       ("cancer_probability", "cancer_probability"),
+                                       ("superpixels", "superpixels")):
+                    shared = torch.from_numpy(getattr(slide, attribute)).share_memory_()
+                    self.shared_supervision[name][key] = shared
+                    setattr(slide, attribute, shared.numpy())
         weights = cfg.experiment.training.image.loss_weights
         self.prepare_expression = any(
             float(weights.get(name, 0)) for name in ("gene_prediction", "gene_correlation")
-        )
-        self.prepare_propagation = bool(cfg.experiment.propagation.enabled) and any(
-            float(weights.get(name, 0)) for name in ("propagation", "propagation_initial")
         )
 
         self.spots_by_slide = {}
@@ -98,6 +98,15 @@ class SegmentationDataset(Dataset):
 
         self.crop_origins = {}
         for name in self.slide_names:
+            if name in self.shared_supervision:
+                size = self.crop_size // self.label_scale
+                step = self.alignment // self.label_scale
+                height, width = self.slides[name].tissue_mask_bl.shape
+                capacity = max(0, (height - size) // step + 1) * max(0, (width - size) // step + 1)
+                self.shared_crop_origins[name] = (
+                    torch.empty((capacity, 2), dtype=torch.int64).share_memory_(),
+                    torch.zeros((), dtype=torch.int64).share_memory_(),
+                )
             self._refresh_slide(name)
 
     def _refresh_slide(self, name):
@@ -107,6 +116,18 @@ class SegmentationDataset(Dataset):
         self.crop_origins[name] = self.candidate_origins(usable)
         if not len(self.crop_origins[name]):
             raise ValueError(f"{name}: no usable training crops")
+        if name in self.shared_crop_origins:
+            buffer, count = self.shared_crop_origins[name]
+            origins = self.crop_origins[name]
+            buffer[:len(origins)].copy_(torch.from_numpy(origins))
+            count.fill_(len(origins))
+
+    def update_supervision(self, name, mask, probability):
+        """原地提交整片监督，保持常驻 worker 使用的共享存储。"""
+        slide = self.slides[name]
+        slide.pseudo_mask_uint8[...] = mask
+        slide.cancer_probability[...] = probability
+        self._refresh_slide(name)
 
     def candidate_origins(self, valid):
         size, step = self.crop_size // self.label_scale, self.alignment // self.label_scale
@@ -150,10 +171,6 @@ class SegmentationDataset(Dataset):
             sample["spot_pool"] = prepare_spot_pool(
                 sample["tissue"][0], sample["spots"], self.spot_radius_px, self.label_scale,
             )
-        if self.prepare_propagation:
-            sample["propagation_graph"] = prepare_graph(
-                sample["superpixels"][0], sample["spot_labels"], sample["spots"], self.label_scale,
-            )
         return sample
 
     def _sample_origin(self, rng):
@@ -165,6 +182,9 @@ class SegmentationDataset(Dataset):
             names = self.labeled_names if rng.random() < float(fraction) else self.expression_only_names
         name = names[int(rng.integers(len(names)))]
         origins = self.crop_origins[name]
+        if name in self.shared_crop_origins:
+            buffer, count = self.shared_crop_origins[name]
+            origins = buffer[:int(count)].numpy()
         index = int(rng.integers(len(origins)))
         spot_data = self.spots_by_slide[name]
 
@@ -189,8 +209,8 @@ class SegmentationDataset(Dataset):
         }
         supervision = {}
         for key, array in arrays.items():
-            if key == "superpixels" and name in self.shared_superpixels:
-                array = self.shared_superpixels[name].numpy()
+            if key in self.shared_supervision.get(name, {}):
+                array = self.shared_supervision[name][key].numpy()
             crop = array[label_top : label_top + size, label_left : label_left + size]
             supervision[key] = torch.from_numpy(crop[None].copy())
 
@@ -218,8 +238,6 @@ def collate_samples(samples):
         values = [sample[key] for sample in samples]
         if key == "spot_pool":
             batch[key] = collate_spot_pools(values, samples[0]["tissue"].shape[-2:])
-        elif key == "propagation_graph":
-            batch["propagation_graphs"] = values
         else:
             batch[key] = values if key in variable_keys else default_collate(values)
     return batch

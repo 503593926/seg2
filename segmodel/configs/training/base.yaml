@@ -1,16 +1,16 @@
 image:
   epochs: 5
   warmup_steps: 0.15  # 预热占总优化器 step 的比例 [0, 1]，向上取整；0 表示不预热
-  progress_every_n_steps: 10  # 进度条指标刷新间隔，按优化器更新计数；首步和每轮末尾也刷新
+  progress_every_n_steps: 1  # 进度条指标刷新间隔，按优化器更新计数；首步和每轮末尾也刷新
   val_every_n_epochs: 1   # 每 N 个 epoch 验证一次（指标 + validation/ 可视化）；epochs 不被 N 整除时末尾无验证
-  gene_visualization_top_n: 10  # 每轮验证后绘制 pooled PCC 最高的 N 个基因的 spot/原生网格图；0 关闭
-  batch_size: 16
+  gene_visualization_top_n: 0  # 每轮验证后保存 pooled PCC 最高的 N 个基因的归一化 spot/dense 对照图；0 关闭
+  batch_size: 8
   expression_transform: log1p  # 线性表达先做 spot 均值，再 log1p 计算 MSE/PCC
   gene_correlation_min_spots: 8  # 每 crop 至少包含这些有效 spot 才计算逐基因 PCC，最低按 3 个处理
   ema_decay: 0.999
 
   template_init:
-    method: mix  # random、nmf、kmeans、mix；mix 三种均分，余数依次分配给 random、nmf，K >= 3
+    method: nmf  # random、nmf、kmeans、mix；mix 三种均分，余数依次分配给 random、nmf，K >= 3
     trainable: true  # false：初始化后固定表达模板；状态/幅度头和类别倾向仍可训练
     min_counts: 100  # 仅模板拟合保留 normalization_total_counts >= 此值的 spot；0 关闭
     seed: 0  # 独立于模型种子，相同 fold/参数可跨训练 seed 复用模板
@@ -23,17 +23,8 @@ image:
   weight_decay: 0.05
   loss_weights:
     segmentation: 0.0
-    affinity: 0.0
-    superpixel: 0.0
-    propagation: 0.0  # 可微传播软标签项, 与 experiment.propagation.enabled 配合
-    propagation_initial: 0.0  # 联合预测初始分割P0的同一RW软标签监督
     gene_prediction: 1.0  # 纯图像稠密表达预测, 所有有效训练 spot 监督
     gene_correlation: 0.5  # 同一 crop 内逐基因的 1-PCC，与 MSE 独立加权
-
-    pfm_cls_global: 0.0
-    pfm_orth_global: 0.0
-    pfm_cls_spatial: 0.0
-    pfm_orth_spatial: 0.0
 
 runtime:
   accelerator: gpu

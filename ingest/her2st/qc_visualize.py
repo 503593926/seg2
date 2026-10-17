@@ -107,7 +107,10 @@ def qc_visualize_mask(
             cv2.line(overlay, (x - r, y + r), (x + r, y - r), (255, 255, 255), 4, cv2.LINE_AA)
 
     # thumbnail
-    thumb = cv2.resize(overlay, None, fx=0.1, fy=0.1, interpolation=cv2.INTER_AREA)
+    thumb = cast(
+        NDArray[np.uint8],
+        cv2.resize(overlay, None, fx=0.1, fy=0.1, interpolation=cv2.INTER_AREA),
+    )
     qc_path = output_dir / 'spot_qc_overlay.jpg'
     _write_image(qc_path, thumb, [cv2.IMWRITE_JPEG_QUALITY, 95])
 
@@ -138,7 +141,10 @@ def qc_visualize_target_mpp(
         max(1, round(overview_width * overview_scale)),
         max(1, round(overview_height * overview_scale)),
     )
-    overview = cv2.resize(image_target_mpp, overview_size, interpolation=cv2.INTER_AREA)
+    overview = cast(
+        NDArray[np.uint8],
+        cv2.resize(image_target_mpp, overview_size, interpolation=cv2.INTER_AREA),
+    )
     overview_tissue = cv2.resize(
         tissue_target_mpp,
         overview_size,
@@ -175,7 +181,10 @@ def qc_visualize_target_mpp(
         max(1, round(canvas_width * canvas_scale)),
         max(1, round(canvas_height * canvas_scale)),
     )
-    thumbnail = cv2.resize(padded_image, canvas_size, interpolation=cv2.INTER_AREA)
+    thumbnail = cast(
+        NDArray[np.uint8],
+        cv2.resize(padded_image, canvas_size, interpolation=cv2.INTER_AREA),
+    )
     thumbnail_tissue = cv2.resize(
         tissue_padded,
         canvas_size,
@@ -202,7 +211,10 @@ def qc_visualize_target_mpp(
         return
 
     # spot_qc_overlay: 画布 + 类别染色 + 图例 + 按所在类别着色的 spot
-    overlay = cv2.resize(padded_image, canvas_size, interpolation=cv2.INTER_AREA)
+    overlay = cast(
+        NDArray[np.uint8],
+        cv2.resize(padded_image, canvas_size, interpolation=cv2.INTER_AREA),
+    )
     semantic_small = cv2.resize(
         semantic_mask,
         canvas_size,
@@ -253,7 +265,10 @@ def qc_visualize_point_mask(
     height, width = image_bgr.shape[:2]
     scale = min(1.0, max_side / max(height, width))
     size = (max(1, round(width * scale)), max(1, round(height * scale)))
-    thumbnail = cv2.resize(image_bgr, size, interpolation=cv2.INTER_AREA)
+    thumbnail = cast(
+        NDArray[np.uint8],
+        cv2.resize(image_bgr, size, interpolation=cv2.INTER_AREA),
+    )
 
     # 点只有 1 个像素, QC 放大成圆点: 红=选中的肿瘤 spot, 绿=选中的非肿瘤 spot, 灰=未选中
     color_of = {0: (0, 180, 0), 1: (0, 0, 255)}

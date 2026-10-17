@@ -4,4 +4,4 @@ defaults:
   - /model: her2st
   - /training: her2st
   - /augment: her2st
-  - /propagation: her2st
+  - /dynamic: her2st

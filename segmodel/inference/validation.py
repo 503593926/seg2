@@ -1,32 +1,20 @@
 from pathlib import Path
+from typing import cast
 
 import cv2
 import numpy as np
 import torch
 
-from segmodel.dataset.loading import read_image
 from segmodel.inference.metrics import expression_metrics, segmentation_metrics
 from segmodel.inference.predictor import predict_slide
-from segmodel.modules.spot_pooling import pool_spot_expression
-
-
-def gene_prediction_metrics(field, tissue, spots, truth, radius_px, label_scale, expression_transform="log1p", spot_results=None, gene_observed=None):
-    """图像预测场在真实 spot 上的独立评估, 真值只参与指标计算。"""
-    prediction, valid = pool_spot_expression(field, tissue, spots, radius_px, label_scale)
-    prediction, target = prediction[valid], truth[valid].float()
-    observed = torch.ones_like(target, dtype=torch.bool) if gene_observed is None else gene_observed[valid].bool()
-    if expression_transform == "log1p":
-        prediction = prediction.log1p()
-    if spot_results is not None:
-        spot_results.update(prediction=prediction.cpu(), target=target.cpu(), observed=observed.cpu(), valid=valid.cpu())
-    return expression_metrics(prediction, target, observed)
+from segmodel.modules.spot_pooling import pool_spot_expression, prepare_spot_pool
 
 
 def load_expert_masks(root, slide):
     sample = Path(root) / "samples" / slide.name
-    labels = read_image(sample / "masks/training_mask.png", cv2.IMREAD_GRAYSCALE)
-    valid = read_image(sample / "masks/valid_mask.png", cv2.IMREAD_GRAYSCALE) > 0
-    canvas = read_image(sample / "spatial/canvas_mask.png", cv2.IMREAD_GRAYSCALE) > 0
+    labels = np.asarray(cv2.imread(str(sample / "masks/training_mask.png"), cv2.IMREAD_GRAYSCALE))
+    valid = np.asarray(cv2.imread(str(sample / "masks/valid_mask.png"), cv2.IMREAD_GRAYSCALE)) > 0
+    canvas = np.asarray(cv2.imread(str(sample / "spatial/canvas_mask.png"), cv2.IMREAD_GRAYSCALE)) > 0
     if any(
         array.shape != (slide.height, slide.width) for array in (labels, valid, canvas)
     ):
@@ -57,62 +45,80 @@ def validate_slide(
     expression_transform="log1p",
     evaluate_segmentation=True,
     expression_results=None,
-    segmentation_results=None,
     save_dense_expression=False,
 ):
-    auxiliary = {} if getattr(model, "joint_prediction", False) and evaluate_segmentation else None
-    factors = {} if save_dense_expression and gene_adata is not None and expression_results is not None else None
-    probability, expression = predict_slide(
-        model,
-        slide,
-        crop_size=crop_size,
-        stride=stride,
-        alignment=alignment,
-        device=device,
-        batch_size=batch_size,
-        return_features=gene_adata is not None,
-        feature_key="gene_expression" if gene_adata is not None else "propagation_features",
-        auxiliary_outputs=auxiliary,
-        **({"expression_factors": factors} if factors is not None else {}),
-    )
+    factorized = bool(getattr(model, "tissue_state_count", 0)) and gene_adata is not None
+    cache_dense = save_dense_expression and gene_adata is not None and expression_results is not None
     metrics = {}
-    if evaluate_segmentation:
-        labels, valid = load_expert_masks(root, slide)
-        metrics.update(segmentation_metrics(
-            probability, labels, valid, threshold=threshold, mpp=mpp,
-        ))
-        if auxiliary:
-            initial_metrics = segmentation_metrics(
-                auxiliary["initial_probability"], labels, valid, threshold=threshold, mpp=mpp,
-            )
-            metrics.update({f"initial_{key}": initial_metrics[key] for key in ("loss", "dice", "iou", "hd95")})
-            metrics["refinement_dice_gain"] = metrics["dice"] - initial_metrics["dice"]
-            if segmentation_results is not None:
-                segmentation_results.update(auxiliary)
+    factors = {}
+    spot_pool = None
     if gene_adata is not None:
         selected = gene_adata.obs["name"].astype(str).to_numpy() == slide.name
         spots = torch.from_numpy(gene_adata.obs.loc[selected, ["pixel_x", "pixel_y"]].to_numpy(dtype=np.float32))
+        spot_ids = gene_adata.obs.index[selected].to_numpy(dtype=str)
         truth = torch.from_numpy(np.asarray(gene_adata.X[selected], dtype=np.float32))
         observed = torch.ones_like(truth, dtype=torch.bool)
         missing = getattr(gene_adata, "uns", {}).get("missing_selected_genes_by_slide", {}).get(slide.name, [])
         if len(missing):
             observed[:, torch.from_numpy(np.isin(gene_adata.var_names, missing))] = False
-        tissue = torch.from_numpy(read_image(
-            Path(root) / "label_mpp" / slide.name / "spatial/tissue_mask.png", cv2.IMREAD_GRAYSCALE,
-        ) > 0)
-        spot_results = {} if expression_results is not None else None
-        metrics.update(gene_prediction_metrics(
-            torch.from_numpy(expression).permute(2, 0, 1), tissue, spots, truth,
-            spot_radius_px, slide.label_scale, expression_transform, spot_results, observed,
-        ))
+        tissue = torch.from_numpy(np.asarray(cv2.imread(
+            str(Path(root) / "samples" / slide.name / "spatial/tissue_mask.png"), cv2.IMREAD_GRAYSCALE,
+        )) > 0)
+        if factorized:
+            # 按整片像素位置排序，窗口内只扫描对应行范围的 spot 像素。
+            plan = prepare_spot_pool(tissue, spots, spot_radius_px, slide.label_scale)
+            pixels, rows = plan["pixels"].numpy(), plan["rows"].numpy()
+            order = np.argsort(pixels, kind="stable")
+            spot_pool = {
+                "pixels": pixels[order], "rows": rows[order],
+                "pixel_counts": np.bincount(rows, minlength=plan["count"]),
+                "indices": plan["indices"].numpy(),
+            }
+            del plan
+        probability, expression = predict_slide(
+            model,
+            slide,
+            crop_size=crop_size,
+            stride=stride,
+            alignment=alignment,
+            device=device,
+            batch_size=batch_size,
+            return_features=not factorized,
+            feature_key="gene_expression",
+            expression_factors=factors if cache_dense else None,
+            spot_pool=spot_pool,
+        )
+        if spot_pool is not None:
+            valid = torch.zeros(len(spots), dtype=torch.bool)
+            valid[torch.from_numpy(spot_pool["indices"])] = True
+            prediction = torch.from_numpy(spot_pool["coefficients"]) @ torch.from_numpy(spot_pool["templates"])
+        else:
+            prediction, valid = pool_spot_expression(
+                torch.from_numpy(cast(np.ndarray, expression)).permute(2, 0, 1),
+                tissue, spots, spot_radius_px, slide.label_scale,
+            )
+            prediction = prediction[valid]
+        target, observed = truth[valid].float(), observed[valid]
+        if expression_transform == "log1p":
+            prediction = prediction.log1p()
+        metrics.update(expression_metrics(prediction, target, observed))
         if expression_results is not None:
-            assert spot_results is not None
-            valid = spot_results.pop("valid").numpy()
-            spot_results["spot_ids"] = gene_adata.obs.index[selected].to_numpy(dtype=str)[valid]
-            spot_results["spots"] = spots.numpy()[valid]
-            if factors is not None:
+            valid = valid.numpy()
+            spot_results = {
+                "prediction": prediction.cpu(), "target": target.cpu(), "observed": observed.cpu(),
+                "spot_ids": spot_ids[valid], "spots": spots.numpy()[valid],
+            }
+            if cache_dense:
                 spot_results["dense_expression"] = factors or {"prediction": expression}
                 spot_results["dense_tissue"] = tissue.numpy()
                 spot_results["dense_mpp"] = float(mpp) * slide.label_scale
             expression_results[slide.name] = spot_results
+    else:
+        probability, _ = predict_slide(
+            model, slide, crop_size=crop_size, stride=stride, alignment=alignment,
+            device=device, batch_size=batch_size, return_features=False,
+        )
+    if evaluate_segmentation:
+        labels, valid = load_expert_masks(root, slide)
+        metrics = {**segmentation_metrics(probability, labels, valid, threshold=threshold), **metrics}
     return probability, metrics

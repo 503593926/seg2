@@ -11,7 +11,7 @@ __pycache__/
 .idea/
 *.log
 
-data/
+data1/
 /outputs
 /lightning_logs
 /pretrained_model

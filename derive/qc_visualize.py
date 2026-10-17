@@ -1,4 +1,5 @@
 from pathlib import Path
+from typing import cast
 
 import cv2
 import matplotlib
@@ -73,10 +74,9 @@ def qc_visualize_pseudo_label(
     scale = min(1.0, 1600.0 / max(height, width))
     output_width = max(1, round(width * scale))
     output_height = max(1, round(height * scale))
-    thumbnail = cv2.resize(
-        image_bgr,
-        (output_width, output_height),
-        interpolation=cv2.INTER_AREA,
+    thumbnail = cast(
+        NDArray[np.uint8],
+        cv2.resize(image_bgr, (output_width, output_height), interpolation=cv2.INTER_AREA),
     )
     mask_overlay = thumbnail.copy()
     pseudo_small = cv2.resize(

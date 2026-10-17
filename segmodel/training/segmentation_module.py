@@ -15,9 +15,7 @@ from segmodel.training.augment import cutmix_batch, mixup_batch
 from segmodel.training.losses import (
     image_losses,
     gene_prediction_losses,
-    pfm_losses,
     segmentation_loss,
-    soft_segmentation_loss,
 )
 
 
@@ -33,15 +31,13 @@ class SegmentationModule(pl.LightningModule):
         visualization_dir=None,
         label_scale=1,
         spot_radius_px=50.0,
-        propagation=None,
     ):
         super().__init__()
         self.model = model
-        if model.tissue_state_count:
-            template_cfg = image_cfg.get("template_init", {})
-            model.tissue_state_decoder.template_logits.requires_grad_(
-                bool(template_cfg.get("trainable", True))
-            )
+        template_cfg = image_cfg.get("template_init", {})
+        model.tissue_state_decoder.template_logits.requires_grad_(
+            bool(template_cfg.get("trainable", True))
+        )
         self.ema_model = deepcopy(model).requires_grad_(False)
         self.ema_model.eval()
         self._last_ema_step = 0
@@ -56,7 +52,6 @@ class SegmentationModule(pl.LightningModule):
         self.label_scale = int(label_scale)
         self.spot_radius_px = float(spot_radius_px)
         self.expression_transform = str(image_cfg.expression_transform)
-        self.propagation = propagation
         self._validation_metrics = {}
         self._validation_expression = {}
 
@@ -66,8 +61,8 @@ class SegmentationModule(pl.LightningModule):
     def forward(self, image, patch, cls, pfm_mask=None, *, dense_expression=True):
         return self.model(image, patch, cls, pfm_mask, dense_expression=dense_expression)
 
-    def _update_propagated_loss(self, losses, output, batch):
-        """全部有效 spot 监督表达；全部类别种子生成停止梯度的 RW 目标。"""
+    def _update_expression_loss(self, losses, output, batch):
+        """全部有效训练 spot 监督表达。"""
         weights = self.image_cfg.loss_weights
         if any(float(weights.get(name, 0)) for name in ("gene_prediction", "gene_correlation")):
             expression_losses, count = gene_prediction_losses(
@@ -78,42 +73,15 @@ class SegmentationModule(pl.LightningModule):
             losses.update(expression_losses)
             self.log("train/gene_spots", float(count), on_step=True, on_epoch=True,
                      prog_bar=True, batch_size=len(batch["image"]))
-        if self.propagation is None or not any(
-            float(weights.get(name, 0)) for name in ("propagation", "propagation_initial")
-        ):
-            return
-        with torch.no_grad():
-            propagated = self.propagation(
-                batch["superpixels"].long(), output["features"], batch["image"],
-                batch["spot_labels"], batch["spots"], batch.get("propagation_graphs"),
-            )
-        if propagated is None:
-            return
-        indices, soft, valid, diagnostics = propagated
-        if float(self.image_cfg.loss_weights.get("propagation", 0)):
-            losses["propagation"] = soft_segmentation_loss(
-                output["logits"][indices], soft, valid
-            )
-        if "initial_logits" in output and float(self.image_cfg.loss_weights.get("propagation_initial", 0)):
-            losses["propagation_initial"] = soft_segmentation_loss(
-                output["initial_logits"][indices], soft, valid
-            )
-        self.log_dict(
-            {f"train/propagation/{name}": value for name, value in diagnostics.items()},
-            on_step=False,
-            on_epoch=True,
-            batch_size=len(indices),
-        )
 
     def training_step(self, batch) -> torch.Tensor:
         output = self(
             batch["image"], batch["patch"], batch["cls"], batch["pfm_mask"],
-            dense_expression=not bool(self.model.tissue_state_count),
+            dense_expression=False,
         )
         weights = self.image_cfg.loss_weights
         losses = image_losses(output, batch, weights)
-        losses.update(pfm_losses(output, batch, self.model.pfm_count, weights))
-        self._update_propagated_loss(losses, output, batch)
+        self._update_expression_loss(losses, output, batch)
 
         loss = cast(
             torch.Tensor,
@@ -135,13 +103,17 @@ class SegmentationModule(pl.LightningModule):
         logged_losses = {f"train/{name}": value for name, value in losses.items()}
         if "tissue_states" in output:
             states = output["tissue_states"].detach()
+            # 分块复用约 16 MiB 的 FP32 临时区，只统计日志，不修改状态图。
+            chunk_rows = max(1, 4_194_304 // (states.shape[0] * states.shape[1] * states.shape[3]))
+            entropy = states.new_zeros((), dtype=torch.float32)
+            for chunk in states.split(chunk_rows, dim=2):
+                terms = chunk.clamp_min(1e-8).log_().mul_(chunk)
+                entropy.sub_(terms.sum())
+                del terms
             usage = states.mean(dim=(0, 2, 3))
-            logged_losses["train/tissue_state_entropy"] = -(states * states.clamp_min(1e-8).log()).sum(dim=1).mean()
+            logged_losses["train/tissue_state_entropy"] = entropy / (states.shape[0] * states.shape[2] * states.shape[3])
             logged_losses["train/tissue_state_usage_entropy"] = -(usage * usage.clamp_min(1e-8).log()).sum()
             logged_losses["train/expression_amplitude_mean"] = output["expression_amplitude"].detach().mean()
-        if "refinement_gate" in output:
-            logged_losses["train/refinement_gate_mean"] = output["refinement_gate"].detach().mean()
-            logged_losses["train/refinement_residual_abs"] = output["refinement_residual"].detach().abs().mean()
         expression_names = {"train/gene_prediction", "train/gene_correlation"}
         self.log_dict(
             {name: value for name, value in logged_losses.items() if name in expression_names},
@@ -170,12 +142,6 @@ class SegmentationModule(pl.LightningModule):
 
     def configure_optimizers(self) -> OptimizerLRSchedulerConfig:
         image_parameters = list(self.model.named_parameters())
-        if self.propagation is not None:
-            # 独立调用传播模块时保留其参数分组。
-            image_parameters += [
-                (f"propagation.{name}", parameter)
-                for name, parameter in self.propagation.named_parameters()
-            ]
         decay, no_decay = [], []
         for name, parameter in image_parameters:
             if not parameter.requires_grad:
@@ -240,10 +206,9 @@ class SegmentationModule(pl.LightningModule):
         if self.validation_roots is None or self.tiling is None:
             return None
         gene_options = {}
-        segmentation_results = {}
         data_module = getattr(self.trainer, "datamodule")
-        evaluate_segmentation = slide.name in getattr(data_module, "test_names", [slide.name])
-        patient_evaluation = len(getattr(data_module, "expression_test_names", [])) > 1
+        evaluate_segmentation = slide.has_segmentation
+        multi_slide_evaluation = len(data_module.test_names) > 1
         if self.model.gene_count:
             gene_options = {
                 "gene_adata": data_module.val_gene_adata,
@@ -265,7 +230,6 @@ class SegmentationModule(pl.LightningModule):
             mpp=self.mpp,
             **gene_options,
             evaluate_segmentation=evaluate_segmentation,
-            segmentation_results=segmentation_results,
         )
         self._validation_metrics[slide.name] = metrics
         if self.visualization_dir is not None and evaluate_segmentation:
@@ -277,15 +241,13 @@ class SegmentationModule(pl.LightningModule):
                 labels,
                 valid,
                 self.label_scale,
-                initial_probability=segmentation_results.get("initial_probability"),
-                refinement_gate=segmentation_results.get("refinement_gate"),
             )
         self.log_dict(
             {
                 f"val/{name}": float(metrics[name])
                 for name in metrics
-                if name in {"loss", "dice", "iou", "hd95", "initial_loss", "initial_dice", "initial_iou", "initial_hd95", "refinement_dice_gain"}
-                or (name.startswith("gene_") and not patient_evaluation)
+                if name in {"loss", "dice", "iou"}
+                or (name.startswith("gene_") and not multi_slide_evaluation)
             },
             on_step=False,
             on_epoch=True,
@@ -312,7 +274,7 @@ class SegmentationModule(pl.LightningModule):
                 record.pop("dense_tissue", None)
         self.log("val/gene_prediction_pcc_macro", summary["macro"]["gene_prediction_pcc"],
                  prog_bar=True, batch_size=1)
-        if len(getattr(data_module, "expression_test_names", [])) <= 1:
+        if len(data_module.test_names) <= 1:
             return
         self.log_dict(
             {f"val/{key}": value for key, value in summary["micro"].items()},

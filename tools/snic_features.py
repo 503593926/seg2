@@ -114,11 +114,11 @@ def run_snic(
     raw_labels += 1
     raw_labels[~mask_crop] = 0
 
-    labels_crop = skimage.measure.label(
+    labels_crop = np.asarray(skimage.measure.label(
         raw_labels,
         background=0,
         connectivity=1,
-    ).astype(np.int32, copy=False)
+    ), dtype=np.int32)
 
     labels = cast(NDArray[np.int32], np.zeros(mask.shape, dtype=np.int32))
     labels[y0:y1, x0:x1] = labels_crop

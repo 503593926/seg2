@@ -1,3 +1,4 @@
+import gc
 import json
 from pathlib import Path
 from typing import cast
@@ -10,13 +11,8 @@ from PIL import Image
 from derive.dataset_config import load_dataset_config
 from derive.qc_visualize import qc_visualize_feature_map
 from pretrained_model.common import FeatureMapExtractor
-from pretrained_model.conch import CONCHExtractor
-from pretrained_model.genbio_pathfm import GenBioPathFMExtractor
-from pretrained_model.h_optimus_0 import HO0Extractor
 from pretrained_model.h_optimus_1 import HO1Extractor
-from pretrained_model.uni import UNIExtractor
 from pretrained_model.uni2 import UNI2Extractor
-from pretrained_model.virchow import VirchowExtractor
 from pretrained_model.virchow2 import Virchow2Extractor
 
 
@@ -65,69 +61,68 @@ def process_sample(
 def main() -> None:
     project_root = Path(__file__).resolve().parents[1]
     dataset_config = load_dataset_config()
+    # 与 segmodel 的 image_feature_maps 对应，逐个加载和释放基础模型。
+    extractor_types = [HO1Extractor, UNI2Extractor, Virchow2Extractor]
+    batch_size = 512
+    device = 'cuda'
 
     with open(project_root / 'config/resolution.yaml', 'r', encoding='utf-8') as f:
         resolution = cast(dict[str, float], yaml.safe_load(f))
     target_mpp = float(resolution['target_mpp'])
     tile_size = int(resolution['tile_size'])
-
-    # 可选 backbone: HO0Extractor / UNIExtractor / UNI2Extractor / VirchowExtractor /
-    # Virchow2Extractor / CONCHExtractor / GenBioPathFMExtractor
-    extractor = GenBioPathFMExtractor(
-        batch_size=512,
-        device='cuda',
-        tile_size=tile_size,
-        resize=True,
-        overlap_average=True,
-        overlap_cls=True,
-    )
-    patch_rows, _ = extractor.patch_grid
-    patch_mpp = extractor.tile_size * target_mpp / patch_rows
-    cls_mpp = extractor.cls_stride * target_mpp
-
-    # 提取配置进目录名, 换 backbone / tile / resize / overlap 都落在不同目录
-    model_tag = extractor.__class__.__name__.removesuffix('Extractor').lower()
-    config_tag = f'tile_{extractor.tile_size}_mpp_{target_mpp:g}_resize_{int(extractor.resize)}'
-    if extractor.overlap_average:
-        config_tag += '_overlap_1'
-    if extractor.overlap_cls:
-        config_tag += '_cls_overlap_1'
+    expression_names = cast(list[str], dataset_config['expression_names'])
 
     mpp_root = project_root / 'data' / dataset_config['dataset'] / f'{target_mpp:g}mpp'
     samples_root = mpp_root / 'samples'
-    output_root = mpp_root / f'feature_{model_tag}' / config_tag
-    output_root.mkdir(parents=True, exist_ok=True)
-
-    # 整次提取共用一个 mpp, 只写下游(segmodel)换算网格步长需要的两个值
-    metadata = {
-        'patch_mpp': patch_mpp,
-        'cls_mpp': cls_mpp,
-    }
-    (output_root / 'metadata.json').write_text(
-        json.dumps(metadata, ensure_ascii=False, indent=2) + '\n',
-        encoding='utf-8',
-    )
-
-    print(
-        f'Model: {extractor.__class__.__name__} | '
-        f'target {target_mpp:g} MPP | patch {patch_mpp:g} MPP | CLS {cls_mpp:g} MPP',
-        flush=True,
-    )
-    for name in dataset_config['names']:
-        process_sample(
-            extractor,
-            name,
-            spatial_dir=samples_root / name / 'spatial',
-            output_dir=output_root / name,
-            target_mpp=target_mpp,
+    for extractor_type in extractor_types:
+        extractor = extractor_type(
+            batch_size=batch_size,
+            device=device,
+            tile_size=tile_size,
+            resize=True,
+            overlap_average=True,
+            overlap_cls=False,
         )
+        patch_rows, _ = extractor.patch_grid
+        patch_mpp = extractor.tile_size * target_mpp / patch_rows
+        cls_mpp = extractor.cls_stride * target_mpp
 
-    qc_visualize_feature_map(
-        output_root,
-        dataset_config['names'],
-        patch_mpp=patch_mpp,
-        cls_mpp=cls_mpp,
-    )
+        # 提取配置进目录名，保留模型真实的 patch / CLS 网格。
+        model_tag = extractor.__class__.__name__.removesuffix('Extractor').lower()
+        config_tag = f'tile_{extractor.tile_size}_mpp_{target_mpp:g}_resize_{int(extractor.resize)}'
+        if extractor.overlap_average:
+            config_tag += '_overlap_1'
+        if extractor.overlap_cls:
+            config_tag += '_cls_overlap_1'
+        output_root = mpp_root / f'feature_{model_tag}' / config_tag
+        output_root.mkdir(parents=True, exist_ok=True)
+
+        metadata = {'patch_mpp': patch_mpp, 'cls_mpp': cls_mpp}
+        (output_root / 'metadata.json').write_text(
+            json.dumps(metadata, ensure_ascii=False, indent=2) + '\n',
+            encoding='utf-8',
+        )
+        print(
+            f'Model: {extractor.__class__.__name__} | '
+            f'target {target_mpp:g} MPP | patch {patch_mpp:g} MPP | CLS {cls_mpp:g} MPP',
+            flush=True,
+        )
+        for name in expression_names:
+            process_sample(
+                extractor,
+                name,
+                spatial_dir=samples_root / name / 'spatial',
+                output_dir=output_root / name,
+                target_mpp=target_mpp,
+            )
+        del extractor
+        gc.collect()
+        qc_visualize_feature_map(
+            output_root,
+            expression_names,
+            patch_mpp=patch_mpp,
+            cls_mpp=cls_mpp,
+        )
 
 
 if __name__ == '__main__':

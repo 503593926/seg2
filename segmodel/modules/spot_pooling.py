@@ -68,8 +68,10 @@ def collate_spot_pools(plans, shape):
 
 def pool_spot_batch(field, plan):
     """(B,C,H,W) → (有效 spot,C)，索引与归一化权重均已准备好。"""
-    pixels = field.float().permute(0, 2, 3, 1).reshape(-1, field.shape[1])
-    selected = pixels[plan["pixels"]] * plan["weights"][:, None]
+    # 用视图索引 batch 与像素，避免整图复制，并保持原反向的通道布局。
+    pixels = field.float().flatten(2).transpose(1, 2)
+    area = pixels.shape[1]
+    selected = pixels[plan["pixels"] // area, plan["pixels"] % area] * plan["weights"][:, None]
     return selected.new_zeros(plan["count"], field.shape[1]).index_add(0, plan["rows"], selected)
 
 

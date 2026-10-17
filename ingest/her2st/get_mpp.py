@@ -8,23 +8,26 @@ def main() -> None:
     save_path = project_root / 'data/her2st/mpp.csv'
     save_path.parent.mkdir(parents=True, exist_ok=True)
 
-    slice_names = ['A1', 'B1', 'C1', 'D1', 'E1', 'F1', 'G2', 'H1']
+    patient_names = ['A', 'B', 'C', 'D', 'E', 'F', 'G', 'H']
     spot_pitch_um = 200.0
 
     records: list[dict[str, object]] = []
-    for name in slice_names:
-        selection_path = raw_data_root / 'ST-spotfiles' / f'{name}_selection.tsv'
-        spatial = pd.read_csv(selection_path, sep='\t')
-        selected = spatial.loc[spatial['selected'] == 1].rename(
-            columns={'new_x': 'array_x', 'new_y': 'array_y'},
-        )
-        axis_fit, affine_fit = estimate_mpp_from_spatial(selected, spot_pitch_um)
-        records.append({
-            'name': name,
-            **axis_fit.add_prefix('axis_').to_dict(),
-            **affine_fit.add_prefix('affine_').to_dict(),
-        })
+    # 按患者查找全部切片，逐张估算原始图像的 MPP。
+    for patient_name in patient_names:
+        for selection_path in sorted((raw_data_root / 'ST-spotfiles').glob(f'{patient_name}*_selection.tsv')):
+            name = selection_path.stem.removesuffix('_selection')
+            spatial = pd.read_csv(selection_path, sep='\t')
+            selected = spatial.loc[spatial['selected'] == 1].rename(
+                columns={'new_x': 'array_x', 'new_y': 'array_y'},
+            )
+            axis_fit, affine_fit = estimate_mpp_from_spatial(selected, spot_pitch_um)
+            records.append({
+                'name': name,
+                **{f'axis_{key}': value for key, value in axis_fit.items()},
+                **{f'affine_{key}': value for key, value in affine_fit.items()},
+            })
 
+    # 保留切片名索引，供下游逐张缩放图像与空间坐标。
     table = pd.DataFrame(records).set_index('name').sort_index()
     table.to_csv(save_path)
 

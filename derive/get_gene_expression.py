@@ -13,7 +13,6 @@ from numpy.typing import NDArray
 from scipy.sparse import csr_matrix
 
 from derive.dataset_config import load_dataset_config
-from segmodel.dataset.splits import patient_folds
 
 
 def rank_genes(
@@ -48,7 +47,7 @@ def select_stable_svgs(
         sample.X = csr_matrix(sample.X, dtype=np.float32)
         sc.pp.normalize_total(sample, target_sum=target_sum)
         sc.pp.log1p(sample)
-        sample.obsm['spatial'] = sample.obs[['pixel_x', 'pixel_y']].to_numpy(
+        sample.obsm['spatial'] = cast(pd.DataFrame, sample.obs)[['pixel_x', 'pixel_y']].to_numpy(
             dtype=np.float64
         )
         sq.gr.spatial_neighbors_knn(
@@ -123,7 +122,8 @@ def select_hvgs(
         n_top_genes=n_top_genes,
         batch_key='name',
     )
-    selected = combined.var.loc[combined.var['highly_variable']].copy()
+    gene_stats = cast(pd.DataFrame, combined.var)
+    selected = gene_stats.loc[gene_stats['highly_variable']].copy()
     selected['selection_score'] = selected['variances_norm']
     selected['selection_rank'] = selected['highly_variable_rank']
     return selected
@@ -214,7 +214,7 @@ def select_genes(
         )
         sc.pp.normalize_total(combined, target_sum=target_sum)
         mean_expression: NDArray[np.floating] = np.asarray(
-            combined.X.mean(axis=0),
+            cast(csr_matrix | NDArray[np.floating], combined.X).mean(axis=0),
         ).reshape(-1).astype(np.float32)
         selected = rank_genes(
             common_genes,
@@ -275,7 +275,6 @@ def load_raw_gene_data(
             obs=obs,
             var=pd.DataFrame(index=counts.columns),
         )
-        sample_adata.uns['spatial_mpp'] = target_mpp
         sample_adatas[name] = sample_adata
 
     return sample_adatas
@@ -297,13 +296,15 @@ def process_gene_expression(
         fill_value=0,
     )
     combined = combined[:, common_genes].copy()
-    combined.X = csr_matrix(combined.X, dtype=np.float32)
-    combined.obs['normalization_total_counts'] = np.asarray(combined.X.sum(axis=1)).reshape(-1)
+    counts = csr_matrix(combined.X, dtype=np.float32)
+    combined.X = counts
+    obs = cast(pd.DataFrame, combined.obs)
+    obs['normalization_total_counts'] = np.asarray(counts.sum(axis=1)).reshape(-1)
     combined.obs_names = (
-        combined.obs['name'].astype(str)
+        obs['name'].astype(str)
         + ':'
-        + combined.obs['spot_id'].astype(str)
-    )
+        + obs['spot_id'].astype(str)
+    ).tolist()
     combined.obs_names.name = 'observation_id'
 
     sc.pp.normalize_total(combined, target_sum=target_sum)
@@ -313,7 +314,7 @@ def process_gene_expression(
     processed = combined[:, selected_genes].copy()
     processed.X = csr_matrix(processed.X, dtype=np.float32)
     processed.var = selected_gene_table.set_index('gene').loc[selected_genes].copy()
-    processed.obsm[f'spatial_{target_mpp:g}mpp'] = processed.obs[
+    processed.obsm[f'spatial_{target_mpp:g}mpp'] = cast(pd.DataFrame, processed.obs)[
         ['pixel_x', 'pixel_y']
     ].to_numpy(dtype=np.float32)
     return processed
@@ -321,7 +322,7 @@ def process_gene_expression(
 
 def prepare_tasks(
     sample_adatas: dict[str, ad.AnnData],
-    names: list[str],
+    sample_names: list[str],
     output_root: Path,
     n_top_genes: int,
     target_sum: float,
@@ -330,19 +331,16 @@ def prepare_tasks(
     target_mpp: float,
     union_rank_and_truncate: bool = False,
     *,
-    patient_loocv: bool = False,
-    evaluation_names: list[str] | None = None,
+    patient_names: list[str],
 ) -> None:
-    task1_root = output_root / ('task1_patient_loocv' if patient_loocv else 'task1_loocv')
-    task1_root.mkdir(parents=True, exist_ok=True)
+    """按患者留出选基因；所有切片使用训练患者确定的基因集合。"""
+    fold_root = output_root / 'patient_loocv'
+    fold_root.mkdir(parents=True, exist_ok=True)
 
-    folds = patient_folds(evaluation_names or names, names) if patient_loocv else [
-        {'train': [name for name in names if name != test_name], 'test': [test_name]}
-        for test_name in names
-    ]
-    for fold in folds:
-        test_name = fold['test'][0]
-        train_names = fold['train']
+    for test_patient in patient_names:
+        train_names = [name for name in sample_names if name[0] != test_patient]
+        test_names = [name for name in sample_names if name[0] == test_patient]
+        # 测试患者的所有切片均不参与基因筛选。
         train_adatas = {name: sample_adatas[name] for name in train_names}
         common_genes, selected_gene_table = select_genes(
             train_adatas,
@@ -353,99 +351,47 @@ def prepare_tasks(
             union_rank_and_truncate,
         )
         selected_genes: list[str] = selected_gene_table['gene'].tolist()
-        test_expression = fold.get('test_expression', fold['test'])
         missing_by_slide = {
             name: [gene for gene in selected_genes if gene not in sample_adatas[name].var_names]
-            for name in test_expression
+            for name in test_names
         }
-        missing_selected = sorted(set().union(*map(set, missing_by_slide.values())))
-
+        # 使用训练患者确定的基因集合处理全部切片。
         processed = process_gene_expression(
             sample_adatas,
-            names,
+            sample_names,
             common_genes,
             selected_gene_table,
             target_sum,
             target_mpp,
         )
 
+        valid_counts = cast(pd.DataFrame, processed.obs)['normalization_total_counts'].to_numpy() > 0
+        excluded_count = int((~valid_counts).sum())
+        processed = processed[valid_counts].copy()
+
+        # 保存划分、处理参数和表达评估需要的缺失基因信息。
         processed.uns.update(
-            {
-                'task': 'image_gene_to_mask',
-                'cross_validation': 'patient_loocv' if patient_loocv else 'loocv',
-                'test_name': test_name,
-                'train_names': train_names,
-                'gene_selection_mode': selection_mode,
-                'union_rank_and_truncate': union_rank_and_truncate,
-                'gene_selection_batch_key': 'name',
-                'n_top_genes': n_top_genes,
-                'target_sum': target_sum,
-                'missing_test_selected_genes': missing_selected,
-                'missing_test_selected_gene_count': len(missing_selected),
-            }
+            test_patient=test_patient,
+            train_names=train_names,
+            test_names=test_names,
+            gene_selection_mode=selection_mode,
+            n_top_genes=n_top_genes,
+            target_sum=target_sum,
+            union_rank_and_truncate=union_rank_and_truncate,
+            missing_selected_genes_by_slide={name: np.asarray(genes, dtype=str) for name, genes in missing_by_slide.items()},
         )
-        if patient_loocv:
-            valid_counts = processed.obs['normalization_total_counts'].to_numpy() > 0
-            excluded_count = int((~valid_counts).sum())
-            processed = processed[valid_counts].copy()
-            processed.uns.update(
-                test_patient=fold['test_patient'],
-                test_segmentation_names=fold['test'],
-                test_expression_names=test_expression,
-                missing_selected_genes_by_slide={name: np.asarray(genes, dtype=str) for name, genes in missing_by_slide.items()},
-                excluded_zero_count_spots=excluded_count,
-            )
         processed.write_h5ad(
-            task1_root / f'test_{test_name}.h5ad',
+            fold_root / f'test_{test_patient}.h5ad',
             compression='gzip',
         )
+        missing_count = len({gene for genes in missing_by_slide.values() for gene in genes})
         print(
-            f'[test={test_name}] common={len(common_genes)}, '
-            f'selected={len(selected_genes)}, missing_selected={len(missing_selected)}, '
+            f'[patient={test_patient}] common={len(common_genes)}, '
+            f'selected={len(selected_genes)}, missing_selected={missing_count}, '
+            f'excluded_zero_count_spots={excluded_count}, '
             f'shape={processed.shape}',
             flush=True,
         )
-
-    if patient_loocv:
-        return
-
-    common_genes, selected_gene_table = select_genes(
-        sample_adatas,
-        n_top_genes,
-        selection_mode,
-        target_sum,
-        svg_n_neighbors,
-        union_rank_and_truncate,
-    )
-    processed = process_gene_expression(
-        sample_adatas,
-        names,
-        common_genes,
-        selected_gene_table,
-        target_sum,
-        target_mpp,
-    )
-    processed.uns.update(
-        {
-            'task': 'image_gene_spot_labels_to_mask',
-            'names': names,
-            'gene_selection_mode': selection_mode,
-            'union_rank_and_truncate': union_rank_and_truncate,
-            'gene_selection_batch_key': 'name',
-            'n_top_genes': n_top_genes,
-            'target_sum': target_sum,
-        }
-    )
-    output_root.mkdir(parents=True, exist_ok=True)
-    processed.write_h5ad(
-        output_root / 'task2_all_slices.h5ad',
-        compression='gzip',
-    )
-    print(
-        f'[all slices] common={len(common_genes)}, '
-        f'selected={len(selected_gene_table)}, shape={processed.shape}',
-        flush=True,
-    )
 
 
 def main() -> None:
@@ -457,7 +403,8 @@ def main() -> None:
         resolution = cast(dict[str, float], yaml.safe_load(f))
 
     target_mpp = float(resolution['target_mpp'])
-    names = cast(list[str], dataset_config['names'])
+    sample_names = cast(list[str], dataset_config['expression_names'])
+    patient_names = cast(list[str], dataset_config['patient_names'])
     selection_mode = cast(str, gene_config['selection_mode'])
     n_top_genes = cast(int, gene_config['n_top_genes'])
     target_sum = cast(float, gene_config['target_sum'])
@@ -474,12 +421,12 @@ def main() -> None:
     )
     sample_adatas = load_raw_gene_data(
         mpp_root / 'samples',
-        names,
+        sample_names,
         target_mpp,
     )
     prepare_tasks(
         sample_adatas,
-        names,
+        sample_names,
         mpp_root / 'gene_expression',
         n_top_genes,
         target_sum,
@@ -487,6 +434,7 @@ def main() -> None:
         svg_n_neighbors,
         target_mpp,
         union_rank_and_truncate,
+        patient_names=patient_names,
     )
     print(f'Wrote {mpp_root / "gene_expression"}', flush=True)
 

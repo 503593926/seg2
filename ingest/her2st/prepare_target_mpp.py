@@ -34,10 +34,9 @@ def resize_discrete_mask(
     assert mask is not None
 
     background = 255 if path.name == "training_mask.png" else 0
-    mask_target_mpp = cv2.resize(
-        mask,
-        (full_width, full_height),
-        interpolation=cv2.INTER_NEAREST,
+    mask_target_mpp = cast(
+        NDArray[np.uint8],
+        cv2.resize(mask, (full_width, full_height), interpolation=cv2.INTER_NEAREST),
     )
 
     x0, y0, x1, y1 = bbox
@@ -63,7 +62,7 @@ def transform_spatial(
     tissue_mask: NDArray[np.uint8],
     spot_label_map: dict[str, int],
 ) -> pd.DataFrame:
-    """合并 spot 标注，统一标签并变换到裁剪后画布坐标系。"""
+    """合并可选类别标注和表达索引，将 spot 对齐到裁剪后画布。"""
     spatial = pd.read_csv(selection_path, sep="\t")
     required = {"x", "y", "pixel_x", "pixel_y", "selected"}
     missing = required.difference(spatial.columns)
@@ -135,17 +134,18 @@ def process_sample(
     spot_label_map: dict[str, int],
     tile_size: int = 112,
 ) -> None:
-    """为一个样本生成 target-MPP 空间数据。"""
-    detection_mpp = 2.0
+    """生成目标 MPP 图像、spot 元数据和原始 counts，并处理已有分割 mask。"""
+    detection_mpp = 4.0
     margin_um = 112
-    closing_diameter_um = 112.0
+    closing_diameter_um = 112
+    weak_threshold_ratio = 0.85  # 越小越放宽灰度阈值，接纳与组织相连的浅染区域
+    min_tissue_area_um2 = 100000.0  # 最小组织块面积：0.1 mm²
 
     name = str(mpp_record.name)
     output_dir = samples_root / name
     spatial_dir = output_dir / "spatial"
     masks_dir = output_dir / "masks"
     spatial_dir.mkdir(parents=True, exist_ok=True)
-    masks_dir.mkdir(parents=True, exist_ok=True)
     # 读取 H&E 并把整张图统一到目标 MPP 网格
     image_path = next((data_root / "ST-imgs" / name[0] / name).glob("*.jpg"))
     img_bgr = cv2.imread(str(image_path), cv2.IMREAD_COLOR)
@@ -155,7 +155,7 @@ def process_sample(
     mpp_y = float(mpp_record["axis_mpp_y"])
     scale_x = mpp_x / target_mpp
     scale_y = mpp_y / target_mpp
-    image_target_mpp = resize_image_to_mpp(img_bgr, mpp_x, mpp_y, target_mpp)
+    image_target_mpp = resize_image_to_mpp(cast(NDArray[np.uint8], img_bgr), mpp_x, mpp_y, target_mpp)
     full_height, full_width = image_target_mpp.shape[:2]
     del img_bgr
 
@@ -165,6 +165,8 @@ def process_sample(
         detection_mpp,
         closing_diameter_um,
         source_mpp=target_mpp,
+        weak_threshold_ratio=weak_threshold_ratio,
+        min_tissue_area_um2=min_tissue_area_um2,
     )
     bbox = tissue_bbox_in_image(
         tissue_detection,
@@ -180,10 +182,9 @@ def process_sample(
     padded_image = pad_to_tile(image_target_mpp[y0:y1, x0:x1], tile_size)
     canvas_height, canvas_width = padded_image.shape[:2]
 
-    tissue_target_mpp = cv2.resize(
-        tissue_detection,
-        (full_width, full_height),
-        interpolation=cv2.INTER_NEAREST,
+    tissue_target_mpp = cast(
+        NDArray[np.uint8],
+        cv2.resize(tissue_detection, (full_width, full_height), interpolation=cv2.INTER_NEAREST),
     )
     tissue_padded = pad_to_tile(tissue_target_mpp[y0:y1, x0:x1], tile_size, (0,))
     canvas_mask = np.zeros((canvas_height, canvas_width), dtype=np.uint8)
@@ -205,9 +206,10 @@ def process_sample(
         [cv2.IMWRITE_PNG_COMPRESSION, 9],
     )
 
-    # 病理标注 mask:逐个对齐到目标 MPP、裁剪、补齐
+    # 有病理标注的切片才生成分割 mask；表达切片继续处理图像和 spot。
     semantic_mask_target_mpp: NDArray[np.uint8] | None = None
     for source_mask_path in (mask_root / name).glob("*_mask.png"):
+        masks_dir.mkdir(parents=True, exist_ok=True)
         output_mask = resize_discrete_mask(
             source_mask_path,
             full_width,
@@ -220,7 +222,7 @@ def process_sample(
         if source_mask_path.name == "semantic_mask.png":
             semantic_mask_target_mpp = output_mask
 
-    # spot 坐标变换
+    # 保留全部 spot 元数据，无类别标注的位置使用 255，表达是否可用单独记录。
     selection_path = data_root / "ST-spotfiles" / f"{name}_selection.tsv"
     annotation_path = data_root / "ST-pat" / "lbl" / f"{name}_labeled_coordinates.tsv"
     count_path = data_root / "ST-cnts" / f"{name}.tsv.gz"
@@ -239,7 +241,7 @@ def process_sample(
         sep="\t",
         index=False,
     )
-    # process 阶段只读取 data 目录；counts 保持统一的 spot × gene TSV 格式。
+    # 保留原始 spot × gene counts，后续按训练 fold 选择基因并归一化。
     shutil.copyfile(count_path, output_dir / "gene_counts.tsv.gz")
 
     # QC 图
@@ -257,8 +259,11 @@ def process_sample(
 
 
 def main() -> None:
+    project_root = Path(__file__).resolve().parents[2]
     raw_data_root = Path("/home/yfm/data/bioinfo/her2st-master/data")
-    names = ["A1", "B1", "C1", "D1", "E1", "F1", "G2", "H1"]
+    data_root = project_root / "data/her2st"
+    mask_root = data_root / "original_mask"
+    patient_names = ["A", "B", "C", "D", "E", "F", "G", "H"]
 
     classes: list[ClassInfo] = [
         {"id": 1, "label": "invasive cancer", "rgb": (236, 28, 36)},
@@ -278,9 +283,6 @@ def main() -> None:
         "undetermined": 255,
     }
 
-    project_root = Path(__file__).resolve().parents[2]
-    data_root = project_root / "data/her2st"
-    mask_root = data_root / "original_mask/"
     with open(str(project_root / "config/resolution.yaml"), "r", encoding="utf-8") as f:
         resolution = cast(dict[str, float], yaml.safe_load(f))
     target_mpp: float = resolution["target_mpp"]
@@ -290,18 +292,21 @@ def main() -> None:
     samples_root.mkdir(parents=True, exist_ok=True)
 
     mpp_table = pd.read_csv(data_root / "mpp.csv", index_col=0)
-    for name in names:
-        print(f"[{name}] preparing {target_mpp}-MPP spatial data", flush=True)
-        process_sample(
-            raw_data_root,
-            samples_root,
-            mask_root,
-            cast(pd.Series, mpp_table.loc[name]),
-            target_mpp,
-            classes=classes,
-            spot_label_map=spot_label_map,
-            tile_size=tile_size,
-        )
+    # 与 get_mpp.py 使用相同的患者和切片遍历方式。
+    for patient_name in patient_names:
+        for selection_path in sorted((raw_data_root / "ST-spotfiles").glob(f"{patient_name}*_selection.tsv")):
+            name = selection_path.stem.removesuffix("_selection")
+            print(f"[{name}] preparing {target_mpp}-MPP spatial data", flush=True)
+            process_sample(
+                raw_data_root,
+                samples_root,
+                mask_root,
+                cast(pd.Series, mpp_table.loc[name]),
+                target_mpp,
+                classes=classes,
+                spot_label_map=spot_label_map,
+                tile_size=tile_size,
+            )
 
 
 if __name__ == "__main__":

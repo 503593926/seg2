@@ -1,12 +1,10 @@
-split_mode: loocv  # loocv | patient_loocv | transfer
-all_names: []
-expression_names: []
+split_mode: patient_loocv  # patient_loocv | transfer
+patient_names: []
 labeled_sampling_fraction: null
-ref_names: []
-tgt_names: []
 data_root: ""
 ref_dataset: ""
 tgt_dataset: ""
+gene_expression_file: '${.ref_dataset}_to_${.tgt_dataset}.h5ad'
 num_workers: 4
 persistent_workers: true
 prefetch_factor: 2

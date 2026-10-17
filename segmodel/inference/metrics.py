@@ -1,10 +1,7 @@
 import math
-from typing import cast
 
 import numpy as np
-from numpy.typing import NDArray
 import torch
-from scipy.ndimage import binary_erosion, distance_transform_edt
 
 
 def probability_loss(probability, target, valid):
@@ -19,29 +16,6 @@ def probability_loss(probability, target, valid):
         probability.sum(dtype=np.float64) + target.sum(dtype=np.float64) + 1
     )
     return float(bce + dice)
-
-
-def hd95(prediction, truth, valid, mpp=1.0):
-    prediction = np.asarray(prediction, bool) & valid
-    truth = np.asarray(truth, bool) & valid
-    if not prediction.any() and not truth.any():
-        return 0.0
-    if not prediction.any() or not truth.any():
-        return float("inf")
-    if np.array_equal(prediction, truth):
-        return 0.0
-    prediction_surface = prediction & ~cast(NDArray[np.bool_], binary_erosion(prediction | ~valid))
-    truth_surface = truth & ~cast(NDArray[np.bool_], binary_erosion(truth | ~valid))
-    if not prediction_surface.any() or not truth_surface.any():
-        return float("nan")
-    # sampling=mpp：把距离从"像素数"换算成微米，HD95 因此带物理单位
-    forward = cast(NDArray[np.float64], distance_transform_edt(~truth_surface, sampling=mpp))[
-        prediction_surface
-    ]
-    backward = cast(NDArray[np.float64], distance_transform_edt(~prediction_surface, sampling=mpp))[
-        truth_surface
-    ]
-    return float(np.percentile(np.concatenate((forward, backward)), 95))
 
 
 def scores_from_counts(tp, fp, fn, tn):
@@ -71,7 +45,7 @@ def scores_from_counts(tp, fp, fn, tn):
     }
 
 
-def segmentation_metrics(probability, labels, valid, threshold=0.5, mpp=1.0):
+def segmentation_metrics(probability, labels, valid, threshold=0.5):
     if probability.shape != labels.shape or labels.shape != valid.shape:
         raise ValueError("probability, labels and valid must have the same shape")
     valid = valid & (labels != 255)
@@ -86,7 +60,6 @@ def segmentation_metrics(probability, labels, valid, threshold=0.5, mpp=1.0):
         int(np.count_nonzero(~prediction & ~truth & valid)),
     )
     scores["loss"] = probability_loss(probability, truth, valid)
-    scores["hd95"] = hd95(prediction, truth, valid, mpp)
     return scores
 
 
@@ -96,21 +69,10 @@ def _summarize_head(metrics_list):
         for key in ("tp", "fp", "fn", "tn")
     ]
     macro_keys = ("loss", "dice", "iou")
-    distances = np.asarray([scores["hd95"] for scores in metrics_list])
-    defined_distances = distances[~np.isnan(distances)]
     return {
         "macro": {
-            **{
-                key: float(np.mean([scores[key] for scores in metrics_list]))
-                for key in macro_keys
-            },
-            "hd95": (
-                float(defined_distances.mean())
-                if defined_distances.size
-                else float("nan")
-            ),
-            "hd95_infinite_slides": int(np.isinf(distances).sum()),
-            "hd95_undefined_slides": int(np.isnan(distances).sum()),
+            key: float(np.mean([scores[key] for scores in metrics_list]))
+            for key in macro_keys
         },
         "micro": scores_from_counts(*counts),
     }

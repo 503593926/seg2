@@ -3,8 +3,9 @@ defaults:
   - _self_
 
 image:
+  batch_size: 4  # 1 mpp 状态图较大；保持 896 μm 的 crop 物理视野
+  accumulate_grad_batches: 1  # 每个优化器 step 累积的 batch 数
   loss_weights:
-    propagation: 0.0  # 唯一分割输出；沿用原先关闭修正时 1.0 + 0.5 的总权重
-    propagation_initial: 0.0  # 共享状态结构没有 P0/分割修正
+    segmentation: 0.5  # 使用整片动态传播缓存的伪标签
     gene_prediction: 1.0
     gene_correlation: 0.5
