@@ -1,62 +1,84 @@
 # segmodel
 
-当前唯一实验入口为 `her2st`：Stem 只变换通道、不做下采样，MoMu 条件 U-Net 在 1 mpp 网格输出特征，预测共享软组织状态，再解码分割与基因表达。使用患者隔离和混合监督训练。表达模板支持随机、NMF、K-means 及三种方式均分的混合初始化，并可选择继续训练或固定；状态预测与类别倾向仍随机初始化并参与训练。
+当前唯一实验入口为 `her2st`：Stem 只变换通道、不做下采样，MoMu 条件 U-Net 在 1 mpp 网格输出特征，预测共享软组织状态，再解码分割与基因表达。使用患者隔离和混合监督训练。表达模板仅使用 random 随机初始化，数量由 `template_init.random_count` 指定，全部参与训练。状态预测与类别倾向仍随机初始化并参与训练。
 
 ## 网络与监督
 
 ```text
-1 mpp H&E → Stem（3×3 Conv，stride=1，padding=1，3→64 + LayerNorm）
+1 mpp H&E → Stem（3×3 Conv，stride=1，padding=1，3→32 + LayerNorm）
                               ↓
            预计算基础模型特征 → MoMu 条件 U-Net
                               ↓
               编码 1→4→16→64 mpp，逐层解码到 1 mpp
                               ↓
-                        F（64 通道，1 mpp）
-                              ↓ 状态编码器（1×1 Conv，64→64，GELU）
-                   软状态 A（K=64，逐位置 softmax）与幅度 u
+                        F（32 通道，1 mpp）
+                              ↓ 状态编码器（1×1 Conv，32→32，GELU）
+                 软状态 A（默认 K=32，逐位置 softmax）与幅度 u
                          ├→ P = Σ_k A_k sigmoid(q_k) → 分割
                          └→ E_g = u Σ_k A_k B_kg → 非负线性表达图
 ```
 
-PFM 的 CLS 与 patch 特征分别经过各自投影和共享投影，再用于 MoMu 的 Top-k 路由、通道调制和空间调制。`model.image.output_scale: 1` 表示 Stem 的步长为 1，只变换通道；输入为 1 mpp 时输出为 1 mpp。设置为 7 可使用原 7×7、stride=7 Stem，同时需将 `resolution.label_mpp` 设为 7。相邻编码层由 `downsample_factor: 4` 控制，使用 4×4、stride=4 卷积；解码端使用对应的 4×4、stride=4 转置卷积，并融合高分辨率跳连。896 crop 的空间尺寸为 `896→224→56→14→56→224→896`，最终输出保持 1 mpp。该参数设为 2 可使用两倍采样。状态编码器使用一层 1×1 卷积和 GELU，将 F 映射到 `tissue_state_dim` 通道（当前为 64），再由两个 1×1 头分别预测 K 通道状态和 1 通道幅度。每个位置的状态权重非负且和为 1。全局表达模板 B 为 K×G，每行由模板 logits 的 softmax 得到，默认可训练，也可固定；类别倾向 q 为 K 个可学习 logits。两种输出必须使用同一张状态图 A，没有独立分割捷径或分割修正头。
+PFM 的 CLS 与 patch 特征分别经过各自投影和共享投影，再用于 MoMu 的 Top-k 路由、通道调制和空间调制。`model.image.output_scale: 1` 表示 Stem 的步长为 1，只变换通道；输入为 1 mpp 时输出为 1 mpp。设置为 7 可使用原 7×7、stride=7 Stem，同时需将 `resolution.label_mpp` 设为 7。相邻编码层由 `downsample_factor: 4` 控制，使用 4×4、stride=4 卷积；解码端使用双线性插值放大 4 倍和 3×3 卷积，并融合高分辨率跳连。896 crop 的空间尺寸为 `896→224→56→14→56→224→896`，最终输出保持 1 mpp。`output_scale: 2` 使用 3×3、stride=2、padding=1 的 Stem，将 1 mpp 输入映射到 2 mpp 输出。状态编码器使用一层 1×1 卷积和 GELU，将 F 映射到 `tissue_state_dim` 通道（当前为 32），再由两个 1×1 头分别预测 K 通道状态和 1 通道幅度。每个位置的状态权重非负且和为 1。全局表达模板 B 为 K×G，每行由模板 logits 的 softmax 得到；所有模板随机初始化并参与训练。类别倾向 q 为 K 个可学习 logits。两种输出必须使用同一张状态图 A，没有独立分割捷径或分割修正头。
 
 每个 stage 通过 `use_spatial` 统一控制内部所有 ConvNeXt block 的空间调制，global 调制始终保留。配置位于 `configs/model/base.yaml` 的 `image.encoder_spatial` 和 `image.decoder_spatial`，每个布尔值对应一个 stage。当前编码器顺序为 1、4、16、64 mpp，解码器顺序为 16、4、1 mpp；调整输出尺度或下采样倍数后，按新的 stage 尺度理解这些值。默认全部为 `false`，保持仅 global 调制。例如 `encoder_spatial: [false, true, true, false]` 只在编码器 4、16 mpp 两个 stage 开启空间调制。关闭的 stage 跳过空间插值、路由和调制；全部关闭时也跳过 patch 特征投影。开关随模型配置保存，独立推理时按相同设置重建。
 
 幅度 u = G×softplus(amplitude_logits)，使初始化的逐基因表达保持 O(1)；由于模板逐行归一化，u 等于该位置所选 G 个基因预测表达之和，不代表真实细胞密度或原始 UMI 总数。类别 logits 使用 logsumexp 计算混合类别概率的 log odds，避免 clamp 概率截断梯度；模板混合与相关损失使用 FP32，兼容 bf16-mixed。
 
-表达损失更新幅度、状态编码器和 MoMu，并在模板可训练时更新模板；分割损失更新类别倾向、状态编码器和 MoMu。共享状态实现任务耦合，但不会保证互相增益。学习到的状态也不能直接认定为细胞类型或真实细胞比例。1 mpp 是输出网格间距，spot 监督不能证明恢复了真实的 1 mpp 分子变化。当前仅接通细网格预测，尚未加入 cell 实例分割或 cell 聚合。
+表达损失更新模板、幅度、状态编码器和 MoMu；分割损失更新类别倾向、状态编码器和 MoMu。共享状态实现任务耦合，但不会保证互相增益。学习到的状态也不能直接认定为细胞类型或真实细胞比例。1 mpp 是输出网格间距，spot 监督不能证明恢复了真实的 1 mpp 分子变化。当前仅接通细网格预测，尚未加入 cell 实例分割或 cell 聚合。
 
-组织 mask 统一读取 `samples/<切片名>/spatial/tissue_mask.png`，不再回退到 `label_mpp` 旧目录。加载时直接读取组织 mask、伪标签、概率和 SNIC 缓存，不进行尺寸缩放。当前 1 mpp 流程由预处理保证这些数组与 H&E 和模型输出使用同一网格。
+输入与输出 MPP 相同时，组织 mask 继续读取 `samples/<切片名>/spatial/tissue_mask.png`，SNIC/伪标签使用原 `label_mpp/<切片名>/` 缓存。输出更粗时，组织 mask、专家标签、SNIC 和伪标签统一读取 `label_mpp/<label_mpp>mpp/<切片名>/`。训练加载只检查网格尺寸，不进行在线缩放。H&E、PFM 特征和表达 h5ad 始终保持输入网格；表达 spot 坐标与半径由 `label_scale` 换算一次。
+
+### 离线标签网格与 2 mpp 输出
+
+恢复的 `derive/get_label_mpp.py` 为所有表达切片和有标注切片准备标签网格：H&E 使用面积缩小，组织/画布/有效 mask 和 0/1/255 专家标签使用最近邻，另生成仅供离线 RW 使用的坐标表和 `grid.json`。超像素和伪标签随后直接在该网格重新生成，尺寸、吸附距离与 spot 可视化半径均按 `label_mpp` 换算，保留原物理单位。
+
+在项目根目录按以下顺序执行：
+
+```bash
+python -m derive.get_label_mpp
+python -m derive.get_superpixel
+python -m derive.get_pseudo_label
+```
+
+默认配置仍为 1 mpp。若使用 1 mpp 输入、2 mpp 癌症与表达输出，将 `config/resolution.yaml` 的 `label_mpp` 设为 `2.0`，并将 `segmodel/configs/model/her2st.yaml` 的 `image.output_scale` 设为 `2`，再执行上面三步。2 mpp 文件写入 `data/her2st/1mpp/label_mpp/2mpp/<切片名>/`；输入图像、特征和表达 h5ad 继续复用。896×896 输入产生 448×448 的 logits、状态图、幅度和稠密表达；整片概率与表达系数保留原生网格，验证真值也使用此网格，可视化不再二次缩小。此前 2×2、stride=2 Stem 的权重与当前 3×3 Stem 尺寸不同，加载旧权重时需要重新初始化 Stem。
+
+离线 `spatial_2mpp.tsv` 只供 SNIC/RW 流程；训练与表达评估仍读取 h5ad 中的输入分辨率坐标。表达圆盘聚合计算组织均值，网格变粗时不对表达数值乘除面积倍率。跨 MPP 比较分割指标时，应统一评估网格。脚本不会覆盖输入数据或其他 MPP 的缓存。
 
 表达头输出当前训练 fold 所选基因的稠密非负线性相对表达。对每个有效 spot，在其圆盘内仅对组织像素求均值，再 `log1p`，与真实 CP10k + log1p 表达计算 MSE 和逐基因相关性损失。真实表达只用于监督；表达损失独立于类别种子和 RW 图是否可解。
 
 每个 epoch 结束后，将当前模型的窗口 MoMu 特征 F 聚合到固定 SNIC 节点，并用该切片全部类别种子进行非可微随机游走传播。Lab 和 F 的节点均值分别标准化后计算边权，CPU 稀疏线性求解器计算癌概率。概率不高于 0.2 或不低于 0.8 的组织位置生成硬伪标签，其他位置忽略；无种子的连通分量保持 0.5。下一 epoch 的 crop 直接读取缓存的概率与监督范围，使用阈值化标签计算 BCE + Dice。
 
-训练总损失对三项监督按 `training.image.loss_weights` 加权：
+训练总损失对三项监督和一项状态用量正则按 `training.image.loss_weights` 加权：
 
 ```text
-L = w_seg × (BCE + Dice) + w_mse × MSE + w_pcc × mean(1 - PCC)
+L = w_seg × (BCE + Dice) + w_mse × MSE + w_pcc × mean(1 - regularized_PCC)
+    + w_balance × mean_k(max(0, log(alpha/K) - log(u_k)))
+u_k = (1 / |T|) Σ_{p∈T} A_{k,p}
 ```
 
-仅有表达的切片计算表达损失；有类别种子的切片还用整片传播的高置信伪标签计算分割损失。权重设为 0 即关闭对应监督。
+`T` 是 `batch["tissue"]`，覆盖所有组织像素，包括仅有表达的切片。`state_balance` 仅惩罚平均用量低于 `alpha/K` 的状态，达到下限后不再推动均匀分配。`training.image.state_balance_alpha` 默认 `0.1`，取值 `(0, 1]`；例如 K=32 时下限为 0.3125%。该参数控制用量下限，`loss_weights.state_balance` 独立控制惩罚强度，权重为 0 时关闭。损失非负且没有固定上界，与旧归一化 KL 的数值尺度不同，历史日志不能直接对比。统计从 `log_softmax` 在对数域归约，避免先 exp 再 clamp/log 导致极低用量状态失去恢复梯度；它仍不直接约束模板差异，也不能排除所有像素输出相同混合的解。
 
-PCC 在同一 crop 内沿 spot 维度逐基因计算，再对有效的 crop–基因项取平均，不跨切片混合相关性。每个 crop 默认至少需要 8 个有效 spot；少于该数量或真值标准差不超过 1e-6 的基因不贡献相关性损失，仍参与 MSE。常数预测不会被排除：对非恒定真值，相关性项为 1，并保留有限梯度。计算使用 FP32，可配合混合精度训练。
+仅有表达的切片计算表达损失；有类别种子的切片还用整片传播的高置信伪标签计算分割损失。权重设为 0 即关闭对应项。
+
+PCC 在 spot 表达完成 `log1p` 后，先将同一 slide 在当前 batch 中的全部有效 spot 合并，分别减去该 slide 的预测均值和真值均值，再将各 slide 的残差拼接，沿 spot 维度逐基因计算一次正则化 PCC，最后对有效基因的 `1-regularized_PCC` 取平均。两侧尺度使用 `sqrt(mean(residual²) + std_floor²)`，默认 `std_floor=0.02`，单位为 log1p 表达标准差；高方差时接近原 PCC，近零方差时平滑限制梯度。这样消除片间均值差异，保留片内变化；同一 slide 的多个 crop 共用均值，不是分别计算 crop PCC 再平均。默认每个 slide 在当前 batch 中合并后至少需要 8 个有效 spot，最低按 3 处理；不足门槛的 slide 组只跳过 PCC，仍参与 MSE。没有满足门槛的组时，PCC 损失为可反向传播的 0。真值残差均方不超过 1e-12 的基因不贡献相关性损失。片内恒定预测不会被排除：对有片内变化的真值，相关性项为 1，并保留经过软方差下限约束的梯度。MSE 仍使用原始 spot 表达，不做 slide 中心化。计算使用 FP32，可配合混合精度训练；梯度累积不扩大 PCC 的统计范围。
 
 RW 目标使用预测网格上的 MoMu 特征 F；软状态和预测表达图不参与 RW 边权计算。
 
 ## 训练吞吐优化
 
-共享状态结构训练时先在 spot 圆盘内聚合 `u × A`（K 通道），再乘 K×G 表达模板，得到 spot 的线性表达预测，随后计算 log1p、MSE 和 crop 内 PCC。由于模板不随空间位置变化，这与先解码稠密表达再求均值在数学上等价，避免训练时分配 B×G×H×W 基因场及其反向中间张量。整片验证/测试将窗口内 K 通道系数按逐像素 Hann 权重和归一化，在预测设备上用 FP64 流式累加到 spot，再转回 FP32、解码表达并计算指标。累加后除以整个 spot 圆盘内的组织像素数，保持先融合再取均值的定义；浮点求和顺序变化可能带来微小差异。仅在需要 dense 可视化时保留整片 K 通道系数，超过 256 MiB 的系数/特征拼接缓冲使用自动释放的临时文件映射。模型前向通过 `dense_expression=True` 返回稠密表达。
+共享状态结构训练时先在 spot 圆盘内聚合 `u × A`（K 通道），再乘 K×G 表达模板，得到 spot 的线性表达预测，随后计算 log1p、MSE 和按 slide 去均值后的 batch 正则化相关性损失。由于模板不随空间位置变化，这与先解码稠密表达再求均值在数学上等价，避免训练时分配 B×G×H×W 基因场及其反向中间张量。整片验证/测试将窗口内 K 通道系数按逐像素 Hann 权重和归一化，在预测设备上用 FP64 流式累加到 spot，再转回 FP32、解码表达并计算指标。累加后除以整个 spot 圆盘内的组织像素数，保持先融合再取均值的定义；浮点求和顺序变化可能带来微小差异。仅在需要 dense 可视化时保留整片 K 通道系数，超过 256 MiB 的系数/特征拼接缓冲使用自动释放的临时文件映射。模型前向通过 `dense_expression=True` 返回稠密表达。
 
 当前 1 mpp 使用 `crop_size: 896`（896 μm 视野）；训练和推理的 batch 大小分别由 `training.image.batch_size` 与 `dataset.inference_batch_size` 控制，训练通过 `accumulate_grad_batches` 控制每个优化器 step 累积的 batch 数。`gradient_checkpointing: true` 在训练反向时重算 ConvNeXt block、解码器上采样与跳连融合、共享状态预测头的激活，降低显存；融合与 block 分开 checkpoint，避免嵌套重算。沿用原 AMP 精度与随机数状态，不改变计算公式，以增加反向计算量换取显存。验证和推理不使用 checkpoint。训练 spot 聚合直接索引 NCHW 特征中的 batch 与像素位置，避免重排整幅特征的副本，仍先计算整幅 `u × A` 再按原权重聚合。相同网络深度在 1 mpp 下的局部卷积物理感受野比原 7 mpp 模式小，基础模型特征仍提供组织上下文。最终模型记录输出尺度与物理 MPP，可独立重建原生 1 mpp 输出。
 
 BF16 混合精度下，通道 LayerNorm 使用原生算子，前向将仿射参数临时转为输入 dtype，内部用 FP32 累积，输出保持 BF16；条件归一化先在 FP32 中计算，再转回输入精度。条件调制系数和 LayerScale 的 gamma 按特征 dtype 参与乘加，因此骨干 stage 与 skip 特征保持 BF16。参数及其梯度仍为 FP32，状态概率、模板混合和表达损失继续使用 FP32。BF16 残差相加会产生舍入误差，初始化很小的 LayerScale 分支可能被舍入；梯度仍回传到原参数。训练与独立推理应使用一致的精度设置评估结果。PFM patch 投影在 autocast 下直接使用输入，避免先将 FP16 特征扩展到 FP32 再转 BF16；未启用 autocast 时保留 FP32 输入转换，CLS 均值继续使用 FP32。
 
-位置状态熵日志在 detach 后按行分块计算，复用约 16 MiB 的 FP32 临时区，避免创建整幅状态图大小的 log 和乘积张量。统计公式与日志字段保持一致；分块求和可能改变日志的浮点末位，不参与训练损失，也不修改状态图。状态用量熵和平均幅度沿用原来的归约。
+位置状态熵和 valid 掩膜上的状态用量熵在 detach 后按行分块计算，复用约 16 MiB 的 FP32 临时区，避免创建整幅状态图大小的 log 和乘积张量；两者都是诊断，不参与训练损失，也不修改状态图。`state_balance` 在共享状态头内按同一分块预算计算组织掩膜上的 `logsumexp`，跨块以 `logaddexp` 合并，返回 K 维对数用量和组织像素数。统计处于状态头的 checkpoint 内，不额外返回完整对数状态图；启用 checkpoint 时反向重算统计中间张量。空组织块采用有限的占位归约后丢弃，避免全 `-inf` 归约产生 NaN 梯度；全空掩膜的损失和梯度均为 0。权重为 0 时在 `no_grad` 下统计，只写日志。平均幅度沿用原来的归约。
 
 CLS 特征按非重叠 tile 网格直接读取，patch 特征可以继续重叠平均。训练和推理的窗口起点同时对齐标签、patch 和 CLS 网格；推理步长取不超过半窗的对齐值，至少为一个网格步长。当前四层编码器的总下采样倍数为 64，crop 必须同时满足模型与 CLS 网格的整除要求；CLS 步长为 224 时，crop 应为 448 的倍数。当前 crop=896、推理步长=448。未指定 `drop_path` 时，每个编码层使用 0，编码器和解码器层数按通道列表构建。
 
 数据加载 worker 在几何增强后准备组织圆盘的像素索引和归一化权重，GPU 一次聚合整个 batch 的 spot。整片传播独立于训练计算图，训练步骤不再构造 RW 图或运行可微求解器。整片推理使用一个后台线程准备窗口，并通过 CUDA 拷贝流预取下一批锁页输入；按批次事件等待和记录使用流，保持原窗口顺序、batch 划分及融合权重，不增加预取配置。
+整片推理按 GPU 复用 CUDA 拷贝流，避免每张切片新建流后留下多组输入缓存。提前结束推理时取消尚未执行的预取。验证和动态传播阶段的开始、结束都会等待 CUDA 工作完成并归还空闲显存缓存，同时输出 `allocated` 和回收前后的 `reserved`（GiB），用于区分活跃张量累积与空闲缓存扩张。清理仅发生在阶段边界，不在每个 batch 执行；模型参数、优化器状态和 CPU 的 RW 图缓存继续保留。
+
 HER2ST 训练 DataLoader 当前配置为：
 
 ```yaml
@@ -67,6 +89,8 @@ pin_memory: false
 ```
 
 `num_workers=0` 时自动关闭持久化和预取。采样器把 epoch 与样本索引一起发送给 worker，避免预取使用旧的 epoch；有标注切片的癌概率、伪标签以及候选采样窗口使用共享存储，整片传播原地更新，因此 fork/spawn 常驻 worker 都能读取下一轮监督。固定超像素也使用共享存储，避免 spawn worker 复制整片数组。几何旋转和翻转先建立 NumPy 视图，最后合并成一次连续内存复制。训练结束时显式释放 worker，避免连续运行多个 fold 时保留整片数据。
+
+`dataset.slides_per_batch` 控制每个完整训练 batch 的不同切片数量，HER2ST 默认 `4`；它必须为正整数、不超过训练切片数，并整除 `training.image.batch_size`。例如 batch=8 时每张切片取 2 个 crop，batch=32 时每张取 8 个。设为 `null` 恢复每个 crop 独立随机选择切片。分组采样先选择互不重复的切片，再沿用 spot 引导采样，从同一切片的合法窗口中无放回选择起点；候选耗尽后允许再次使用，不强制窗口距离或无重叠，也不对重叠 crop 中的 spot 去重。`labeled_sampling_fraction` 在切片组层面分配数量，例如 4 张切片、比例 0.5 时选择 2 张有标注和 2 张仅表达切片；非整数数量随机舍入，某组切片不足时从另一组补齐。末尾不足一个 batch 时尽量均分，必要时减少切片数，保持 `samples_per_epoch` 不变。采样计划带有 epoch 和窗口坐标，持久化 worker 读取当前 RW 更新后的合法窗口和监督；现有 PCC 继续合并同一切片的有效 spot。
 
 大特征 batch 的多进程预取会同时占用共享内存和主进程中的锁页副本。WSL 的锁页内存可用量有限，HER2ST 使用 `prefetch_factor=1` 和 `pin_memory=false` 降低 Windows 主机内存压力；该开关不改变模型、损失或训练步数。通用 `dataset/base.yaml` 仍提供 `pin_memory=true`，可在其他环境中单独配置。
 
@@ -88,7 +112,7 @@ pin_memory: false
 | `modules/spot_pooling.py` | 稠密表达在 spot 圆盘内的组织均值 |
 | `training/segmentation_module.py` | 损失接线、优化器、学习率、EMA 和验证日志 |
 | `dynamic/callback.py` | 在固定超像素图上执行动态 RW，更新训练监督和采样窗口 |
-| `training/losses.py` | 最终分割 BCE + Dice、表达 MSE 与逐基因 PCC |
+| `training/losses.py` | 最终分割 BCE + Dice、表达 MSE 与逐基因正则化 PCC |
 | `inference/` | 滑窗拼接、分割/表达指标和结果可视化 |
 
 ## 配置入口
@@ -109,43 +133,28 @@ pin_memory: false
 
 划分和 `split.json` 只保留 `train_names`、`test_names` 两个样本名单，分别包含全部训练、测试切片。每张切片的 `has_segmentation` 根据 `masks/training_mask.png` 是否存在确定；表达使用全部切片，分割监督、分割评估和动态传播只使用有标注的切片。采样所需的标注索引在训练 Dataset 内按此属性生成。
 
-transfer 设置 `dataset.split_mode: transfer`、`ref_dataset`（源数据集）和 `tgt_dataset`（目标数据集）。切片分别从 `data/<数据集>/<target_mpp>mpp/samples/*/gene_counts.tsv.gz` 自动发现，有分割标注的切片通过 `masks/training_mask.png` 识别。表达文件默认读取 `data/<源集>_to_<目标集>/<源集>_to_<目标集>.h5ad`，文件名可通过 `gene_expression_file` 修改。该文件需使用源集确定的基因集合，`uns['train_names']` 记录源集训练切片，并包含源集、目标集的表达及坐标；切片名必须能区分源集与目标集。训练和模板初始化只使用源集，训练期间不读取目标集用于验证，训练结束后测试目标集。输出目录为 `seed_<seed>/<源集>_to_<目标集>/`。
+transfer 设置 `dataset.split_mode: transfer`、`ref_dataset`（源数据集）和 `tgt_dataset`（目标数据集）。切片分别从 `data/<数据集>/<target_mpp>mpp/samples/*/gene_counts.tsv.gz` 自动发现，有分割标注的切片通过 `masks/training_mask.png` 识别。表达文件默认读取 `data/<源集>_to_<目标集>/<源集>_to_<目标集>.h5ad`，文件名可通过 `gene_expression_file` 修改。该文件需使用源集确定的基因集合，`uns['train_names']` 记录源集训练切片，并包含源集、目标集的表达及坐标；切片名必须能区分源集与目标集。训练只使用源集，训练期间不读取目标集用于验证，训练结束后测试目标集。输出目录为 `seed_<seed>/<源集>_to_<目标集>/`。
 
-表达监督变换设置在 `training.image.expression_transform`，HER2ST 为 `log1p`。MSE 权重为 `training.image.loss_weights.gene_prediction`，相关性权重为 `training.image.loss_weights.gene_correlation`。将后者设为 `0.0` 即关闭相关性监督。最少有效 spot 数设置在 `training.image.gene_correlation_min_spots`，默认 8，最低按 3 处理。基因数从训练表达矩阵读取。
+表达监督变换设置在 `training.image.expression_transform`，HER2ST 为 `log1p`。MSE 权重为 `training.image.loss_weights.gene_prediction`，相关性权重为 `training.image.loss_weights.gene_correlation`。将后者设为 `0.0` 即关闭相关性监督。当前 batch 中每个 slide 组的最少有效 spot 数设置在 `training.image.gene_correlation_min_spots`，默认 8，最低按 3 处理。相关性标准差软下限设置在 `training.image.gene_correlation_std_floor`，默认 0.02。基因数从训练表达矩阵读取。
 
-表达模板初始化设置在 `configs/training/base.yaml` 的 `image.template_init.method`，支持 `random`、`nmf`、`kmeans` 和 `mix`。训练入口在每个 fold 开始时自动生成或读取缓存，无需单独运行脚本：
+表达模板数量设置在 `configs/training/base.yaml` 的 `image.template_init`：
 
 ```yaml
 template_init:
-  method: mix  # 三种方式均分；也支持单独使用 random、nmf、kmeans
-  trainable: true  # false：初始化后固定表达模板
-  min_counts: 100  # 仅模板拟合过滤低计数 spot；0 关闭
-  seed: 0
-  max_iter: 1000
-  kmeans_n_init: 10
-  smoothing: 0.01
-  cache_dir: outputs/template_initialization
+  random_count: 32  # 状态数 K；至少为 2，全部参与训练
 ```
 
-数据初始化只读取当前 fold 的训练切片表达。HER2ST 的 log1p 数据先通过 expm1 还原为归一化后的线性表达；NMF 取 K×G 非负成分，K-means 在线性表达空间聚类并取各组的线性表达均值。所选基因全部为零的 spot 不参与拟合。模板逐行归一化，并混入配置比例的均匀分布，再以 log(template) 写入模板 logits。类别倾向和状态/幅度预测头继续使用随机初始化。
-
-`template_init.min_counts` 默认 100，NMF、K-means 和 mix 拟合时仅使用 `obs['normalization_total_counts'] >= min_counts` 的训练 spot，阈值相等时保留，0 表示关闭此过滤。该字段记录归一化前、训练公共基因范围内的总 counts，不能从 CP10k/log1p 表达反推。启用过滤时若缺少该字段或训练计数非有限/为负，会明确报错。先过滤低 counts，再排除所选基因表达全零的 spot；若最终没有有效表达则停止并报告阈值。日志及初始化 JSON 记录输入数、低计数排除数、全零排除数和最终拟合数，阈值与过滤后表达内容进入缓存键，新配置自动使用新缓存。过滤仅作用于拟合输入，不修改 h5ad、训练/验证 spot、类别种子、采样或表达损失；random 初始化不读取计数或执行此过滤。
-
-`mix` 要求 K >= 3，将模板数量尽量均分给 random、NMF、K-means；不能整除时余数依次分配给 random、NMF。模板按随机、NMF、K-means 的顺序合并。例如 K=32 时为 11+11+10，K=63 时为 21+21+21，K=64 时为 22+21+21。随机部分使用 `template_init.seed` 的独立随机数生成器，按与解码器默认初始化相同的 `Normal(0, 0.5)` logit 分布生成；NMF/K-means 在同一份经过上述过滤的训练表达上拟合。三部分均逐行归一化并应用相同 smoothing，因此同一 fold/参数可以跨模型训练 seed 复用完整混合模板。`max_iter` 分别限制两种拟合算法的迭代次数，`kmeans_n_init` 控制其中的 K-means 拟合。初始化 JSON 记录三种模板数量和各自的生成/拟合诊断；新 mix 缓存版本自动与旧的 NMF/K-means 各半缓存区分，单独 nmf/kmeans 的已有缓存仍可复用。
-
-`template_init.trainable` 默认 `true`，模板随训练更新；设为 `false` 时，在创建 EMA 和优化器前冻结 `tissue_state_decoder.template_logits`，并将其排除在优化器参数组之外。四种初始化方式均支持该开关。固定模板时，表达损失仍通过模板更新状态/幅度头和骨干，类别倾向仍可训练；EMA 的模板也保持固定。该开关不改变拟合结果和缓存键，因此切换可训练性可以复用已有模板缓存；最终模型继续保存模板权重。
-
-拟合仅在 CPU 上执行并限制线程数。缓存位于 `project_root` 下的 `template_init.cache_dir`，按方法、训练切片、基因顺序、表达数据内容、状态数、拟合参数和软件版本区分；初始化 seed 独立于模型训练 seed，相同 fold 和参数可跨训练 seed 复用。每个使用数据初始化的 fold 还会保存 `template_initialization.npz`（初始模板、基因/训练切片顺序）和 `template_initialization.json`（方法、拟合诊断与缓存信息）。模板在创建 EMA 前写入，普通模型和 EMA 从同一表达模板开始；最终模型仍按原接口保存和独立推理。
+`random_count` 必须为至少 2 的整数，共享状态数 K 与其相等。模板 logits 在模型构建时按 `Normal(0, 0.5)` 初始化，使用本次训练的随机种子 `seeds`。相同训练 seed 可以复现初始化；不同训练 seed 会得到不同模板。模板逐行 softmax 后用于表达解码，普通模型与 EMA 从相同权重开始。
 
 学习率在每次优化器更新后按 step 调度：先从 `0.1 × lr` 线性预热到 `lr`，再余弦衰减到 `0`。`training.image.warmup_steps` 只表示预热占总优化器更新次数的比例，取值范围 `[0, 1]`，实际预热步数为 `ceil(总步数 × warmup_steps)`；例如 `0.1` 表示前 10% 的训练步数用于预热，`0` 表示不预热，`1` 表示全程线性预热。总步数取 Lightning 的实际估计，考虑梯度累积、batch 限制和 `max_steps`。例如 2560 samples/epoch、batch size 16、100 epochs、`warmup_steps=0.1` 在单 GPU、无梯度累积时对应总计 16000 step、预热 1600 step。学习率不再使用 `warmup_epochs`；整片动态传播的周期和预热仍按 epoch 计数。
 
-进度条通过 `training.image.progress_every_n_steps` 控制训练指标的显示间隔，默认每 100 个优化器 step 刷新一次，首个 step 和每轮末尾也刷新。显示当前 batch 的 Loss、Dice、IoU、表达 MSE 损失（`gene_prediction`）、相关性损失 1−PCC（`gene_correlation`）、有效 spot 数（`gene_spots`），以及全局 step 和科学计数法显示的当前学习率；表达损失仅显示已启用的项。梯度累积期间按优化器更新次数计数，epoch 汇总日志继续保留，验证指标仍在验证时更新。
+进度条通过 `training.image.progress_every_n_steps` 控制训练指标的显示间隔，默认每 100 个优化器 step 刷新一次，首个 step 和每轮末尾也刷新。显示当前 batch 的 Loss、Dice、IoU、表达 MSE 损失（`gene_prediction`）、正则化相关性损失（`gene_correlation`）、有效 spot 数（`gene_spots`），以及全局 step 和科学计数法显示的当前学习率；表达损失仅显示已启用的项。梯度累积期间按优化器更新次数计数，epoch 汇总日志继续保留，验证指标仍在验证时更新。
 
-当前默认模型设置：`tissue_state_count=64`、`tissue_state_dim=64`。G 从当前 fold 的训练表达矩阵读取。模板 `tissue_state_decoder.template_logits` 和类别倾向 `tissue_state_decoder.class_logits` 随模型权重保存，可分别 softmax/sigmoid 后查看。
+当前默认模型设置：K=32、`tissue_state_dim=32`。G 从当前 fold 的训练表达矩阵读取。模板权重保存在 `tissue_state_decoder.template_logits`，对每行执行 softmax 得到表达模板。类别倾向通过 `tissue_state_decoder.class_logits.sigmoid()` 查看。最终模型保存状态总数 K，可通过保存的配置与权重独立重建。
 
-在 `configs/model/her2st.yaml` 中设置共享软状态数 `tissue_state_count >= 2`。`tissue_state_dim` 是状态编码器的隐藏通道数，与模板数量 K 不同。
+在 `configs/training/base.yaml` 中设置 `template_init.random_count` 以确定共享状态数 K；`configs/model/her2st.yaml` 中的 `tissue_state_dim` 是状态编码器的隐藏通道数，与模板数量 K 不同。
 
-训练损失只有 `segmentation`、`gene_prediction` 和 `gene_correlation`，分别控制最终分割 BCE + Dice、表达 MSE 和逐基因 1−PCC。表达单任务将分割权重设为 0；共享状态的分割单任务将表达 MSE/PCC 都设为 0，仍构造相同状态和模板参数，没有表达监督时不能将模板解释为学到的分子模式。
+训练损失只有 `segmentation`、`gene_prediction`、`gene_correlation` 和 `state_balance`，分别控制最终分割 BCE + Dice、表达 MSE、逐基因正则化相关性损失和状态用量正则。表达单任务将分割权重设为 0；共享状态的分割单任务将表达 MSE/PCC 都设为 0，仍构造相同状态和模板参数，没有表达监督时不能将模板解释为学到的分子模式。
 
 ## 整片动态传播
 
@@ -158,13 +167,13 @@ interval_epochs: 1
 save_intermediate: true
 ```
 
-`warmup_epochs` 指定首次更新的 epoch，当前为 2：前两轮使用离线伪标签，第 2 个 epoch 结束后首次传播，第 3 个 epoch 开始使用新监督。之后按 `interval_epochs` 更新，没有轮数上限，与验证周期和学习率预热独立。超像素固定使用预处理生成的 `label_mpp/<切片名>/snic/superpixels.npy`。每张切片首次更新时缓存图拓扑、标准化后的 Lab 节点均值、吸附后的 spot 与种子投票结果、可求解节点和滑窗权重和；恢复回调状态时重建这些缓存，训练结束后释放。每轮重新计算当前模型的节点特征、边权和 RW 概率。
+`warmup_epochs` 指定首次更新的 epoch，当前为 2：前两轮使用离线伪标签，第 2 个 epoch 结束后首次传播，第 3 个 epoch 开始使用新监督。之后按 `interval_epochs` 更新，没有轮数上限，与验证周期和学习率预热独立。超像素固定使用当前标签网格的 `snic/superpixels.npy`，例如 2 mpp 使用 `label_mpp/2mpp/<切片名>/snic/superpixels.npy`。每张切片首次更新时缓存图拓扑、标准化后的 Lab 节点均值、吸附后的 spot 与种子投票结果、可求解节点和滑窗权重和；恢复回调状态时重建这些缓存，训练结束后释放。每轮重新计算当前模型的节点特征、边权和 RW 概率。
 
 仅处理当前 fold 中有类别种子的训练切片，使用普通模型当前的 F（`feature_key="features"`）进行整片滑窗推理。传播图使用分别标准化的 Lab/F 节点均值，`learned_weight=1.0` 按通道数平衡 F 与 Lab，`beta=1.0` 控制边权核。类别种子按 `max_snap_distance_um=100.0` 吸附到组织边缘，冲突种子不固定节点。无种子的连通分量保持不确定。超像素的尺寸和紧凑度由离线预处理配置决定。
 
 有效更新只提交癌概率和 0/1/255 伪标签，并刷新候选训练窗口，超像素数组始终固定；只记录覆盖率比和重叠区翻转率，不设质量接受门槛。概率非有限或没有可用训练窗口时保留上一轮监督。更新留在训练内存中，不写回离线数据。动态回调由 `dynamic.enabled` 控制，独立于损失权重；分割权重为 0 时仍生成传播结果，启用分割训练需设置 `training.image.loss_weights.segmentation`。
 
-动态传播不再分配或读写整片 H×W×C 特征场。每个窗口的 F 按原 Hann 权重除以逐像素的总权重后，在预测设备上用 FP64 累加到节点，最后按节点像素数求均值，仅将节点表传回 CPU。窗口位置、步长、融合权重和最终 1 mpp 超像素标签保持原定义；浮点求和顺序变化可能带来微小数值差异。模型概率图和 QC 输出保持原流程。RW 前向只计算 F 和分割 logits，跳过表达状态的 exp、幅度头和模板归一化；dense 表达可视化仍使用原来的整片系数拼接。
+动态传播不再分配或读写整片 H×W×C 特征场。每个窗口的 F 按原 Hann 权重除以逐像素的总权重后，在预测设备上用 FP64 累加到节点，最后按节点像素数求均值，仅将节点表传回 CPU。窗口位置、步长与融合权重保持原定义，F、概率和超像素统一使用配置的预测网格；浮点求和顺序变化可能带来微小数值差异。RW 前向只计算 F 和分割 logits，跳过表达状态的 exp、幅度头和模板归一化；dense 表达可视化仍使用原来的整片系数拼接。
 
 每次有效更新仅保存下面两个文件到 `<fold>/dynamic_pseudo_labels/epoch_0002/A1/` 等目录，`save_intermediate: false` 关闭保存：
 
@@ -177,7 +186,7 @@ save_intermediate: true
 
 HER2ST 在 `dataset.patient_names` 中填写患者字母，按列表顺序执行患者留出。表达切片从 `data_root/samples/*/gene_counts.tsv.gz` 自动发现，只使用所选患者；存在 `masks/training_mask.png` 的切片用于分割监督和评估，无需维护 `all_names` 或 `expression_names`。当前数据自动识别为 36 张表达切片、8 张标注切片。例如留出 C 患者时，C1–C6 全部排除在训练之外，C1 评估分割，C1–C6 都评估表达。表达预处理直接使用患者名单，按患者名保存 `gene_expression/patient_loocv/test_C.h5ad`，对应实验目录为 `seed_<seed>/test_C/`，不依赖该患者是否有分割标注。
 
-每个表达文件保存全部切片在当前 fold 基因集合上的表达。`uns` 保留 `train_names`、`test_names`、`test_patient`、选基因和归一化参数，以及评估需要的 `missing_selected_genes_by_slide`；不再写入旧任务名、测试切片名、分割/表达名单及重复的缺失基因汇总。归一化前总 counts 继续保存在 `obs['normalization_total_counts']`，供表达模板初始化过滤低计数 spot。
+每个表达文件保存全部切片在当前 fold 基因集合上的表达。`uns` 保留 `train_names`、`test_names`、`test_patient`、选基因和归一化参数，以及评估需要的 `missing_selected_genes_by_slide`；不再写入旧任务名、测试切片名、分割/表达名单及重复的缺失基因汇总。归一化前总 counts 继续保存在 `obs['normalization_total_counts']`，用于数据检查。
 
 其他患者的有标注切片和仅有表达切片混合采样，比例由 `dataset.labeled_sampling_fraction` 控制；设为 `null` 时从全部训练切片等概率抽取。仅表达切片没有类别种子，不贡献分割监督，但其有效 spot 参与表达损失。基因选择和归一化基因集合由训练患者决定，留出患者不参与选择。
 
@@ -196,7 +205,7 @@ HER2ST 在 `dataset.patient_names` 中填写患者字母，按列表顺序执行
 
 常数预测、常数真值及观测不足的基因不参与 PCC；缺失基因值不当作真实零表达。
 
-训练日志分别记录未加权的 `train/gene_prediction`（MSE）和 `train/gene_correlation`（平均 1-PCC），后者越低越好；没有可计算的相关性项时为 0。总损失 `train/loss` 使用配置权重。另记录 `train/gene_spots`、启用的分割损失、整片传播覆盖率和翻转率记录。共享状态额外记录逐位置状态熵 `train/tissue_state_entropy`、batch 平均状态用量的熵 `train/tissue_state_usage_entropy` 和平均幅度 `train/expression_amplitude_mean`；两个熵均使用自然对数，取值范围约为 0 到 ln(K)。低用量熵提示少数状态占主导，高位置熵可能表示状态混合接近均匀，不能只凭熵判断质量。验证使用 EMA 模型，最终保存和测试使用普通模型。验证表达 MSE、RMSE、PCC 的定义保持不变，训练相关性项使用 crop 内统计，验证 PCC 使用整片或整患者统计。
+训练日志分别记录未加权的 `train/gene_prediction`（MSE）和 `train/gene_correlation`（平均 1-regularized_PCC），后者越低越好；没有可计算的相关性项时为 0。总损失 `train/loss` 使用配置权重。另记录 `train/gene_spots`、启用的分割损失、整片传播覆盖率和翻转率记录。共享状态额外记录逐位置状态熵 `train/tissue_state_entropy`（按全部像素统计）、valid 像素上平均状态用量的熵 `train/tissue_state_usage_entropy` 和平均幅度 `train/expression_amplitude_mean`；两个熵均使用自然对数，取值范围约为 0 到 ln(K)。`train/state_balance` 是组织掩膜上的最低用量损失（所有状态用量达到 alpha/K 时为 0，无固定上界），只有权重非 0 时进入 `train/loss`；`train/state_effective_states = exp(H_tissue)` 是同一掩膜上的有效状态数。注意三种统计的掩膜不同：位置熵用全部像素，usage 熵用 valid 像素，`state_balance`/`state_effective_states` 用组织像素，不能直接横向比较。低用量熵提示少数状态占主导，高位置熵可能表示状态混合接近均匀，不能只凭熵判断质量；最低用量损失也可能被“每个像素都均匀混合”的退化解降低。验证使用 EMA 模型，最终保存和测试使用普通模型。验证表达 MSE、RMSE、PCC 的定义保持不变，训练相关性项使用 batch 内按 slide 中心化的残差，验证 PCC 使用整片或整患者统计。
 
 每个 fold 保存 `config.yaml`、`split.json`、`metrics.csv`、`validation/`、`final_model.pt`、`test/<slide>/` 和 `metrics.json`。训练日志 `metrics.csv` 直接保存在 fold 目录。整片传播有效更新时额外保存 `dynamic_pseudo_labels/epoch_<轮次>/<训练切片>/`。有分割评估的切片保存概率图和掩码；表达评估保存 `gene_predictions.npz`。
 

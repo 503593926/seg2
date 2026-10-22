@@ -1,3 +1,5 @@
+from numbers import Integral
+
 import torch
 from torch import nn
 from torch.utils.checkpoint import checkpoint
@@ -37,7 +39,7 @@ class SegmentationModel(nn.Module):
         global_dim=256,
         spatial_dim=32,
         skip_drop_path=0.1,
-        drop_path=None,
+        drop_path=(0.1, 0.1, 0.2, 0.3),
         backbone_init="pytorch",
         tissue_state_count=64,
         tissue_state_dim=96,
@@ -50,6 +52,8 @@ class SegmentationModel(nn.Module):
         super().__init__()
         if backbone_init not in ("pytorch", "convnext"):
             raise ValueError(f"Unknown backbone_init: {backbone_init!r}; use 'pytorch' or 'convnext'")
+        if not isinstance(tissue_state_count, Integral) or tissue_state_count < 2:
+            raise ValueError("tissue_state_count (template_init.random_count) must be an integer of at least 2")
         self.pfm_patch_dims = tuple(pfm_patch_dims)
         self.pfm_cls_dims = tuple(pfm_cls_dims)
         self.pfm_count = len(self.pfm_patch_dims)
@@ -59,8 +63,6 @@ class SegmentationModel(nn.Module):
         self.downsample_factor = int(downsample_factor)
         if self.output_scale not in (1, 2, 7) or self.output_scale != output_scale:
             raise ValueError("output_scale must be 1, 2 or 7 input pixels per prediction")
-        if self.tissue_state_count < 2:
-            raise ValueError("tissue_state_count must be at least 2")
 
         self.stem = Stem(
             in_chans=3,
@@ -70,7 +72,7 @@ class SegmentationModel(nn.Module):
         self.unet = ConvNeXtUnet(
             encoder_chans=encoder_chans,
             decoder_chans=decoder_chans,
-            drop_path=(0.0,) * len(encoder_chans) if drop_path is None else drop_path,
+            drop_path=drop_path,
             blocks=2,
             global_dim=global_dim,
             spatial_dim=spatial_dim,
@@ -93,8 +95,6 @@ class SegmentationModel(nn.Module):
         )
 
         if backbone_init == "convnext":
-            # 先完成原初始化, 再局部重置; 保持其他分支、后续投影头和训练 RNG 不变。
-            # 模型在 CPU 构建, 这里只隔离 CPU 随机数状态。
             with torch.random.fork_rng(devices=[]):
                 init_convnext_backbone(self.stem)
                 init_convnext_backbone(self.unet)
@@ -105,7 +105,17 @@ class SegmentationModel(nn.Module):
                 self.feature_channels, self.gene_count, self.tissue_state_count, tissue_state_dim,
             )
 
-    def forward(self, image, patch, cls, available=None, *, dense_expression=True, compute_expression=True):
+    def forward(
+        self,
+        image,
+        patch,
+        cls,
+        available=None,
+        dense_expression=True,
+        compute_expression=True,
+        state_usage_mask=None,
+        state_usage_grad=True
+    ):
         # PFM 投影为 MoMu 条件特征，屏蔽不可用的输入。
         task_global = self.global_projector(
             [value.float().mean(dim=(-2, -1)) for value in cls]
@@ -132,7 +142,8 @@ class SegmentationModel(nn.Module):
         # 分割、表达与整片动态传播共用 MoMu 特征。
         output = {"features": decoded_fm}
         # 状态头整体重算，避免保存多张全分辨率 FP32 中间状态图。
-        decoder_args = (decoded_fm, dense_expression, compute_expression)
+        decoder_args = (decoded_fm, dense_expression, compute_expression,
+                        state_usage_mask, state_usage_grad)
         if self.gradient_checkpointing and self.training and torch.is_grad_enabled():
             states = checkpoint(self.tissue_state_decoder, *decoder_args, use_reentrant=False)
         else:

@@ -6,7 +6,7 @@ geometry:
   vertical_flip_probability: 0.5
 
 stain:
-  probability: 0.0
+  probability: 0.2
   method: random_preset   # random_preset、preset
   preset: null  # null、standard
   intensity_scale_range: [0.8, 1.2]
@@ -15,17 +15,17 @@ stain:
   tissue_only: true
 
 brightness:
-  probability: 0.0
+  probability: 0.2
   multiplier_range: [0.8, 1.2]
   tissue_only: true
 
 contrast:
-  probability: 0.0
+  probability: 0.2
   factor_range: [0.8, 1.2]
   tissue_only: true
 
 low_resolution:
-  probability: 0.0
+  probability: 0.2
   scale_range: [0.5, 1.0]
   tissue_only: false
 

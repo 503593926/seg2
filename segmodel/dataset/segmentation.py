@@ -1,9 +1,9 @@
+from collections.abc import Iterator
+
 import cv2
 import numpy as np
 import torch
 from torch.utils.data import Dataset, Sampler, default_collate
-
-from segmodel.modules.spot_pooling import collate_spot_pools, prepare_spot_pool
 
 from segmodel.dataset.augment import (
     augment_geometry,
@@ -11,19 +11,62 @@ from segmodel.dataset.augment import (
     get_augmented_inputs,
     pfm_mask,
 )
+from segmodel.modules.spot_pooling import collate_spot_pools, prepare_spot_pool
+
 
 class EpochSampler(Sampler):
-    """把 epoch 放进任务索引，预取和持久化 worker 不依赖本地 epoch 副本。"""
+    """把 epoch 和可选的分组 crop 计划发给 worker。"""
 
-    def __init__(self, dataset):
+    def __init__(self, dataset, batch_size=1, slides_per_batch=None):
         self.dataset = dataset
+        self.batch_size = int(batch_size)
+        self.slides_per_batch = slides_per_batch
+        if slides_per_batch is not None:
+            if isinstance(slides_per_batch, bool) or not isinstance(slides_per_batch, int):
+                raise ValueError("slides_per_batch must be an integer or null")
+            if not 1 <= slides_per_batch <= min(self.batch_size, len(dataset.slide_names)):
+                raise ValueError("slides_per_batch must be between 1 and min(batch_size, training slides)")
+            if self.batch_size % slides_per_batch:
+                raise ValueError("batch_size must be divisible by slides_per_batch")
+            fraction = dataset.dataset_cfg.get("labeled_sampling_fraction")
+            if fraction is not None and not 0 < float(fraction) < 1:
+                raise ValueError("labeled_sampling_fraction must be between 0 and 1")
 
     def set_epoch(self, epoch):
         self.dataset.epoch = int(epoch)
 
-    def __iter__(self):
+    def __iter__(self) -> Iterator[tuple]:
         epoch = self.dataset.epoch
-        return iter((epoch, index) for index in range(len(self.dataset)))
+        if self.slides_per_batch is None:
+            yield from ((epoch, index) for index in range(len(self.dataset)))
+            return
+        for start in range(0, len(self.dataset), self.batch_size):
+            count = min(self.batch_size, len(self.dataset) - start)
+            rng = np.random.default_rng(np.random.SeedSequence([self.dataset.seed, epoch, start, 1]))
+            names = self._sample_slides(rng, min(self.slides_per_batch, count))
+            crops, extra = divmod(count, len(names))
+            index = start
+            for position, name in enumerate(names):
+                for top, left in self.dataset._sample_slide_origins(name, crops + (position < extra), rng):
+                    yield epoch, index, name, top, left
+                    index += 1
+
+    def _sample_slides(self, rng, count):
+        dataset = self.dataset
+        fraction = dataset.dataset_cfg.get("labeled_sampling_fraction")
+        if fraction is None or not dataset.labeled_names or not dataset.expression_only_names:
+            return rng.choice(dataset.slide_names, size=count, replace=False).tolist()
+        expected = count * float(fraction)
+        labeled_count = int(np.floor(expected)) + int(rng.random() < expected % 1)
+        # 某组切片不足时，从另一组补足，保持 batch 内切片互不重复。
+        labeled_count = min(max(labeled_count, count - len(dataset.expression_only_names)),
+                            len(dataset.labeled_names))
+        names = (
+            rng.choice(dataset.labeled_names, size=labeled_count, replace=False).tolist()
+            + rng.choice(dataset.expression_only_names, size=count - labeled_count, replace=False).tolist()
+        )
+        rng.shuffle(names)
+        return names
 
     def __len__(self):
         return len(self.dataset)
@@ -39,7 +82,7 @@ class SegmentationDataset(Dataset):
         seed=0,
     ):
         self.slides = slides
-        self.slide_names = sorted(list(slide_names))
+        self.slide_names = sorted(slide_names)
         self.labeled_names = [name for name in self.slide_names if slides[name].has_segmentation]
         self.expression_only_names = [name for name in self.slide_names if not slides[name].has_segmentation]
         self.gene_expression = torch.from_numpy(gene_adata.X)
@@ -146,9 +189,9 @@ class SegmentationDataset(Dataset):
         return int(self.dataset_cfg.samples_per_epoch)
 
     def __getitem__(self, index):
-        epoch, index = index if isinstance(index, tuple) else (self.epoch, index)
+        epoch, index, *origin = index if isinstance(index, tuple) else (self.epoch, index)
         rng = np.random.default_rng(np.random.SeedSequence([self.seed, epoch, index]))
-        name, top, left = self._sample_origin(rng)
+        name, top, left = origin if origin else self._sample_origin(rng)
         sample = get_augmented_inputs(
             self.slides[name],
             top,
@@ -181,21 +224,31 @@ class SegmentationDataset(Dataset):
                 raise ValueError("labeled_sampling_fraction must be between 0 and 1")
             names = self.labeled_names if rng.random() < float(fraction) else self.expression_only_names
         name = names[int(rng.integers(len(names)))]
+        top, left = self._sample_slide_origins(name, 1, rng)[0]
+        return name, top, left
+
+    def _sample_slide_origins(self, name, count, rng):
         origins = self.crop_origins[name]
         if name in self.shared_crop_origins:
-            buffer, count = self.shared_crop_origins[name]
-            origins = buffer[:int(count)].numpy()
-        index = int(rng.integers(len(origins)))
+            buffer, valid_count = self.shared_crop_origins[name]
+            origins = buffer[:int(valid_count)].numpy()
         spot_data = self.spots_by_slide[name]
-
         fraction = float(self.augment_cfg.sampling.spot_sampling_fraction)
         expression_only = not self.slides[name].has_segmentation
-        if len(spot_data["coords"]) and (expression_only or (self.augment_cfg.enabled and rng.random() < fraction)):
-            center = spot_data["coords"][int(rng.integers(len(spot_data["coords"])))]
-            desired = center[::-1] - self.crop_size / 2
-            index = int(np.argmin(((origins - desired) ** 2).sum(axis=1)))
-        top, left = origins[index]
-        return name, int(top), int(left)
+        available = np.arange(len(origins))
+        selected = []
+        for _ in range(count):
+            if not len(available):
+                available = np.arange(len(origins))
+            index = int(rng.integers(len(available)))
+            if len(spot_data["coords"]) and (expression_only or (self.augment_cfg.enabled and rng.random() < fraction)):
+                center = spot_data["coords"][int(rng.integers(len(spot_data["coords"])))]
+                desired = center[::-1] - self.crop_size / 2
+                index = int(np.argmin(((origins[available] - desired) ** 2).sum(axis=1)))
+            top, left = origins[available[index]]
+            selected.append((int(top), int(left)))
+            available = np.delete(available, index)
+        return selected
 
     def _supervision(self, name, top, left):
         slide = self.slides[name]
@@ -225,6 +278,7 @@ class SegmentationDataset(Dataset):
         keep = ((local >= radius) & (local <= self.crop_size - 1 - radius)).all(axis=1)
         indices = torch.from_numpy(spot_data["indices"][keep])
         return {
+            "slide": name,
             "spots": torch.from_numpy(local[keep].astype(np.float32)),
             "gene_expression": self.gene_expression[indices],
             "spot_labels": self.spot_labels[indices],

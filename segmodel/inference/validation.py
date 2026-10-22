@@ -8,18 +8,21 @@ import torch
 from segmodel.inference.metrics import expression_metrics, segmentation_metrics
 from segmodel.inference.predictor import predict_slide
 from segmodel.modules.spot_pooling import pool_spot_expression, prepare_spot_pool
+from tools.label_grid import label_grid_root
 
 
-def load_expert_masks(root, slide):
-    sample = Path(root) / "samples" / slide.name
+def load_expert_masks(root, slide, mpp=1.0):
+    sample = (Path(root) / "samples" if slide.label_scale == 1 else
+              label_grid_root(root, mpp, float(mpp) * slide.label_scale)) / slide.name
     labels = np.asarray(cv2.imread(str(sample / "masks/training_mask.png"), cv2.IMREAD_GRAYSCALE))
     valid = np.asarray(cv2.imread(str(sample / "masks/valid_mask.png"), cv2.IMREAD_GRAYSCALE)) > 0
     canvas = np.asarray(cv2.imread(str(sample / "spatial/canvas_mask.png"), cv2.IMREAD_GRAYSCALE)) > 0
     if any(
-        array.shape != (slide.height, slide.width) for array in (labels, valid, canvas)
+        array.shape != (slide.height // slide.label_scale, slide.width // slide.label_scale)
+        for array in (labels, valid, canvas)
     ):
         raise ValueError(
-            f"{slide.name}: expert masks must match the target-resolution H&E canvas"
+            f"{slide.name}: expert masks must match the prediction grid"
         )
     if not np.isin(labels, (0, 1, 255)).all():
         raise ValueError(f"{slide.name}: training_mask must contain only 0/1/255")
@@ -61,9 +64,13 @@ def validate_slide(
         missing = getattr(gene_adata, "uns", {}).get("missing_selected_genes_by_slide", {}).get(slide.name, [])
         if len(missing):
             observed[:, torch.from_numpy(np.isin(gene_adata.var_names, missing))] = False
+        tissue_root = (Path(root) / "samples" if slide.label_scale == 1 else
+                       label_grid_root(root, mpp, float(mpp) * slide.label_scale))
         tissue = torch.from_numpy(np.asarray(cv2.imread(
-            str(Path(root) / "samples" / slide.name / "spatial/tissue_mask.png"), cv2.IMREAD_GRAYSCALE,
+            str(tissue_root / slide.name / "spatial/tissue_mask.png"), cv2.IMREAD_GRAYSCALE,
         )) > 0)
+        if tissue.shape != (slide.height // slide.label_scale, slide.width // slide.label_scale):
+            raise ValueError(f"{slide.name}: tissue mask must match the prediction grid")
         if factorized:
             # 按整片像素位置排序，窗口内只扫描对应行范围的 spot 像素。
             plan = prepare_spot_pool(tissue, spots, spot_radius_px, slide.label_scale)
@@ -119,6 +126,6 @@ def validate_slide(
             device=device, batch_size=batch_size, return_features=False,
         )
     if evaluate_segmentation:
-        labels, valid = load_expert_masks(root, slide)
+        labels, valid = load_expert_masks(root, slide, mpp)
         metrics = {**segmentation_metrics(probability, labels, valid, threshold=threshold), **metrics}
     return probability, metrics

@@ -3,10 +3,10 @@
   top_k: 2
   encoder_chans: [32, 64, 128, 256]
   decoder_chans: [128, 64, 32]
-  downsample_factor: 4  # 相邻编码层缩小 4 倍，解码层同步放大 4 倍
+  downsample_factor: 2  # 相邻编码层缩小 4 倍，解码层同步放大 4 倍
   global_dim: 128
-  spatial_dim: 128
+  spatial_dim: 64
   # 每个值控制整个 stage 的 spatial 调制，global 调制始终保留。
-  encoder_spatial: [false, false, true, false]  # 依次为 1、4、16、64 mpp
-  decoder_spatial: [true, false, false]  # 依次为 16、4、1 mpp
-  skip_drop_path: 0.0
+  encoder_spatial: [false, false, false, true]  # 依次为 2、4、8、16 mpp
+  decoder_spatial: [false, false, false]  # 依次为8、4、2 mpp
+  skip_drop_path: 0.1

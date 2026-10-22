@@ -4,6 +4,8 @@ import torch
 from torch import nn
 from torch.nn import functional as F
 
+from segmodel.modules.state_usage import state_log_usage
+
 
 class TissueStateDecoder(nn.Module):
     def __init__(self, in_channels, gene_count, state_count=32, hidden_dim=96):
@@ -17,12 +19,13 @@ class TissueStateDecoder(nn.Module):
         )
         self.state_head = nn.Conv2d(hidden_dim, state_count, 1)
         self.amplitude_head = nn.Conv2d(hidden_dim, 1, 1)
-        # 默认随机初始化；训练入口可用 NMF/K-means 覆盖，并选择是否训练模板。
+        # 全部模板随机初始化，并与状态头一起训练。
         self.template_logits = nn.Parameter(torch.empty(state_count, gene_count).normal_(std=0.5))
         # 避免所有类别倾向相同，使首次分割反向就能更新状态权重。
         self.class_logits = nn.Parameter(torch.empty(state_count).uniform_(-2, 2))
 
-    def forward(self, features, dense_expression=True, compute_expression=True):
+    def forward(self, features, dense_expression=True, compute_expression=True,
+                state_usage_mask=None, state_usage_grad=True):
         latent = self.encoder(features)
         state_logits = self.state_head(latent)
         amplitude_logits = self.amplitude_head(latent) if compute_expression else None
@@ -30,6 +33,11 @@ class TissueStateDecoder(nn.Module):
         # 混合、模板归一化和概率转 logits 使用 FP32，兼容 AMP。
         with torch.autocast(device_type=features.device.type, enabled=False):
             log_states = state_logits.float().log_softmax(dim=1)
+            if state_usage_mask is not None:
+                # 在 checkpoint 内归约，只返回 K 维统计，不额外保留完整 log_states。
+                with torch.set_grad_enabled(torch.is_grad_enabled() and state_usage_grad):
+                    log_usage, pixels = state_log_usage(log_states, state_usage_mask)
+                output.update(tissue_state_log_usage=log_usage, tissue_state_pixels=pixels)
             # RW 只使用 F 和分割概率；训练保留原表达分支的运算顺序。
             if amplitude_logits is not None:
                 states = log_states.exp()

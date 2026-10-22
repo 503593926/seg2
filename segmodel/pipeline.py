@@ -20,7 +20,6 @@ from segmodel.models.segmentation import SegmentationModel
 from segmodel.dynamic.callback import DynamicPropagationCallback
 from segmodel.training.callbacks import DatasetEpochCallback, MetricsBelowRichProgressBar
 from segmodel.training.segmentation_module import SegmentationModule
-from segmodel.training.template_initialization import initialize_expression_templates
 
 
 def run_fold(fold, seed, cfg, output_dir):
@@ -80,19 +79,13 @@ def _train_segmentation(cfg, data_module, tiling, output_dir):
     if int(model_options["output_scale"]) != label_scale:
         raise ValueError("model.image.output_scale must match resolution.label_mpp / target_mpp")
     model_options["gene_count"] = data_module.train_gene_adata.n_vars
+    model_options["tissue_state_count"] = train_cfg.template_init.random_count
     model = SegmentationModel(
         pfm_patch_dims=slide.patch_dims,
         pfm_cls_dims=slide.cls_dims,
         **model_options,
     )
     model.gene_names = list(map(str, data_module.train_gene_adata.var_names))
-    template_cfg = train_cfg.template_init
-    if str(template_cfg.method).lower() != "random":
-        initialize_expression_templates(
-            model, data_module.train_gene_adata, data_module.train_names, template_cfg,
-            expression_transform=str(train_cfg.expression_transform),
-            project_root=Path(str(cfg.project_root)), output_dir=output_dir,
-        )
     module = SegmentationModule(
         model,
         train_cfg,
@@ -138,7 +131,6 @@ def _train_segmentation(cfg, data_module, tiling, output_dir):
 
 
 def _save_final_model(cfg, model, tiling, output_dir):
-    """保存权重与重建所需信息，让 checkpoint 自描述（供外部单跑推理）。"""
     model_config = cast(
         dict[str, Any],
         OmegaConf.to_container(cfg.experiment.model.image, resolve=True),
@@ -146,6 +138,7 @@ def _save_final_model(cfg, model, tiling, output_dir):
     model_config["pfm_patch_dims"] = list(model.pfm_patch_dims)
     model_config["pfm_cls_dims"] = list(model.pfm_cls_dims)
     model_config["gene_count"] = model.gene_count
+    model_config["tissue_state_count"] = model.tissue_state_count
     model_config["output_scale"] = model.output_scale
     model_config["gradient_checkpointing"] = model.gradient_checkpointing
     model_config["downsample_factor"] = model.downsample_factor

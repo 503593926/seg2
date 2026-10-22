@@ -10,12 +10,15 @@ from torchmetrics.classification import BinaryF1Score, BinaryJaccardIndex
 
 from segmodel.inference.validation import load_expert_masks, validate_slide
 from segmodel.inference.metrics import summarize_expression_metrics
+from segmodel.inference.memory import release_inference_cache
 from segmodel.inference.visualization import save_prediction_result, save_top_gene_predictions
+from segmodel.modules.state_usage import STATE_USAGE_CHUNK_ELEMENTS
 from segmodel.training.augment import cutmix_batch, mixup_batch
 from segmodel.training.losses import (
     image_losses,
     gene_prediction_losses,
     segmentation_loss,
+    state_balance_loss,
 )
 
 
@@ -34,15 +37,16 @@ class SegmentationModule(pl.LightningModule):
     ):
         super().__init__()
         self.model = model
-        template_cfg = image_cfg.get("template_init", {})
-        model.tissue_state_decoder.template_logits.requires_grad_(
-            bool(template_cfg.get("trainable", True))
-        )
         self.ema_model = deepcopy(model).requires_grad_(False)
         self.ema_model.eval()
         self._last_ema_step = 0
         self.image_cfg = image_cfg
         self.augment_cfg = augment_cfg
+        if float(image_cfg.get("loss_weights", {}).get("state_balance", 0)) < 0:
+            raise ValueError("loss_weights.state_balance must be nonnegative")
+        self.state_balance_alpha = float(image_cfg.get("state_balance_alpha", 0.1))
+        if not 0 < self.state_balance_alpha <= 1:
+            raise ValueError("state_balance_alpha must be in (0, 1]")
         self.validation_roots = validation_roots
         self.tiling = tiling
         self.mpp = mpp
@@ -58,8 +62,10 @@ class SegmentationModule(pl.LightningModule):
         self.train_dice = BinaryF1Score(threshold=0.5)
         self.train_iou = BinaryJaccardIndex(threshold=0.5)
 
-    def forward(self, image, patch, cls, pfm_mask=None, *, dense_expression=True):
-        return self.model(image, patch, cls, pfm_mask, dense_expression=dense_expression)
+    def forward(self, image, patch, cls, pfm_mask=None, *, dense_expression=True,
+                state_usage_mask=None, state_usage_grad=True):
+        return self.model(image, patch, cls, pfm_mask, dense_expression=dense_expression,
+                          state_usage_mask=state_usage_mask, state_usage_grad=state_usage_grad)
 
     def _update_expression_loss(self, losses, output, batch):
         """全部有效训练 spot 监督表达。"""
@@ -69,19 +75,32 @@ class SegmentationModule(pl.LightningModule):
                 output, batch, self.spot_radius_px, self.label_scale, self.expression_transform,
                 weights=weights,
                 correlation_min_spots=int(self.image_cfg.gene_correlation_min_spots),
+                correlation_std_floor=float(self.image_cfg.gene_correlation_std_floor),
             )
             losses.update(expression_losses)
             self.log("train/gene_spots", float(count), on_step=True, on_epoch=True,
                      prog_bar=True, batch_size=len(batch["image"]))
 
     def training_step(self, batch) -> torch.Tensor:
+        weights = self.image_cfg.loss_weights
+        balance_weight = float(weights.get("state_balance", 0))
         output = self(
             batch["image"], batch["patch"], batch["cls"], batch["pfm_mask"],
-            dense_expression=False,
+            dense_expression=False, state_usage_mask=batch["tissue"],
+            state_usage_grad=bool(balance_weight),
         )
-        weights = self.image_cfg.loss_weights
         losses = image_losses(output, batch, weights)
         self._update_expression_loss(losses, output, batch)
+
+        tissue_log_usage = tissue_pixels = None
+        if "tissue_states" in output:
+            tissue_log_usage = output["tissue_state_log_usage"]
+            tissue_pixels = output["tissue_state_pixels"]
+            losses["state_balance"] = state_balance_loss(
+                tissue_log_usage, tissue_pixels, alpha=self.state_balance_alpha,
+            )
+        elif balance_weight:
+            raise RuntimeError("state_balance is enabled but the model returned no tissue_states")
 
         loss = cast(
             torch.Tensor,
@@ -103,16 +122,33 @@ class SegmentationModule(pl.LightningModule):
         logged_losses = {f"train/{name}": value for name, value in losses.items()}
         if "tissue_states" in output:
             states = output["tissue_states"].detach()
+            valid = batch["valid"].to(dtype=states.dtype)
             # 分块复用约 16 MiB 的 FP32 临时区，只统计日志，不修改状态图。
-            chunk_rows = max(1, 4_194_304 // (states.shape[0] * states.shape[1] * states.shape[3]))
+            chunk_rows = max(1, STATE_USAGE_CHUNK_ELEMENTS // (states.shape[0] * states.shape[1] * states.shape[3]))
             entropy = states.new_zeros((), dtype=torch.float32)
-            for chunk in states.split(chunk_rows, dim=2):
+            usage = states.new_zeros(states.shape[1], dtype=torch.float32)
+            valid_pixels = states.new_zeros((), dtype=torch.float32)
+            for chunk, valid_chunk in zip(
+                states.split(chunk_rows, dim=2), valid.split(chunk_rows, dim=2),
+            ):
                 terms = chunk.clamp_min(1e-8).log_().mul_(chunk)
                 entropy.sub_(terms.sum())
                 del terms
-            usage = states.mean(dim=(0, 2, 3))
+                usage.add_((chunk * valid_chunk).sum(dim=(0, 2, 3)))
+                valid_pixels.add_(valid_chunk.sum())
+            usage = usage / valid_pixels.clamp_min(1)
             logged_losses["train/tissue_state_entropy"] = entropy / (states.shape[0] * states.shape[2] * states.shape[3])
             logged_losses["train/tissue_state_usage_entropy"] = -(usage * usage.clamp_min(1e-8).log()).sum()
+            if tissue_log_usage is not None:
+                assert tissue_pixels is not None
+                log_usage_tissue = tissue_log_usage.detach()
+                usage_tissue = log_usage_tissue.exp()
+                tissue_entropy = -(usage_tissue * log_usage_tissue).sum()
+                logged_losses["train/state_effective_states"] = torch.where(
+                    tissue_pixels > 0,
+                    tissue_entropy.exp(),
+                    usage_tissue.new_zeros(()),
+                )
             logged_losses["train/expression_amplitude_mean"] = output["expression_amplitude"].detach().mean()
         expression_names = {"train/gene_prediction", "train/gene_correlation"}
         self.log_dict(
@@ -200,6 +236,7 @@ class SegmentationModule(pl.LightningModule):
     def on_validation_epoch_start(self):
         self._validation_metrics = {}
         self._validation_expression = {}
+        release_inference_cache(self.device, f"validation epoch {self.current_epoch + 1} begin")
 
     def validation_step(self, slide, batch_index):
         # 留出切片验证使用 EMA; 最终测试使用的模型由 pipeline 决定。
@@ -233,7 +270,7 @@ class SegmentationModule(pl.LightningModule):
         )
         self._validation_metrics[slide.name] = metrics
         if self.visualization_dir is not None and evaluate_segmentation:
-            labels, valid = load_expert_masks(self.validation_roots[slide.name], slide)
+            labels, valid = load_expert_masks(self.validation_roots[slide.name], slide, self.mpp)
             save_prediction_result(
                 self.visualization_dir / f"epoch_{self.current_epoch + 1:04d}",
                 slide.image,
@@ -257,31 +294,34 @@ class SegmentationModule(pl.LightningModule):
         return metrics
 
     def on_validation_epoch_end(self):
-        data_module = getattr(self.trainer, "datamodule")
-        summary = summarize_expression_metrics(self._validation_metrics, self._validation_expression)
-        if not summary:
-            return
-        top_n = int(self.image_cfg.get("gene_visualization_top_n", 10))
-        if self.visualization_dir is not None and top_n > 0 and self.trainer.is_global_zero:
-            save_top_gene_predictions(
-                self.visualization_dir / f"epoch_{self.current_epoch + 1:04d}" / "gene_expression",
-                self._validation_expression, list(map(str, data_module.val_gene_adata.var_names)),
-                data_module.val_slides, top_n=top_n, spot_radius_px=self.spot_radius_px,
-                expression_transform=self.expression_transform,
+        try:
+            data_module = getattr(self.trainer, "datamodule")
+            summary = summarize_expression_metrics(self._validation_metrics, self._validation_expression)
+            if not summary:
+                return
+            top_n = int(self.image_cfg.get("gene_visualization_top_n", 10))
+            if self.visualization_dir is not None and top_n > 0 and self.trainer.is_global_zero:
+                save_top_gene_predictions(
+                    self.visualization_dir / f"epoch_{self.current_epoch + 1:04d}" / "gene_expression",
+                    self._validation_expression, list(map(str, data_module.val_gene_adata.var_names)),
+                    data_module.val_slides, top_n=top_n, spot_radius_px=self.spot_radius_px,
+                    expression_transform=self.expression_transform,
+                )
+                for record in self._validation_expression.values():
+                    record.pop("dense_expression", None)
+                    record.pop("dense_tissue", None)
+            self.log("val/gene_prediction_pcc_macro", summary["macro"]["gene_prediction_pcc"],
+                     prog_bar=True, batch_size=1)
+            if len(data_module.test_names) <= 1:
+                return
+            self.log_dict(
+                {f"val/{key}": value for key, value in summary["micro"].items()},
+                prog_bar=True, batch_size=1,
             )
-            for record in self._validation_expression.values():
-                record.pop("dense_expression", None)
-                record.pop("dense_tissue", None)
-        self.log("val/gene_prediction_pcc_macro", summary["macro"]["gene_prediction_pcc"],
-                 prog_bar=True, batch_size=1)
-        if len(data_module.test_names) <= 1:
-            return
-        self.log_dict(
-            {f"val/{key}": value for key, value in summary["micro"].items()},
-            prog_bar=True, batch_size=1,
-        )
-        for name, metrics in summary["slides"].items():
-            self.log_dict({f"val/{name}/{key}": value for key, value in metrics.items()}, batch_size=1)
+            for name, metrics in summary["slides"].items():
+                self.log_dict({f"val/{name}/{key}": value for key, value in metrics.items()}, batch_size=1)
+        finally:
+            release_inference_cache(self.device, f"validation epoch {self.current_epoch + 1} end")
 
 
     def on_train_batch_end(self, outputs, batch, batch_idx):

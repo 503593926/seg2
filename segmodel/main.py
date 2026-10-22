@@ -11,7 +11,6 @@ def get_folds(cfg: DictConfig) -> list[dict]:
     dataset_cfg = cfg.experiment.dataset
     project_root = Path(str(cfg.project_root))
     if dataset_cfg.split_mode == "patient_loocv":
-        # 按患者确定全部训练和测试切片。
         data_root = project_root / str(dataset_cfg.data_root)
         samples_root = data_root / "samples"
         sample_names = sorted(
@@ -31,7 +30,6 @@ def get_folds(cfg: DictConfig) -> list[dict]:
                 "gene_path": data_root / str(dataset_cfg.gene_expression_dir) / f"{fold_name}.h5ad",
             })
     elif dataset_cfg.split_mode == "transfer":
-        # 源集全部训练，目标集统一测试；每个 seed 只生成一个实验。
         data_base = project_root / "data"
         mpp_dir = f"{float(cfg.resolution.target_mpp):g}mpp"
         ref_root = data_base / str(dataset_cfg.ref_dataset) / mpp_dir

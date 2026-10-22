@@ -16,6 +16,7 @@ from tools.propagate_random_walker import (
     save_random_walker_topology,
 )
 from tools.pseudo_label import build_pseudo_mask, snap_spots_to_tissue
+from tools.label_grid import label_grid_root
 
 def _write_image(
     path: Path,
@@ -29,7 +30,7 @@ def process_sample(
     processing_root: Path,
     samples_root: Path,
     name: str,
-    target_mpp: float,
+    label_mpp: float,
     ratio: float,
     max_snap_distance_um: float,
     beta: float,
@@ -37,13 +38,13 @@ def process_sample(
     cancer_threshold: float,
     qc_spot_diameter_um: float,
 ) -> None:
-    sample_dir = samples_root / name / "spatial"
+    sample_dir = processing_root / name / "spatial"
     snic_dir = processing_root / name / "snic"
     output_dir = processing_root / name / f"pseudo_label_ratio@{ratio*100:g}"
     output_dir.mkdir(parents=True, exist_ok=True)
 
     image_bgr = cv2.imread(
-        str(sample_dir / f"he_{target_mpp:g}mpp.png"),
+        str(sample_dir / f"he_{label_mpp:g}mpp.png"),
         cv2.IMREAD_COLOR,
     )
     assert image_bgr is not None, f"{sample_dir}: H&E image is not readable"
@@ -58,7 +59,7 @@ def process_sample(
     tissue_mask_bl: NDArray[np.bool_] = tissue_mask_uint8 > 0
     superpixels: NDArray[np.int32] = np.load(snic_dir / "superpixels.npy")
 
-    spatial = pd.read_csv(sample_dir / f"spatial_{target_mpp:g}mpp.tsv", sep="\t")
+    spatial = pd.read_csv(sample_dir / f"spatial_{label_mpp:g}mpp.tsv", sep="\t")
     spatial = spatial.loc[spatial["selected"].eq(1) & spatial["in_content"]]
 
     spot_x: NDArray[np.int64] = np.rint(
@@ -75,7 +76,7 @@ def process_sample(
     )
 
     point_selection = pd.read_csv(
-        sample_dir / "point_selection.tsv",
+        samples_root / name / "spatial/point_selection.tsv",
         sep="\t",
     )
     ratio_column = f"ratio@{ratio:g}"
@@ -87,7 +88,7 @@ def process_sample(
     supervised = spatial["spot_id"].isin(supervised_ids).to_numpy()
     spot_labels[~supervised] = 255
 
-    max_snap_distance_px = round(max_snap_distance_um / target_mpp)
+    max_snap_distance_px = round(max_snap_distance_um / label_mpp)
     propagation_spot_x, propagation_spot_y = snap_spots_to_tissue(
         spot_x,
         spot_y,
@@ -139,7 +140,7 @@ def process_sample(
         spot_x,
         spot_y,
         spot_labels,
-        target_mpp,
+        label_mpp,
         qc_spot_diameter_um,
     )
 
@@ -156,8 +157,9 @@ def main() -> None:
         dataset_file = yaml.safe_load(f)
 
     target_mpp = float(resolution["target_mpp"])
+    label_mpp = float(resolution["label_mpp"])
     samples_root = data_root / f"{target_mpp:g}mpp" / "samples"
-    processing_root = data_root / f"{target_mpp:g}mpp" / "label_mpp"
+    processing_root = label_grid_root(data_root / f"{target_mpp:g}mpp", target_mpp, label_mpp)
     processing_root.mkdir(parents=True, exist_ok=True)
     ratio = float(dataset_file["radio"])
 
@@ -167,7 +169,7 @@ def main() -> None:
             processing_root,
             samples_root,
             name,
-            target_mpp=target_mpp,
+            label_mpp=label_mpp,
             ratio=ratio,
             max_snap_distance_um=float(pseudo_mask_config["max_snap_distance_um"]),
             beta=float(pseudo_mask_config["rw_beta"]),

@@ -74,8 +74,8 @@ def save_prediction_result(
     directory = Path(directory)
     directory.mkdir(parents=True, exist_ok=True)
     size = (
-        round(probability.shape[1] / scale),
-        round(probability.shape[0] / scale),
+        image_rgb.shape[1] // scale,
+        image_rgb.shape[0] // scale,
     )
     down_probability = cv2.resize(probability, size, interpolation=cv2.INTER_AREA)
     down_image = cv2.cvtColor(

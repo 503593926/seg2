@@ -124,8 +124,8 @@ class Stem(nn.Module):
     def __init__(self, in_chans=3, out_chans=64, down_factor=7):
         super().__init__()
         self.block1 = nn.Sequential(
-            nn.Conv2d(in_chans, out_chans, kernel_size=3 if down_factor == 1 else down_factor,
-                      stride=down_factor, padding=1 if down_factor == 1 else 0),
+            nn.Conv2d(in_chans, out_chans, kernel_size=3 if down_factor in (1, 2) else down_factor,
+                      stride=down_factor, padding=1 if down_factor in (1, 2) else 0),
             LayerNorm(out_chans, eps=1e-6)
         )
 

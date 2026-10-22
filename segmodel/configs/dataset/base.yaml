@@ -1,6 +1,7 @@
 split_mode: patient_loocv  # patient_loocv | transfer
 patient_names: []
 labeled_sampling_fraction: null
+slides_per_batch: null  # null 保留独立随机采样；整数指定每个完整训练 batch 的不同切片数，需整除 batch_size
 data_root: ""
 ref_dataset: ""
 tgt_dataset: ""

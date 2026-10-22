@@ -7,6 +7,8 @@ import cv2
 import numpy as np
 import torch
 
+from segmodel.inference.memory import inference_copy_stream
+
 
 def _prediction_buffer(shape):
     """大幅状态/特征场用自动释放的临时文件映射，限制整片推理的常驻内存。"""
@@ -62,22 +64,31 @@ def _prefetch_batches(slide, origins, crop_size, batch_size, device):
     """预取下一批输入；CUDA 拷贝与当前批前向重叠，保持批次顺序。"""
     device = torch.device(device)
     batches = [origins[start:start + batch_size] for start in range(0, len(origins), batch_size)]
-    copy_stream = torch.cuda.Stream(device=device) if device.type == "cuda" else None
+    copy_stream = inference_copy_stream(device)
     current_stream = torch.cuda.current_stream(device) if copy_stream is not None else None
     with ThreadPoolExecutor(max_workers=1) as executor:
         pending = executor.submit(_prepare_batch, slide, batches[0], crop_size, device, copy_stream)
-        for index, batch_origins in enumerate(batches):
-            inputs, ready = pending.result()
-            if index + 1 < len(batches):
-                pending = executor.submit(
-                    _prepare_batch, slide, batches[index + 1], crop_size, device, copy_stream,
-                )
-            if current_stream is not None and ready is not None:
-                current_stream.wait_event(ready)
-                for values in inputs.values():
-                    for value in values:
-                        value.record_stream(current_stream)
-            yield batch_origins, inputs
+        try:
+            for index, batch_origins in enumerate(batches):
+                assert pending is not None
+                inputs, ready = pending.result()
+                pending = None
+                if index + 1 < len(batches):
+                    pending = executor.submit(
+                        _prepare_batch, slide, batches[index + 1], crop_size, device, copy_stream,
+                    )
+                if current_stream is not None and ready is not None:
+                    current_stream.wait_event(ready)
+                    for values in inputs.values():
+                        for value in values:
+                            value.record_stream(current_stream)
+                try:
+                    yield batch_origins, inputs
+                finally:
+                    inputs = ready = None
+        finally:
+            if pending is not None:
+                pending.cancel()
 
 
 def _accumulate_pixels(field, pixels, rows, weights, sums):
@@ -109,7 +120,7 @@ def predict_slide(
     superpixel_pool=None,
     spot_pool=None,
 ):
-    """拼接概率，按需缓存 dense 系数，并流式聚合节点特征或 spot 表达系数。"""
+    """在原生预测网格拼接概率和 dense 系数，并流式聚合节点或 spot。"""
     batch_size = int(batch_size)
     if batch_size <= 0:
         raise ValueError("inference batch_size must be positive")
@@ -307,9 +318,5 @@ def predict_slide(
         # 仅缓存 K 通道系数；确定最高 PCC 基因后再解码所需通道。
         coefficient_sum /= np.maximum(probability_weight[..., None], 1e-6)
         expression_factors.update(coefficients=coefficient_sum, templates=templates)
-    probability = cv2.resize(
-        probability_sum / np.maximum(probability_weight, 1e-6),
-        (width, height),
-        interpolation=cv2.INTER_LINEAR,
-    )
+    probability = probability_sum / np.maximum(probability_weight, 1e-6)
     return probability, features

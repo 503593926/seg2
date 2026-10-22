@@ -8,6 +8,7 @@ import numpy as np
 import scipy.sparse as sp
 
 from segmodel.dataset.slide import Slide, TrainingSlide
+from tools.label_grid import label_grid_root, label_scale as resolve_label_scale
 
 
 def read_slide_inputs(image_path, feature_dirs):
@@ -62,7 +63,8 @@ def load_feature_scales(root, feature_maps, resolution_cfg):
 def load_training_slides(roots, names, dataset_cfg, resolution_cfg) -> dict[str, TrainingSlide]:
 
     target_mpp = float(resolution_cfg.target_mpp)
-    label_scale = round(float(resolution_cfg.label_mpp) / target_mpp)
+    label_mpp = float(resolution_cfg.label_mpp)
+    label_scale = resolve_label_scale(target_mpp, label_mpp)
     spot_radius_px = float(dataset_cfg.spot_diameter_um) / (2.0 * target_mpp)
     feature_maps = list(dataset_cfg.image_feature_maps)
     slides = {}
@@ -79,10 +81,11 @@ def load_training_slides(roots, names, dataset_cfg, resolution_cfg) -> dict[str,
             [root / str(feature_map) / name for feature_map in feature_maps],
         )
 
-        label_dir = root / "label_mpp" / name
+        label_dir = label_grid_root(root, target_mpp, label_mpp) / name
         shape = tuple(size // label_scale for size in image.shape[:2])
+        spatial_dir = sample_dir / "spatial" if label_scale == 1 else label_dir / "spatial"
         tissue_mask = np.asarray(cv2.imread(
-            str(sample_dir / "spatial/tissue_mask.png"),
+            str(spatial_dir / "tissue_mask.png"),
             cv2.IMREAD_GRAYSCALE,
         ))
         has_segmentation = (sample_dir / "masks/training_mask.png").is_file()
@@ -98,6 +101,13 @@ def load_training_slides(roots, names, dataset_cfg, resolution_cfg) -> dict[str,
             pseudo_mask_uint8 = np.broadcast_to(np.uint8(255), shape)
             cancer_probability = np.broadcast_to(np.float32(0), shape)
             superpixels = np.broadcast_to(np.int32(0), shape)
+
+        if any(array.shape != shape for array in
+               (tissue_mask, pseudo_mask_uint8, cancer_probability, superpixels)):
+            raise ValueError(
+                f"{name}: tissue, pseudo labels and SNIC must use prediction grid {shape}; "
+                "run derive.get_label_mpp, derive.get_superpixel and derive.get_pseudo_label"
+            )
 
         slides[name] = TrainingSlide(
             name=name,
@@ -119,7 +129,7 @@ def load_training_slides(roots, names, dataset_cfg, resolution_cfg) -> dict[str,
 def load_inference_slides(roots, names, dataset_cfg, resolution_cfg) -> dict[str, Slide]:
     """只读取 test/predict 所需的图像和离线特征。"""
     target_mpp = float(resolution_cfg.target_mpp)
-    label_scale = round(float(resolution_cfg.label_mpp) / target_mpp)
+    label_scale = resolve_label_scale(target_mpp, float(resolution_cfg.label_mpp))
     feature_maps = list(dataset_cfg.image_feature_maps)
     slides = {}
     for name in names:

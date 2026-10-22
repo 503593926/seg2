@@ -14,7 +14,11 @@ from segmodel.dataset.loading import (
     load_inference_slides,
     load_training_slides,
 )
-from segmodel.dataset.segmentation import EpochSampler, SegmentationDataset, collate_samples
+from segmodel.dataset.segmentation import (
+    EpochSampler,
+    SegmentationDataset,
+    collate_samples,
+)
 from segmodel.dataset.slide import SlideDataset
 
 
@@ -115,10 +119,11 @@ class FoldDataModule(pl.LightningDataModule):
                 # fork 前关闭父进程的 OpenCV 并行池，避免子进程调整继承的池时死锁。
                 cv2.setNumThreads(1)
             options: dict[str, Any] = {"prefetch_factor": int(dataset_cfg.prefetch_factor)} if workers else {}
+            batch_size = int(self.cfg.experiment.training.image.batch_size)
             self._train_loader = DataLoader(
                 dataset,
-                batch_size=int(self.cfg.experiment.training.image.batch_size),
-                sampler=EpochSampler(dataset),
+                batch_size=batch_size,
+                sampler=EpochSampler(dataset, batch_size, dataset_cfg.get("slides_per_batch")),
                 num_workers=workers,
                 collate_fn=collate_samples,
                 worker_init_fn=initialize_training_worker,
