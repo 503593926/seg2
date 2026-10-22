@@ -123,8 +123,8 @@ def _train_segmentation(cfg, data_module, tiling, output_dir):
         logger=CSVLogger(save_dir=output_dir, name="", version=""),
         enable_checkpointing=False,
         num_sanity_val_steps=0,
-        gradient_clip_val=1.0,
-        gradient_clip_algorithm="norm",
+        # gradient_clip_val=1.0,
+        # gradient_clip_algorithm="norm",
     )
     trainer.fit(module, datamodule=data_module)
     return module

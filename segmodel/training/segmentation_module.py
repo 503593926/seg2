@@ -19,6 +19,8 @@ from segmodel.training.losses import (
     gene_prediction_losses,
     segmentation_loss,
     state_balance_loss,
+    template_entropy_loss,
+    template_orthogonality_loss,
 )
 
 
@@ -44,6 +46,8 @@ class SegmentationModule(pl.LightningModule):
         self.augment_cfg = augment_cfg
         if float(image_cfg.get("loss_weights", {}).get("state_balance", 0)) < 0:
             raise ValueError("loss_weights.state_balance must be nonnegative")
+        if float(image_cfg.get("loss_weights", {}).get("template_orthogonal", 0)) < 0:
+            raise ValueError("loss_weights.template_orthogonal must be nonnegative")
         self.state_balance_alpha = float(image_cfg.get("state_balance_alpha", 0.1))
         if not 0 < self.state_balance_alpha <= 1:
             raise ValueError("state_balance_alpha must be in (0, 1]")
@@ -81,6 +85,23 @@ class SegmentationModule(pl.LightningModule):
             self.log("train/gene_spots", float(count), on_step=True, on_epoch=True,
                      prog_bar=True, batch_size=len(batch["image"]))
 
+    def _update_template_losses(self, losses, output):
+        """模板几何正则：正交项去冗余，熵项按权重符号调稀疏/弥散。"""
+        weights = self.image_cfg.loss_weights
+        orthogonal = float(weights.get("template_orthogonal", 0))
+        entropy = float(weights.get("template_entropy", 0))
+        if not orthogonal and not entropy:
+            return
+        if "expression_templates" not in output:
+            raise RuntimeError(
+                "template regularization is enabled but the model returned no expression_templates"
+            )
+        templates = output["expression_templates"]
+        if orthogonal:
+            losses["template_orthogonal"] = template_orthogonality_loss(templates)
+        if entropy:
+            losses["template_entropy"] = template_entropy_loss(templates)
+
     def training_step(self, batch) -> torch.Tensor:
         weights = self.image_cfg.loss_weights
         balance_weight = float(weights.get("state_balance", 0))
@@ -91,6 +112,7 @@ class SegmentationModule(pl.LightningModule):
         )
         losses = image_losses(output, batch, weights)
         self._update_expression_loss(losses, output, batch)
+        self._update_template_losses(losses, output)
 
         tissue_log_usage = tissue_pixels = None
         if "tissue_states" in output:

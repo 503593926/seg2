@@ -111,6 +111,30 @@ def state_balance_loss(log_usage, pixels, *, alpha=0.1):
     return loss * (pixels > 0).to(dtype=loss.dtype)
 
 
+def template_orthogonality_loss(templates, eps=1e-8):
+    """模板去冗余：log 模板按基因去均值后两两余弦，取非对角项平方均值。"""
+    if templates.ndim != 2:
+        raise ValueError("templates must be a K x G matrix")
+    log_templates = templates.float().clamp_min(eps).log()
+    # 模板行和恒为 1，必须先去掉共同的平均 profile 再比较形状。
+    centered = log_templates - log_templates.mean(dim=1, keepdim=True)
+    unit = centered / centered.norm(dim=1, keepdim=True).clamp_min(eps)
+    gram = unit @ unit.transpose(0, 1)
+    count = gram.shape[0] * (gram.shape[0] - 1)
+    if count == 0:
+        return gram.sum() * 0
+    off_diagonal = gram - torch.diag_embed(torch.diagonal(gram))
+    return off_diagonal.square().sum() / count
+
+
+def template_entropy_loss(templates, eps=1e-8):
+    """模板熵（nats/state）：正权重压熵使模板更稀疏，负权重抬熵使模板更弥散。"""
+    if templates.ndim != 2:
+        raise ValueError("templates must be a K x G matrix")
+    probabilities = templates.float().clamp_min(eps)
+    return -(probabilities * probabilities.log()).sum(dim=1).mean()
+
+
 def image_losses(output, batch, weights=None):
     """只计算已启用的损失；不传 weights 时保留全部计算的用法。"""
     losses = {}
