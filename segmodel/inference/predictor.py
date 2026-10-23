@@ -1,5 +1,3 @@
-from concurrent.futures import ThreadPoolExecutor
-from contextlib import nullcontext
 from math import ceil
 from tempfile import TemporaryFile
 
@@ -7,7 +5,7 @@ import cv2
 import numpy as np
 import torch
 
-from segmodel.inference.memory import inference_copy_stream
+from segmodel.inference.prefetch import _prefetch_batches
 
 
 def _prediction_buffer(shape):
@@ -38,59 +36,6 @@ def tile_origins(length, crop_size, stride, alignment):
     return origins
 
 
-def _prepare_batch(slide, origins, crop_size, device, copy_stream):
-    """后台准备窗口并发起异步拷贝，不等待下一批准备完成才运行当前批。"""
-    inputs = [slide.inputs(top, left, crop_size) for top, left in origins]
-    batch = {"image": [torch.stack([item["image"] for item in inputs])]}
-    for key in ("patch", "cls"):
-        batch[key] = [
-            torch.stack([item[key][index] for item in inputs])
-            for index in range(len(inputs[0][key]))
-        ]
-    with torch.cuda.stream(copy_stream) if copy_stream is not None else nullcontext():
-        if copy_stream is not None:
-            batch = {key: [value.pin_memory() for value in values] for key, values in batch.items()}
-        batch = {
-            key: [value.to(device, non_blocking=copy_stream is not None) for value in values]
-            for key, values in batch.items()
-        }
-        ready = torch.cuda.Event() if copy_stream is not None else None
-        if ready is not None:
-            ready.record(copy_stream)
-    return batch, ready
-
-
-def _prefetch_batches(slide, origins, crop_size, batch_size, device):
-    """预取下一批输入；CUDA 拷贝与当前批前向重叠，保持批次顺序。"""
-    device = torch.device(device)
-    batches = [origins[start:start + batch_size] for start in range(0, len(origins), batch_size)]
-    copy_stream = inference_copy_stream(device)
-    current_stream = torch.cuda.current_stream(device) if copy_stream is not None else None
-    with ThreadPoolExecutor(max_workers=1) as executor:
-        pending = executor.submit(_prepare_batch, slide, batches[0], crop_size, device, copy_stream)
-        try:
-            for index, batch_origins in enumerate(batches):
-                assert pending is not None
-                inputs, ready = pending.result()
-                pending = None
-                if index + 1 < len(batches):
-                    pending = executor.submit(
-                        _prepare_batch, slide, batches[index + 1], crop_size, device, copy_stream,
-                    )
-                if current_stream is not None and ready is not None:
-                    current_stream.wait_event(ready)
-                    for values in inputs.values():
-                        for value in values:
-                            value.record_stream(current_stream)
-                try:
-                    yield batch_origins, inputs
-                finally:
-                    inputs = ready = None
-        finally:
-            if pending is not None:
-                pending.cancel()
-
-
 def _accumulate_pixels(field, pixels, rows, weights, sums):
     """按稀疏像素索引累加到节点或 spot，分块限制 FP64 临时显存。"""
     pixels = torch.as_tensor(pixels, device=sums.device)
@@ -105,6 +50,33 @@ def _accumulate_pixels(field, pixels, rows, weights, sums):
         del selected
 
 
+class _PredictionGrid:
+    """所有输出共用的窗口范围与完整 Hann 权重；窗口只保存权重视图。"""
+
+    def __init__(self, height, width, crop_size, tile_shape, origins, cached_weights=None):
+        tile_height, tile = tile_shape
+        if tile_height != tile or crop_size % tile:
+            raise ValueError("logit grid must evenly divide the crop")
+        scale = crop_size // tile
+        self.shape = (height // scale, width // scale)
+        window = np.maximum(np.outer(np.hanning(crop_size), np.hanning(crop_size)), 0.01).astype(np.float32)
+        window = cv2.resize(window, (tile, tile), interpolation=cv2.INTER_AREA)
+        self.windows = {}
+        for top, left in origins:
+            y, x = top // scale, left // scale
+            h, w = min(crop_size, height - top) // scale, min(crop_size, width - left) // scale
+            self.windows[top, left] = (slice(y, y + h), slice(x, x + w), window[:h, :w])
+        if cached_weights is None:
+            self.weights = np.zeros(self.shape, dtype=np.float32)
+            for y, x, weight in self.windows.values():
+                self.weights[y, x] += weight
+        else:
+            if cached_weights.shape != self.shape:
+                raise ValueError("Cached Hann weights must match the prediction grid")
+            self.weights = cached_weights
+        self.denominator = np.maximum(self.weights, 1e-6)
+
+
 @torch.inference_mode()
 def predict_slide(
     model,
@@ -115,208 +87,122 @@ def predict_slide(
     device,
     batch_size=1,
     return_features=True,
-    feature_key="features",
     expression_factors=None,
     superpixel_pool=None,
     spot_pool=None,
 ):
-    """在原生预测网格拼接概率和 dense 系数，并流式聚合节点或 spot。"""
+    """拼接概率、F 或表达系数；spot/超像素直接流式聚合，不生成整片 G 通道图。"""
     batch_size = int(batch_size)
     if batch_size <= 0:
         raise ValueError("inference batch_size must be positive")
-    was_training = model.training
-    model.eval()
-
     height, width = slide.height, slide.width
-    window = np.maximum(
-        np.outer(np.hanning(crop_size), np.hanning(crop_size)),
-        0.01,
-    ).astype(np.float32)
-
-    probability_sum = None
-    probability_weight = None
-    grid_window = None
-    grid_scale = None
-    feature_sum = None
-    feature_weight = None
-    coefficient_sum = None
-    templates = None
-    node_sum = None
-    spot_sum = None
     rows = tile_origins(height, crop_size, stride, alignment)
     columns = tile_origins(width, crop_size, stride, alignment)
     origins = [(top, left) for top in rows for left in columns]
+    grid = None
+    probability_sum = feature_sum = coefficient_sum = None
+    templates = node_sum = spot_sum = None
+    compute_expression = expression_factors is not None or spot_pool is not None
 
     batches = _prefetch_batches(slide, origins, crop_size, batch_size, device)
+    was_training = model.training
+    model.eval()
     try:
         for batch_origins, inputs in batches:
-            options = {}
-            if getattr(model, "tissue_state_count", 0):
-                options["dense_expression"] = return_features and feature_key == "gene_expression"
-                options["compute_expression"] = (
-                    options["dense_expression"] or expression_factors is not None or spot_pool is not None
-                )
             output = model(
                 inputs["image"][0], inputs["patch"], inputs["cls"],
-                **options,
+                compute_expression=compute_expression,
             )
             probability_grid = output["logits"].float().sigmoid()[:, 0].cpu().numpy()
-            feature_batch = None
+            # 两个可选稠密场使用相同窗口累加与归一化；表达始终只保存 K 通道系数。
+            dense_fields = {}
             if return_features and superpixel_pool is None:
-                feature_batch = (
-                    output[feature_key]
-                    .float()
-                    .cpu()
-                    .numpy()
-                    .transpose(0, 2, 3, 1)
-                )
-            coefficient_batch = None
+                dense_fields["features"] = output["features"].float().cpu().numpy().transpose(0, 2, 3, 1)
             coefficients = None
-            if (expression_factors is not None or spot_pool is not None) and "tissue_states" in output:
+            if compute_expression:
                 coefficients = output["tissue_states"].float() * output["expression_amplitude"].float()
                 if expression_factors is not None:
-                    coefficient_batch = coefficients.cpu().numpy().transpose(0, 2, 3, 1)
+                    dense_fields["coefficients"] = coefficients.cpu().numpy().transpose(0, 2, 3, 1)
                 if templates is None:
-                    templates = model.tissue_state_decoder.template_logits.float().softmax(dim=1).cpu().numpy()
+                    templates = output["expression_templates"].float().cpu().numpy()
 
-            if probability_weight is None:
-                tile = probability_grid.shape[-1]
-                grid_scale = crop_size // tile
-                if crop_size % tile or probability_grid.shape[-2] != tile:
-                    raise ValueError("logit grid must evenly divide the crop")
-                grid_shape = (height // grid_scale, width // grid_scale)
-                probability_sum = np.zeros(grid_shape, dtype=np.float32)
-                probability_weight = superpixel_pool.get("weights") if superpixel_pool is not None else None
-                if probability_weight is None:
-                    probability_weight = np.zeros(grid_shape, dtype=np.float32)
-                grid_window = cv2.resize(
-                    window,
-                    (tile, tile),
-                    interpolation=cv2.INTER_AREA,
+            if grid is None:
+                grid = _PredictionGrid(
+                    height, width, crop_size, probability_grid.shape[-2:], origins,
+                    superpixel_pool.get("weights") if superpixel_pool is not None else None,
                 )
-                # 流式聚合需要先知道每个像素的完整 Hann 权重和。
-                if spot_pool is not None or (superpixel_pool is not None and "weights" not in superpixel_pool):
-                    for top, left in origins:
-                        grid_top, grid_left = top // grid_scale, left // grid_scale
-                        valid_height = min(crop_size, height - top) // grid_scale
-                        valid_width = min(crop_size, width - left) // grid_scale
-                        probability_weight[
-                            grid_top:grid_top + valid_height, grid_left:grid_left + valid_width
-                        ] += grid_window[:valid_height, :valid_width]
-                    if superpixel_pool is not None:
-                        superpixel_pool["weights"] = probability_weight
+                probability_sum = np.zeros(grid.shape, dtype=np.float32)
+                if superpixel_pool is not None:
+                    superpixel_pool["weights"] = grid.weights
                 if spot_pool is not None:
-                    assert coefficients is not None
                     spot_sum = torch.zeros(
                         (len(spot_pool["pixel_counts"]), coefficients.shape[1]),
                         dtype=torch.float64, device=coefficients.device,
                     )
-                if coefficient_batch is not None:
-                    coefficient_sum = _prediction_buffer((*grid_shape, coefficient_batch.shape[-1]))
+                if "coefficients" in dense_fields:
+                    coefficient_sum = _prediction_buffer((*grid.shape, dense_fields["coefficients"].shape[-1]))
                 if return_features:
                     if superpixel_pool is None:
-                        assert feature_batch is not None
-                        feature_sum = _prediction_buffer((*grid_shape, feature_batch[0].shape[-1]))
-                        feature_weight = np.zeros(grid_shape, dtype=np.float32)
+                        feature_sum = _prediction_buffer((*grid.shape, dense_fields["features"].shape[-1]))
                     else:
-                        superpixels, pixel_counts = superpixel_pool["superpixels"], superpixel_pool["pixel_counts"]
-                        if superpixels.shape != grid_shape or output[feature_key].shape[-2:] != (tile, tile):
+                        if (superpixel_pool["superpixels"].shape != grid.shape
+                                or output["features"].shape[-2:] != probability_grid.shape[-2:]):
                             raise ValueError("Superpixels, features and logits must use the same prediction grid")
                         node_sum = torch.zeros(
-                            (len(pixel_counts), output[feature_key].shape[1]),
-                            dtype=torch.float64, device=output[feature_key].device,
+                            (len(superpixel_pool["pixel_counts"]), output["features"].shape[1]),
+                            dtype=torch.float64, device=output["features"].device,
                         )
 
-            assert grid_scale is not None and grid_window is not None
-            assert probability_sum is not None
-            for index, (top, left) in enumerate(batch_origins):
-                grid_top, grid_left = top // grid_scale, left // grid_scale
-                valid_height = min(crop_size, height - top) // grid_scale
-                valid_width = min(crop_size, width - left) // grid_scale
-                rows_slice = slice(grid_top, grid_top + valid_height)
-                columns_slice = slice(grid_left, grid_left + valid_width)
-                weight_window = grid_window[:valid_height, :valid_width]
-                if superpixel_pool is None and spot_pool is None:
-                    probability_weight[rows_slice, columns_slice] += weight_window
-                probability_sum[rows_slice, columns_slice] += (
-                    probability_grid[index][:valid_height, :valid_width]
-                    * weight_window
-                )
-                if coefficient_batch is not None:
-                    assert coefficient_sum is not None
-                    coefficient_sum[rows_slice, columns_slice] += (
-                        coefficient_batch[index, :valid_height, :valid_width] * weight_window[..., None]
-                    )
-                if spot_pool is not None:
-                    assert coefficients is not None and spot_sum is not None
-                    grid_width = probability_weight.shape[1]
+            dense_sums = {"features": feature_sum, "coefficients": coefficient_sum}
+            for index, origin in enumerate(batch_origins):
+                y, x, weight = grid.windows[origin]
+                h, w = weight.shape
+                probability_sum[y, x] += probability_grid[index, :h, :w] * weight
+                for name in dense_fields:
+                    dense_sums[name][y, x] += dense_fields[name][index, :h, :w] * weight[..., None]
+                # spot 和节点共用同一份归一化窗口权重，保持原 FP64 聚合顺序。
+                if spot_sum is not None or node_sum is not None:
+                    normalized = (weight.astype(np.float64) / grid.denominator[y, x]).ravel()
+                if spot_sum is not None:
+                    grid_width = grid.shape[1]
                     first, last = np.searchsorted(
-                        spot_pool["pixels"], [grid_top * grid_width, (grid_top + valid_height) * grid_width],
+                        spot_pool["pixels"], [y.start * grid_width, y.stop * grid_width],
                     )
                     pixels = spot_pool["pixels"][first:last]
-                    x = pixels % grid_width
-                    inside = (x >= grid_left) & (x < grid_left + valid_width)
-                    local_pixels = (pixels[inside] // grid_width - grid_top) * valid_width + x[inside] - grid_left
-                    weights = (
-                        weight_window.astype(np.float64)
-                        / np.maximum(probability_weight[rows_slice, columns_slice], 1e-6)
-                    ).ravel()[local_pixels]
+                    columns = pixels % grid_width
+                    inside = (columns >= x.start) & (columns < x.stop)
+                    local_pixels = (pixels[inside] // grid_width - y.start) * w + columns[inside] - x.start
                     _accumulate_pixels(
-                        coefficients[index, :, :valid_height, :valid_width], local_pixels,
-                        spot_pool["rows"][first:last][inside], weights, spot_sum,
+                        coefficients[index, :, :h, :w], local_pixels,
+                        spot_pool["rows"][first:last][inside], normalized[local_pixels], spot_sum,
                     )
-
-                if return_features:
-                    if superpixel_pool is None:
-                        assert feature_batch is not None and feature_sum is not None and feature_weight is not None
-                        features = feature_batch[index]
-                        feature_sum[rows_slice, columns_slice] += (
-                            features[:valid_height, :valid_width]
-                            * weight_window[..., None]
-                        )
-                        feature_weight[rows_slice, columns_slice] += weight_window
-                    else:
-                        assert node_sum is not None
-                        superpixels = superpixel_pool["superpixels"]
-                        labels = superpixels[rows_slice, columns_slice].ravel()
-                        foreground = np.flatnonzero(labels)
-                        weights = (
-                            weight_window.astype(np.float64)
-                            / np.maximum(probability_weight[rows_slice, columns_slice], 1e-6)
-                        ).ravel()[foreground]
-                        _accumulate_pixels(
-                            output[feature_key][index, :, :valid_height, :valid_width],
-                            foreground, labels[foreground], weights, node_sum,
-                        )
-            del output, inputs, coefficients
+                if node_sum is not None:
+                    labels = superpixel_pool["superpixels"][y, x].ravel()
+                    foreground = np.flatnonzero(labels)
+                    _accumulate_pixels(
+                        output["features"][index, :, :h, :w], foreground,
+                        labels[foreground], normalized[foreground], node_sum,
+                    )
+            del output, inputs, coefficients, dense_fields, dense_sums
     finally:
         batches.close()
         model.train(was_training)
 
-    features = None
-    if return_features:
-        if superpixel_pool is None:
-            assert feature_sum is not None and feature_weight is not None
-            # 稠密基因图通道较多, 原地归一化避免再复制一份整片表达场。
-            feature_sum /= np.maximum(feature_weight[..., None], 1e-6)
-            features = feature_sum
-        else:
-            assert node_sum is not None
-            pixel_counts = superpixel_pool["pixel_counts"]
-            features = node_sum.cpu().numpy()
-            features /= np.maximum(pixel_counts[:, None], 1)
-            features[0] = 0
-    assert probability_sum is not None and probability_weight is not None
+    assert grid is not None and probability_sum is not None
+    # 两个场共享概率图的权重和，无须再维护 feature_weight。
+    for field in (feature_sum, coefficient_sum):
+        if field is not None:
+            field /= grid.denominator[..., None]
+    features = feature_sum
+    if node_sum is not None:
+        features = node_sum.cpu().numpy()
+        features /= np.maximum(superpixel_pool["pixel_counts"][:, None], 1)
+        features[0] = 0
     if spot_sum is not None:
-        assert spot_pool is not None
         spot_pool["coefficients"] = (
             spot_sum.cpu().numpy() / np.maximum(spot_pool["pixel_counts"][:, None], 1)
         ).astype(np.float32)
         spot_pool["templates"] = templates
     if coefficient_sum is not None:
-        assert expression_factors is not None
-        # 仅缓存 K 通道系数；确定最高 PCC 基因后再解码所需通道。
-        coefficient_sum /= np.maximum(probability_weight[..., None], 1e-6)
         expression_factors.update(coefficients=coefficient_sum, templates=templates)
-    probability = probability_sum / np.maximum(probability_weight, 1e-6)
-    return probability, features
+    return probability_sum / grid.denominator, features

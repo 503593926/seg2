@@ -4,7 +4,7 @@
 
 spot_diameter_um: 100.0
 data_root: 'data/her2st/1mpp'
-patient_names: [B, A, C, D, E, F, G, H]  # 患者留出顺序；填写患者名，不填写切片名
+patient_names: [E, B, A, C, D, F, G, H]  # 患者留出顺序；填写患者名，不填写切片名
 split_mode: patient_loocv
 
 gene_expression_dir: gene_expression/patient_loocv
@@ -21,9 +21,9 @@ labeled_sampling_fraction: null
 slides_per_batch: 4  # 每个 batch 选 4 张不同切片，各取 batch_size / 4 个 crop；null 恢复独立随机采样
 crop_size: 896
 inference_batch_size: 8  # 1 mpp 解码限制每次窗口数
-samples_per_epoch: 8000
+samples_per_epoch: 4000
 min_valid_fraction: 0.25
 
-num_workers: 4
+num_workers: 8
 prefetch_factor: 1  # 大特征 batch 限制预取，避免共享内存和锁页副本堆积
 pin_memory: false  # WSL 下优先降低主机内存压力；仍使用 GPU/BF16 训练

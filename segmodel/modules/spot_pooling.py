@@ -45,7 +45,6 @@ def prepare_spot_pool(tissue, spots, radius_px, label_scale):
         "weights": torch.cat(weights) if weights else torch.empty(0),
         "indices": torch.tensor(valid_indices, dtype=torch.long),
         "count": len(valid_indices),
-        "spot_count": len(spots),
     }
 
 
@@ -73,20 +72,3 @@ def pool_spot_batch(field, plan):
     area = pixels.shape[1]
     selected = pixels[plan["pixels"] // area, plan["pixels"] % area] * plan["weights"][:, None]
     return selected.new_zeros(plan["count"], field.shape[1]).index_add(0, plan["rows"], selected)
-
-
-def pool_spot_expression(field, superpixels, spots, radius_px, label_scale):
-    """整片评估逐圆盘聚合，限制临时内存；训练使用 pool_spot_batch。"""
-    predictions, valid = [], []
-    for top, bottom, left, right, disk in _spot_windows(spots, superpixels.shape, radius_px, label_scale):
-        if disk is not None:
-            disk = disk & (superpixels[top:bottom, left:right] > 0)
-        usable = disk is not None and bool(disk.any())
-        valid.append(usable)
-        predictions.append(
-            field[:, top:bottom, left:right][:, disk].float().mean(1)
-            if usable else field.new_zeros(field.shape[0], dtype=torch.float32)
-        )
-    values = torch.stack(predictions) if predictions else field.new_zeros(0, field.shape[0], dtype=torch.float32)
-    return values, torch.tensor(valid, dtype=torch.bool, device=field.device)
-

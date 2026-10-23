@@ -161,13 +161,8 @@ def _expression_dense_panel(heatmap, maximum, title, size=512):
     return _expression_colorbar(panel, maximum, title)
 
 
-def save_top_gene_predictions(
-    directory, expression_results, gene_names, slides, *, top_n=10,
-    spot_radius_px=50.0, expression_transform="log1p", source_model="ema",
-):
-    """复用验证结果，每个基因仅保存归一化的 spot/dense 三列对照图。"""
-    if top_n <= 0:
-        return {}
+def _expression_records(expression_results):
+    """整理非空切片的 CPU 观测，保留原始结果供指标和后续使用。"""
     records = {}
     for name, source in expression_results.items():
         if not len(source["prediction"]):
@@ -179,29 +174,17 @@ def save_top_gene_predictions(
             "observed": torch.as_tensor(source.get("observed", torch.ones_like(target, dtype=torch.bool))).bool().cpu(),
             "spots": np.asarray(source["spots"]),
         }
-    if not records:
-        return {}
+    return records
+
+
+def _rank_expression_genes(records, gene_names, top_n):
+    """按 pooled PCC 稳定排序，并保存每个基因的 spot 归一化范围。"""
     prediction = torch.cat([record["prediction"] for record in records.values()])
     target = torch.cat([record["target"] for record in records.values()])
     observed = torch.cat([record["observed"] for record in records.values()])
     correlations = gene_pearson_correlations(prediction, target, observed).numpy()
     eligible = np.flatnonzero(np.isfinite(correlations))
     indices = eligible[np.argsort(-correlations[eligible], kind="stable")[:top_n]]
-    for name, record in records.items():
-        source = expression_results[name]
-        dense = source.get("dense_expression")
-        if dense is None or not len(indices):
-            continue
-        if "coefficients" in dense:
-            values = np.asarray(dense["coefficients"]) @ np.asarray(dense["templates"])[:, indices]
-        else:
-            values = np.asarray(dense["prediction"])[..., indices].copy()
-        if expression_transform == "log1p":
-            np.log1p(values, out=values)
-        tissue = np.asarray(source["dense_tissue"], dtype=bool)
-        if values.shape[:2] != tissue.shape:
-            raise ValueError(f"{name}: dense expression and tissue grid must match")
-        record.update(dense_prediction=values, dense_tissue=tissue, dense_mpp=float(source["dense_mpp"]))
     selected = []
     for position, index in enumerate(indices):
         mask = observed[:, index]
@@ -214,14 +197,36 @@ def save_top_gene_predictions(
             "pcc": float(correlations[index]), "observed_spots": int(mask.sum()),
             "normalization": normalization, "slides": {},
         })
+    return selected, len(eligible)
+
+
+def _decode_selected_genes(records, expression_results, selected, expression_transform):
+    """只解码入选基因，并在所有切片组织内确定 dense 归一化范围。"""
+    indices = [gene["gene_index"] for gene in selected]
+    for name, record in records.items():
+        source = expression_results[name]
+        dense = source.get("dense_expression")
+        if dense is None or not len(indices):
+            continue
+        values = np.asarray(dense["coefficients"]) @ np.asarray(dense["templates"])[:, indices]
+        if expression_transform == "log1p":
+            np.log1p(values, out=values)
+        tissue = np.asarray(source["dense_tissue"], dtype=bool)
+        if values.shape[:2] != tissue.shape:
+            raise ValueError(f"{name}: dense expression and tissue grid must match")
+        record.update(dense_prediction=values, dense_tissue=tissue, dense_mpp=float(source["dense_mpp"]))
+    for position, gene in enumerate(selected):
         dense_values = [record["dense_prediction"][..., position][record["dense_tissue"]]
                         for record in records.values() if "dense_prediction" in record and record["dense_tissue"].any()]
         if dense_values:
             minimum, maximum = min(float(value.min()) for value in dense_values), max(float(value.max()) for value in dense_values)
-            selected[-1]["dense_normalization"] = {"min": minimum, "max": maximum}
+            gene["dense_normalization"] = {"min": minimum, "max": maximum}
 
-    directory = Path(directory)
-    directory.mkdir(parents=True, exist_ok=True)
+
+def _save_gene_comparisons(directory, records, selected, slides, spot_radius_px,
+                           expression_transform, source_model):
+    """逐切片绘制三列对照图，并把图片路径和局部 PCC 写入基因记录。"""
+    indices = [gene["gene_index"] for gene in selected]
     for name, record in records.items():
         if not selected or "dense_prediction" not in record:
             continue
@@ -271,6 +276,26 @@ def save_top_gene_predictions(
                 "dense_mpp": record["dense_mpp"], "dense_shape": list(dense_values.shape),
             }
 
+
+def save_top_gene_predictions(
+    directory, expression_results, gene_names, slides, *, top_n=10,
+    spot_radius_px=50.0, expression_transform="log1p", source_model="ema",
+):
+    """整理观测 → 选基因 → 解码 → 绘图 → 保存排名及元数据。"""
+    if top_n <= 0:
+        return {}
+    records = _expression_records(expression_results)
+    if not records:
+        return {}
+    selected, eligible_count = _rank_expression_genes(records, gene_names, top_n)
+    _decode_selected_genes(records, expression_results, selected, expression_transform)
+
+    directory = Path(directory)
+    directory.mkdir(parents=True, exist_ok=True)
+    _save_gene_comparisons(
+        directory, records, selected, slides, spot_radius_px,
+        expression_transform, source_model,
+    )
     columns = ("rank", "gene", "gene_index", "pcc", "observed_spots")
     with (directory / "top_genes.csv").open("w", newline="", encoding="utf-8") as handle:
         writer = csv.DictWriter(handle, fieldnames=columns)
@@ -279,7 +304,7 @@ def save_top_gene_predictions(
     metadata = {
         "source_model": source_model, "ranking_scope": "pooled_validation_spots",
         "expression_transform": expression_transform, "requested_top_n": int(top_n),
-        "eligible_genes": len(eligible), "selected_genes": selected,
+        "eligible_genes": eligible_count, "selected_genes": selected,
         "normalized_color_scale": "independent min-max for observed and predicted per gene, pooled across slides; displayed range [0, 1]",
         "dense_normalized_color_scale": "independent dense min-max per gene over tissue pixels across slides; displayed range [0, 1]",
     }

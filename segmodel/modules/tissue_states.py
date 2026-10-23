@@ -8,7 +8,7 @@ from segmodel.modules.state_usage import state_log_usage
 
 
 class TissueStateDecoder(nn.Module):
-    def __init__(self, in_channels, gene_count, state_count=32, hidden_dim=96):
+    def __init__(self, in_channels, gene_count, state_count, hidden_dim):
         super().__init__()
         if gene_count <= 0 or state_count < 2 or hidden_dim <= 0:
             raise ValueError("Tissue states require genes, at least two states and a positive hidden dimension")
@@ -24,7 +24,7 @@ class TissueStateDecoder(nn.Module):
         # 避免所有类别倾向相同，使首次分割反向就能更新状态权重。
         self.class_logits = nn.Parameter(torch.empty(state_count).uniform_(-2, 2))
 
-    def forward(self, features, dense_expression=True, compute_expression=True,
+    def forward(self, features, compute_expression=True,
                 state_usage_mask=None, state_usage_grad=True):
         latent = self.encoder(features)
         state_logits = self.state_head(latent)
@@ -50,10 +50,4 @@ class TissueStateDecoder(nn.Module):
             positive = torch.logsumexp(log_states + F.logsigmoid(classes), dim=1, keepdim=True)
             negative = torch.logsumexp(log_states + F.logsigmoid(-classes), dim=1, keepdim=True)
         output = {"logits": positive - negative, **output}
-        if compute_expression and dense_expression:
-            templates = output.pop("expression_templates")
-            with torch.autocast(device_type=features.device.type, enabled=False):
-                output["gene_expression"] = F.conv2d(
-                    output["tissue_states"], templates.T[:, :, None, None],
-                ) * output["expression_amplitude"]
         return output

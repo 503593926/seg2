@@ -14,8 +14,8 @@ from segmodel.dataset.loading import (
     load_inference_slides,
     load_training_slides,
 )
+from segmodel.dataset.sampling import EpochSampler
 from segmodel.dataset.segmentation import (
-    EpochSampler,
     SegmentationDataset,
     collate_samples,
 )

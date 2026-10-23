@@ -1,5 +1,6 @@
+"""Lightning 训练入口：前向、损失组合、日志、EMA 与生命周期接线。"""
+
 from copy import deepcopy
-from math import ceil
 from pathlib import Path
 from typing import cast
 
@@ -8,20 +9,17 @@ import torch
 from pytorch_lightning.utilities.types import OptimizerLRSchedulerConfig
 from torchmetrics.classification import BinaryF1Score, BinaryJaccardIndex
 
-from segmodel.inference.validation import load_expert_masks, validate_slide
-from segmodel.inference.metrics import summarize_expression_metrics
 from segmodel.inference.memory import release_inference_cache
-from segmodel.inference.visualization import save_prediction_result, save_top_gene_predictions
-from segmodel.modules.state_usage import STATE_USAGE_CHUNK_ELEMENTS
-from segmodel.training.augment import cutmix_batch, mixup_batch
+from segmodel.training.diagnostics import state_diagnostics
 from segmodel.training.losses import (
     image_losses,
     gene_prediction_losses,
-    segmentation_loss,
     state_balance_loss,
     template_entropy_loss,
     template_orthogonality_loss,
 )
+from segmodel.training.optim import configure_optimizer
+from segmodel.training.validation import SlideValidation
 
 
 class SegmentationModule(pl.LightningModule):
@@ -29,7 +27,6 @@ class SegmentationModule(pl.LightningModule):
         self,
         model,
         image_cfg,
-        augment_cfg,
         validation_roots=None,
         tiling=None,
         mpp=1.0,
@@ -43,32 +40,29 @@ class SegmentationModule(pl.LightningModule):
         self.ema_model.eval()
         self._last_ema_step = 0
         self.image_cfg = image_cfg
-        self.augment_cfg = augment_cfg
-        if float(image_cfg.get("loss_weights", {}).get("state_balance", 0)) < 0:
-            raise ValueError("loss_weights.state_balance must be nonnegative")
-        if float(image_cfg.get("loss_weights", {}).get("template_orthogonal", 0)) < 0:
-            raise ValueError("loss_weights.template_orthogonal must be nonnegative")
-        self.state_balance_alpha = float(image_cfg.get("state_balance_alpha", 0.1))
+        for name in ("state_balance", "template_orthogonal"):
+            if float(image_cfg.get("loss_weights", {}).get(name, 0)) < 0:
+                raise ValueError(f"loss_weights.{name} must be nonnegative")
+        self.state_balance_alpha = float(image_cfg.state_balance_alpha)
         if not 0 < self.state_balance_alpha <= 1:
             raise ValueError("state_balance_alpha must be in (0, 1]")
-        self.validation_roots = validation_roots
-        self.tiling = tiling
-        self.mpp = mpp
-        self.visualization_dir = (
-            Path(visualization_dir) if visualization_dir is not None else None
-        )
-        self.label_scale = int(label_scale)
-        self.spot_radius_px = float(spot_radius_px)
         self.expression_transform = str(image_cfg.expression_transform)
-        self._validation_metrics = {}
-        self._validation_expression = {}
+        self.validation = SlideValidation(
+            roots=validation_roots,
+            tiling=tiling,
+            directory=Path(visualization_dir) if visualization_dir is not None else None,
+            mpp=mpp,
+            label_scale=int(label_scale),
+            spot_radius_px=float(spot_radius_px),
+            expression_transform=self.expression_transform,
+        )
 
         self.train_dice = BinaryF1Score(threshold=0.5)
         self.train_iou = BinaryJaccardIndex(threshold=0.5)
 
-    def forward(self, image, patch, cls, pfm_mask=None, *, dense_expression=True,
+    def forward(self, image, patch, cls, pfm_mask=None, *,
                 state_usage_mask=None, state_usage_grad=True):
-        return self.model(image, patch, cls, pfm_mask, dense_expression=dense_expression,
+        return self.model(image, patch, cls, pfm_mask,
                           state_usage_mask=state_usage_mask, state_usage_grad=state_usage_grad)
 
     def _update_expression_loss(self, losses, output, batch):
@@ -76,7 +70,7 @@ class SegmentationModule(pl.LightningModule):
         weights = self.image_cfg.loss_weights
         if any(float(weights.get(name, 0)) for name in ("gene_prediction", "gene_correlation")):
             expression_losses, count = gene_prediction_losses(
-                output, batch, self.spot_radius_px, self.label_scale, self.expression_transform,
+                output, batch, expression_transform=self.expression_transform,
                 weights=weights,
                 correlation_min_spots=int(self.image_cfg.gene_correlation_min_spots),
                 correlation_std_floor=float(self.image_cfg.gene_correlation_std_floor),
@@ -92,10 +86,6 @@ class SegmentationModule(pl.LightningModule):
         entropy = float(weights.get("template_entropy", 0))
         if not orthogonal and not entropy:
             return
-        if "expression_templates" not in output:
-            raise RuntimeError(
-                "template regularization is enabled but the model returned no expression_templates"
-            )
         templates = output["expression_templates"]
         if orthogonal:
             losses["template_orthogonal"] = template_orthogonality_loss(templates)
@@ -107,22 +97,17 @@ class SegmentationModule(pl.LightningModule):
         balance_weight = float(weights.get("state_balance", 0))
         output = self(
             batch["image"], batch["patch"], batch["cls"], batch["pfm_mask"],
-            dense_expression=False, state_usage_mask=batch["tissue"],
+            state_usage_mask=batch["tissue"],
             state_usage_grad=bool(balance_weight),
         )
         losses = image_losses(output, batch, weights)
         self._update_expression_loss(losses, output, batch)
         self._update_template_losses(losses, output)
 
-        tissue_log_usage = tissue_pixels = None
-        if "tissue_states" in output:
-            tissue_log_usage = output["tissue_state_log_usage"]
-            tissue_pixels = output["tissue_state_pixels"]
-            losses["state_balance"] = state_balance_loss(
-                tissue_log_usage, tissue_pixels, alpha=self.state_balance_alpha,
-            )
-        elif balance_weight:
-            raise RuntimeError("state_balance is enabled but the model returned no tissue_states")
+        losses["state_balance"] = state_balance_loss(
+            output["tissue_state_log_usage"], output["tissue_state_pixels"],
+            alpha=self.state_balance_alpha,
+        )
 
         loss = cast(
             torch.Tensor,
@@ -133,45 +118,14 @@ class SegmentationModule(pl.LightningModule):
             ),
         )
 
-        mixup_loss = self._mixup_segmentation_loss(batch)
-        if mixup_loss is not None:
-            loss = loss + float(self.augment_cfg.mixup.weight) * mixup_loss
+        self._log_training(loss, losses, output, batch)
+        return loss
 
-        cutmix_loss = self._cutmix_segmentation_loss(batch)
-        if cutmix_loss is not None:
-            loss = loss + float(self.augment_cfg.cutmix.weight) * cutmix_loss
-
+    def _log_training(self, loss, losses, output, batch):
         logged_losses = {f"train/{name}": value for name, value in losses.items()}
-        if "tissue_states" in output:
-            states = output["tissue_states"].detach()
-            valid = batch["valid"].to(dtype=states.dtype)
-            # 分块复用约 16 MiB 的 FP32 临时区，只统计日志，不修改状态图。
-            chunk_rows = max(1, STATE_USAGE_CHUNK_ELEMENTS // (states.shape[0] * states.shape[1] * states.shape[3]))
-            entropy = states.new_zeros((), dtype=torch.float32)
-            usage = states.new_zeros(states.shape[1], dtype=torch.float32)
-            valid_pixels = states.new_zeros((), dtype=torch.float32)
-            for chunk, valid_chunk in zip(
-                states.split(chunk_rows, dim=2), valid.split(chunk_rows, dim=2),
-            ):
-                terms = chunk.clamp_min(1e-8).log_().mul_(chunk)
-                entropy.sub_(terms.sum())
-                del terms
-                usage.add_((chunk * valid_chunk).sum(dim=(0, 2, 3)))
-                valid_pixels.add_(valid_chunk.sum())
-            usage = usage / valid_pixels.clamp_min(1)
-            logged_losses["train/tissue_state_entropy"] = entropy / (states.shape[0] * states.shape[2] * states.shape[3])
-            logged_losses["train/tissue_state_usage_entropy"] = -(usage * usage.clamp_min(1e-8).log()).sum()
-            if tissue_log_usage is not None:
-                assert tissue_pixels is not None
-                log_usage_tissue = tissue_log_usage.detach()
-                usage_tissue = log_usage_tissue.exp()
-                tissue_entropy = -(usage_tissue * log_usage_tissue).sum()
-                logged_losses["train/state_effective_states"] = torch.where(
-                    tissue_pixels > 0,
-                    tissue_entropy.exp(),
-                    usage_tissue.new_zeros(()),
-                )
-            logged_losses["train/expression_amplitude_mean"] = output["expression_amplitude"].detach().mean()
+        logged_losses.update(
+            {f"train/{name}": value for name, value in state_diagnostics(output, batch).items()}
+        )
         expression_names = {"train/gene_prediction", "train/gene_correlation"}
         self.log_dict(
             {name: value for name, value in logged_losses.items() if name in expression_names},
@@ -195,160 +149,53 @@ class SegmentationModule(pl.LightningModule):
             prog_bar=True,
             batch_size=len(batch["image"]),
         )
-        return loss
-
 
     def configure_optimizers(self) -> OptimizerLRSchedulerConfig:
-        image_parameters = list(self.model.named_parameters())
-        decay, no_decay = [], []
-        for name, parameter in image_parameters:
-            if not parameter.requires_grad:
-                continue
-            if parameter.ndim <= 1 or name.endswith(".bias"):
-                no_decay.append(parameter)
-            else:
-                decay.append(parameter)
-        optimizer = torch.optim.AdamW(
-            [
-                {"params": decay, "weight_decay": float(self.image_cfg.weight_decay)},
-                {"params": no_decay, "weight_decay": 0.0},
-            ],
-            lr=float(self.image_cfg.lr),
-        )
-
-        # 独立检查优化器参数组时没有 Trainer，不推测训练的总步数。
-        if self._trainer is None:
-            return cast(OptimizerLRSchedulerConfig, {"optimizer": optimizer})
-
-        # 使用实际优化器更新数，包含梯度累积、batch 限制和 max_steps。
-        total_steps = int(self.trainer.estimated_stepping_batches)
-        warmup_ratio = float(self.image_cfg.warmup_steps)
-        if total_steps < 1 or not 0 <= warmup_ratio <= 1:
-            raise ValueError("Training steps must be positive and warmup_steps must be a ratio in [0, 1]")
-        warmup_steps = ceil(total_steps * warmup_ratio)
-
-        if warmup_steps:
-            warmup = torch.optim.lr_scheduler.LinearLR(
-                optimizer, start_factor=0.1, end_factor=1.0, total_iters=warmup_steps,
-            )
-            if warmup_steps >= total_steps:
-                scheduler = warmup
-            else:
-                scheduler = torch.optim.lr_scheduler.SequentialLR(
-                    optimizer,
-                    schedulers=[warmup, torch.optim.lr_scheduler.CosineAnnealingLR(
-                        optimizer, T_max=total_steps - warmup_steps, eta_min=0,
-                    )],
-                    milestones=[warmup_steps],
-                )
-        else:
-            scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
-                optimizer, T_max=total_steps, eta_min=0,
-            )
-        return {
-            "optimizer": optimizer,
-            "lr_scheduler": {
-                "scheduler": scheduler,
-                "interval": "step",
-                "frequency": 1,
-            },
-        }
-
+        return configure_optimizer(self.model, self.image_cfg, self._trainer)
 
     def on_validation_epoch_start(self):
-        self._validation_metrics = {}
-        self._validation_expression = {}
+        self.validation.reset()
         release_inference_cache(self.device, f"validation epoch {self.current_epoch + 1} begin")
 
     def validation_step(self, slide, batch_index):
-        # 留出切片验证使用 EMA; 最终测试使用的模型由 pipeline 决定。
-        if self.validation_roots is None or self.tiling is None:
+        if not self.validation.enabled:
             return None
-        gene_options = {}
-        data_module = getattr(self.trainer, "datamodule")
-        evaluate_segmentation = slide.has_segmentation
-        multi_slide_evaluation = len(data_module.test_names) > 1
-        if self.model.gene_count:
-            gene_options = {
-                "gene_adata": data_module.val_gene_adata,
-                "spot_radius_px": self.spot_radius_px,
-                "expression_transform": self.expression_transform,
-                "expression_results": self._validation_expression,
-                "save_dense_expression": (
-                    self.visualization_dir is not None
-                    and int(self.image_cfg.get("gene_visualization_top_n", 10)) > 0
-                    and self.trainer.is_global_zero
-                ),
-            }
-        probability, metrics = validate_slide(
-            self.ema_model,
-            slide,
-            self.validation_roots[slide.name],
-            self.device,
-            **self.tiling,
-            mpp=self.mpp,
-            **gene_options,
-            evaluate_segmentation=evaluate_segmentation,
+        data = self.trainer.datamodule
+        metrics = self.validation.evaluate(
+            self.ema_model, slide, data.val_gene_adata,
+            device=self.device, epoch=self.current_epoch + 1,
+            save_dense=int(self.image_cfg.gene_visualization_top_n) > 0 and self.trainer.is_global_zero,
         )
-        self._validation_metrics[slide.name] = metrics
-        if self.visualization_dir is not None and evaluate_segmentation:
-            labels, valid = load_expert_masks(self.validation_roots[slide.name], slide, self.mpp)
-            save_prediction_result(
-                self.visualization_dir / f"epoch_{self.current_epoch + 1:04d}",
-                slide.image,
-                probability,
-                labels,
-                valid,
-                self.label_scale,
-            )
         self.log_dict(
-            {
-                f"val/{name}": float(metrics[name])
-                for name in metrics
-                if name in {"loss", "dice", "iou"}
-                or (name.startswith("gene_") and not multi_slide_evaluation)
-            },
-            on_step=False,
-            on_epoch=True,
-            prog_bar=True,
-            batch_size=1,
+            {f"val/{name}": float(value) for name, value in metrics.items()
+             if name in {"loss", "dice", "iou"}
+             or (name.startswith("gene_") and len(data.test_names) <= 1)},
+            on_step=False, on_epoch=True, prog_bar=True, batch_size=1,
         )
         return metrics
 
     def on_validation_epoch_end(self):
         try:
-            data_module = getattr(self.trainer, "datamodule")
-            summary = summarize_expression_metrics(self._validation_metrics, self._validation_expression)
+            data = self.trainer.datamodule
+            summary = self.validation.summarize(
+                data.val_gene_adata, data.val_slides, epoch=self.current_epoch + 1,
+                top_n=int(self.image_cfg.gene_visualization_top_n),
+                save_images=self.trainer.is_global_zero,
+            )
             if not summary:
                 return
-            top_n = int(self.image_cfg.get("gene_visualization_top_n", 10))
-            if self.visualization_dir is not None and top_n > 0 and self.trainer.is_global_zero:
-                save_top_gene_predictions(
-                    self.visualization_dir / f"epoch_{self.current_epoch + 1:04d}" / "gene_expression",
-                    self._validation_expression, list(map(str, data_module.val_gene_adata.var_names)),
-                    data_module.val_slides, top_n=top_n, spot_radius_px=self.spot_radius_px,
-                    expression_transform=self.expression_transform,
-                )
-                for record in self._validation_expression.values():
-                    record.pop("dense_expression", None)
-                    record.pop("dense_tissue", None)
             self.log("val/gene_prediction_pcc_macro", summary["macro"]["gene_prediction_pcc"],
                      prog_bar=True, batch_size=1)
-            if len(data_module.test_names) <= 1:
-                return
-            self.log_dict(
-                {f"val/{key}": value for key, value in summary["micro"].items()},
-                prog_bar=True, batch_size=1,
-            )
-            for name, metrics in summary["slides"].items():
-                self.log_dict({f"val/{name}/{key}": value for key, value in metrics.items()}, batch_size=1)
+            if len(data.test_names) > 1:
+                self.log_dict({f"val/{key}": value for key, value in summary["micro"].items()},
+                              prog_bar=True, batch_size=1)
+                for name, metrics in summary["slides"].items():
+                    self.log_dict({f"val/{name}/{key}": value for key, value in metrics.items()}, batch_size=1)
         finally:
             release_inference_cache(self.device, f"validation epoch {self.current_epoch + 1} end")
 
-
     def on_train_batch_end(self, outputs, batch, batch_idx):
         self._update_ema_model()
-
 
     @torch.no_grad()
     def _update_ema_model(self):
@@ -369,7 +216,6 @@ class SegmentationModule(pl.LightningModule):
         self._last_ema_step = step
         self.ema_model.eval()
 
-
     def _update_segmentation_metrics(self, output, batch):
         valid = batch["valid"].bool()
         # forward 同时计算当前 batch 指标和累积 epoch 统计；保留 batch 维以支持空掩码。
@@ -377,57 +223,5 @@ class SegmentationModule(pl.LightningModule):
         target = (batch["cancer_probability"] >= 0.5)[valid].reshape(1, -1)
         self.train_dice(probability, target)
         self.train_iou(probability, target)
-        self.log(
-            "train/dice",
-            self.train_dice,
-            on_step=True,
-            on_epoch=True,
-            prog_bar=True,
-        )
-        self.log(
-            "train/iou",
-            self.train_iou,
-            on_step=True,
-            on_epoch=True,
-            prog_bar=True,
-        )
-
-
-    def _mixup_segmentation_loss(self, batch):
-        if not bool(self.augment_cfg.enabled):
-            return None
-        cfg = self.augment_cfg.get("mixup")
-        if cfg is None or not bool(cfg.enabled) or self.current_epoch < int(cfg.start_epoch):
-            return None
-        if float(cfg.probability) <= 0 or torch.rand(()).item() >= float(cfg.probability):
-            return None
-
-        result = mixup_batch(batch, cfg)
-        if result is None:
-            return None
-        mixed, ratio, indices, partners = result
-        output = self(mixed["image"], mixed["patch"], mixed["cls"], mixed["pfm_mask"])
-        logits = output["logits"]
-        return (
-            ratio * segmentation_loss(
-                logits, batch["cancer_probability"][indices], batch["valid"][indices]
-            )
-            + (1 - ratio) * segmentation_loss(
-                logits, batch["cancer_probability"][partners], batch["valid"][partners]
-            )
-        )
-
-
-    def _cutmix_segmentation_loss(self, batch):
-        if not bool(self.augment_cfg.enabled):
-            return None
-        cfg = self.augment_cfg.get("cutmix")
-        if cfg is None or not bool(cfg.enabled) or self.current_epoch < int(cfg.start_epoch):
-            return None
-        if float(cfg.probability) <= 0 or torch.rand(()).item() >= float(cfg.probability):
-            return None
-        mixed = cutmix_batch(batch, cfg)
-        if mixed is None:
-            return None
-        output = self(mixed["image"], mixed["patch"], mixed["cls"], mixed["pfm_mask"])
-        return segmentation_loss(output["logits"], mixed["cancer_probability"], mixed["valid"])
+        for name, metric in (("dice", self.train_dice), ("iou", self.train_iou)):
+            self.log(f"train/{name}", metric, on_step=True, on_epoch=True, prog_bar=True)

@@ -114,7 +114,7 @@ def augment_geometry(sample, rng, size, cfg):
         coordinates[:, 1] = size - 1 - coordinates[:, 1]
     sample["spots"] = coordinates
 
-    for key in ("image", "cancer_probability", "valid", "superpixels", "tissue"):
+    for key in ("image", "cancer_probability", "valid", "tissue"):
         if key in sample:
             sample[key] = _transform_geometry(sample[key], turns, flip_x, flip_y)
     for key in ("patch", "cls"):

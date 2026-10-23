@@ -3,7 +3,7 @@ defaults:
   - _self_
 
 image:
-  batch_size: 16  # 1 mpp 状态图较大；保持 896 μm 的 crop 物理视野
+  batch_size: 8  # 1 mpp 状态图较大；保持 896 μm 的 crop 物理视野
   accumulate_grad_batches: 1  # 每个优化器 step 累积的 batch 数
   loss_weights:
     segmentation: 1.0  # 使用整片动态传播缓存的伪标签
@@ -11,4 +11,4 @@ image:
     gene_correlation: 1.0
     state_balance: 0.1  # 仅惩罚低于 alpha/K 的组织状态用量；0 关闭，包含仅有表达的切片
     template_orthogonal: 0.1  # 模板两两去相关（log 空间余弦平方均值）；0 关闭
-    template_entropy: 0.05  # 模板熵（nats）；正权重压熵更稀疏，负权重抬熵更弥散；0 关闭
+    template_entropy: 0.01  # 模板熵（nats）；正权重压熵更稀疏，负权重抬熵更弥散；0 关闭

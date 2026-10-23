@@ -3,7 +3,7 @@ import math
 import torch
 from torch.nn import functional as F
 
-from segmodel.modules.spot_pooling import collate_spot_pools, pool_spot_batch, prepare_spot_pool
+from segmodel.modules.spot_pooling import pool_spot_batch
 
 
 def _gene_correlation_terms(predictions, targets, slide_names, min_spots, std_floor):
@@ -34,29 +34,15 @@ def _gene_correlation_terms(predictions, targets, slide_names, min_spots, std_fl
 
 
 def gene_prediction_losses(
-    output, batch, spot_radius_px, label_scale, expression_transform="log1p",
-    *, weights=None, correlation_min_spots=8, correlation_std_floor=0.02,
+    output, batch, *, expression_transform, weights,
+    correlation_min_spots, correlation_std_floor,
 ):
     """计算 spot 表达 MSE，以及按 slide 去均值后的 batch 正则化相关性损失。"""
-    if weights is None:
-        weights = {"gene_prediction": 1.0}
     losses = {}
-    factorized = "expression_templates" in output
-    field = (output["tissue_states"] * output["expression_amplitude"]
-             if factorized else output["gene_expression"])
-    plan = batch.get("spot_pool")
-    if plan is None:
-        tissue = batch.get("tissue", batch["superpixels"])[:, 0]
-        plans = [prepare_spot_pool(grid, spots, spot_radius_px, label_scale)
-                 for grid, spots in zip(tissue, batch["spots"])]
-        plan = collate_spot_pools(plans, field.shape[-2:])
-        plan = {key: [item.to(field.device) for item in value] if key == "indices"
-                else value.to(field.device) if isinstance(value, torch.Tensor) else value
-                for key, value in plan.items()}
+    field = output["tissue_states"] * output["expression_amplitude"]
+    plan = batch["spot_pool"]
     with torch.autocast(device_type=field.device.type, enabled=False):
-        pooled = pool_spot_batch(field, plan)
-        if factorized:
-            pooled = pooled @ output["expression_templates"]
+        pooled = pool_spot_batch(field, plan) @ output["expression_templates"]
     predictions = [value for value, count in zip(pooled.split(plan["counts"]), plan["counts"]) if count]
     targets = [expression[indices].detach().float()
                for expression, indices, count in zip(batch["gene_expression"], plan["indices"], plan["counts"])

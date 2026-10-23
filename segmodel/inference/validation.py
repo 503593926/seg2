@@ -1,5 +1,4 @@
 from pathlib import Path
-from typing import cast
 
 import cv2
 import numpy as np
@@ -7,7 +6,7 @@ import torch
 
 from segmodel.inference.metrics import expression_metrics, segmentation_metrics
 from segmodel.inference.predictor import predict_slide
-from segmodel.modules.spot_pooling import pool_spot_expression, prepare_spot_pool
+from segmodel.modules.spot_pooling import prepare_spot_pool
 from tools.label_grid import label_grid_root
 
 
@@ -50,7 +49,6 @@ def validate_slide(
     expression_results=None,
     save_dense_expression=False,
 ):
-    factorized = bool(getattr(model, "tissue_state_count", 0)) and gene_adata is not None
     cache_dense = save_dense_expression and gene_adata is not None and expression_results is not None
     metrics = {}
     factors = {}
@@ -71,18 +69,17 @@ def validate_slide(
         )) > 0)
         if tissue.shape != (slide.height // slide.label_scale, slide.width // slide.label_scale):
             raise ValueError(f"{slide.name}: tissue mask must match the prediction grid")
-        if factorized:
-            # 按整片像素位置排序，窗口内只扫描对应行范围的 spot 像素。
-            plan = prepare_spot_pool(tissue, spots, spot_radius_px, slide.label_scale)
-            pixels, rows = plan["pixels"].numpy(), plan["rows"].numpy()
-            order = np.argsort(pixels, kind="stable")
-            spot_pool = {
-                "pixels": pixels[order], "rows": rows[order],
-                "pixel_counts": np.bincount(rows, minlength=plan["count"]),
-                "indices": plan["indices"].numpy(),
-            }
-            del plan
-        probability, expression = predict_slide(
+        # 按整片像素位置排序，窗口内只扫描对应行范围的 spot 像素。
+        plan = prepare_spot_pool(tissue, spots, spot_radius_px, slide.label_scale)
+        pixels, rows = plan["pixels"].numpy(), plan["rows"].numpy()
+        order = np.argsort(pixels, kind="stable")
+        spot_pool = {
+            "pixels": pixels[order], "rows": rows[order],
+            "pixel_counts": np.bincount(rows, minlength=plan["count"]),
+            "indices": plan["indices"].numpy(),
+        }
+        del plan
+        probability, _ = predict_slide(
             model,
             slide,
             crop_size=crop_size,
@@ -90,21 +87,13 @@ def validate_slide(
             alignment=alignment,
             device=device,
             batch_size=batch_size,
-            return_features=not factorized,
-            feature_key="gene_expression",
+            return_features=False,
             expression_factors=factors if cache_dense else None,
             spot_pool=spot_pool,
         )
-        if spot_pool is not None:
-            valid = torch.zeros(len(spots), dtype=torch.bool)
-            valid[torch.from_numpy(spot_pool["indices"])] = True
-            prediction = torch.from_numpy(spot_pool["coefficients"]) @ torch.from_numpy(spot_pool["templates"])
-        else:
-            prediction, valid = pool_spot_expression(
-                torch.from_numpy(cast(np.ndarray, expression)).permute(2, 0, 1),
-                tissue, spots, spot_radius_px, slide.label_scale,
-            )
-            prediction = prediction[valid]
+        valid = torch.zeros(len(spots), dtype=torch.bool)
+        valid[torch.from_numpy(spot_pool["indices"])] = True
+        prediction = torch.from_numpy(spot_pool["coefficients"]) @ torch.from_numpy(spot_pool["templates"])
         target, observed = truth[valid].float(), observed[valid]
         if expression_transform == "log1p":
             prediction = prediction.log1p()
@@ -116,7 +105,7 @@ def validate_slide(
                 "spot_ids": spot_ids[valid], "spots": spots.numpy()[valid],
             }
             if cache_dense:
-                spot_results["dense_expression"] = factors or {"prediction": expression}
+                spot_results["dense_expression"] = factors
                 spot_results["dense_tissue"] = tissue.numpy()
                 spot_results["dense_mpp"] = float(mpp) * slide.label_scale
             expression_results[slide.name] = spot_results

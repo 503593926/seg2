@@ -6,5 +6,4 @@ defaults:
 image:
   output_scale: 2  # Stem 3×3、stride=2、padding=1；1 mpp 输入，原生输出 2 mpp
   gradient_checkpointing: true  # 重算 ConvNeXt block、解码融合和状态头的激活
-  # 状态数 K 由 training.image.template_init.random_count 决定。
   tissue_state_dim: 32  # 单层 1×1 状态编码器输出通道数，不是状态数

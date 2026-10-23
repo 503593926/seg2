@@ -3,16 +3,13 @@ image:
   warmup_steps: 0.2  # 预热占总优化器 step 的比例 [0, 1]，向上取整；0 表示不预热
   progress_every_n_steps: 1  # 进度条指标刷新间隔，按优化器更新计数；首步和每轮末尾也刷新
   val_every_n_epochs: 1   # 每 N 个 epoch 验证一次（指标 + validation/ 可视化）；epochs 不被 N 整除时末尾无验证
-  gene_visualization_top_n: 5  # 每轮验证后保存 pooled PCC 最高的 N 个基因的归一化 spot/dense 对照图；0 关闭
+  gene_visualization_top_n: 1  # 每轮验证后保存 pooled PCC 最高的 N 个基因的归一化 spot/dense 对照图；0 关闭
   batch_size: 8
   expression_transform: log1p  # 线性表达先做 spot 均值，再 log1p 计算 MSE/PCC
   gene_correlation_min_spots: 8  # 当前 batch 内每个 slide 合并后至少包含这些有效 spot，最低按 3 个处理
   gene_correlation_std_floor: 0.02  # 相关性两侧标准差的软下限，单位为 log1p 表达标准差
   ema_decay: 0.999
   state_balance_alpha: 0.5  # 每个状态最低用量为 alpha / K，取值 (0, 1]
-
-  template_init:
-    random_count: 32  # 随机模板数量，即状态数 K；至少为 2，全部参与训练
 
   lr: 4e-3
   weight_decay: 0.05

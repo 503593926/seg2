@@ -70,26 +70,29 @@ def _resolve_tiling(cfg, data_module):
     }
 
 
+def build_model(model_cfg, slide, gene_names):
+    """完整解析实验模型配置；保存的构造参数与实际建模使用同一份值。"""
+    model_options = cast(dict[str, Any], OmegaConf.to_container(model_cfg, resolve=True))
+    if int(model_options["output_scale"]) != slide.label_scale:
+        raise ValueError("model.image.output_scale must match resolution.label_mpp / target_mpp")
+    model_options.update(
+        pfm_patch_dims=list(slide.patch_dims), pfm_cls_dims=list(slide.cls_dims),
+        gene_count=len(gene_names),
+    )
+    model = SegmentationModel(**model_options)
+    model.model_config = model_options
+    model.gene_names = list(map(str, gene_names))
+    return model
+
+
 def _train_segmentation(cfg, data_module, tiling, output_dir):
     slide = next(iter(data_module.train_slides.values()))
     label_scale = slide.label_scale
-    model_cfg = cfg.experiment.model.image
     train_cfg = cfg.experiment.training.image
-    model_options = cast(dict[str, Any], OmegaConf.to_container(model_cfg, resolve=True))
-    if int(model_options["output_scale"]) != label_scale:
-        raise ValueError("model.image.output_scale must match resolution.label_mpp / target_mpp")
-    model_options["gene_count"] = data_module.train_gene_adata.n_vars
-    model_options["tissue_state_count"] = train_cfg.template_init.random_count
-    model = SegmentationModel(
-        pfm_patch_dims=slide.patch_dims,
-        pfm_cls_dims=slide.cls_dims,
-        **model_options,
-    )
-    model.gene_names = list(map(str, data_module.train_gene_adata.var_names))
+    model = build_model(cfg.experiment.model.image, slide, data_module.train_gene_adata.var_names)
     module = SegmentationModule(
         model,
         train_cfg,
-        cfg.experiment.augment,
         validation_roots=data_module.data_roots,
         tiling=tiling,
         mpp=float(cfg.resolution.target_mpp),
@@ -131,22 +134,11 @@ def _train_segmentation(cfg, data_module, tiling, output_dir):
 
 
 def _save_final_model(cfg, model, tiling, output_dir):
-    model_config = cast(
-        dict[str, Any],
-        OmegaConf.to_container(cfg.experiment.model.image, resolve=True),
-    )
-    model_config["pfm_patch_dims"] = list(model.pfm_patch_dims)
-    model_config["pfm_cls_dims"] = list(model.pfm_cls_dims)
-    model_config["gene_count"] = model.gene_count
-    model_config["tissue_state_count"] = model.tissue_state_count
-    model_config["output_scale"] = model.output_scale
-    model_config["gradient_checkpointing"] = model.gradient_checkpointing
-    model_config["downsample_factor"] = model.downsample_factor
     artifact = {
         "state_dict": {
             name: value.detach().cpu() for name, value in model.state_dict().items()
         },
-        "model_config": model_config,
+        "model_config": model.model_config,
         "inference_config": {**tiling, "threshold": 0.5},
         "image_feature_map": list(cfg.experiment.dataset.image_feature_maps),
         "resolution": {

@@ -1,9 +1,7 @@
-from collections.abc import Iterator
-
 import cv2
 import numpy as np
 import torch
-from torch.utils.data import Dataset, Sampler, default_collate
+from torch.utils.data import Dataset, default_collate
 
 from segmodel.dataset.augment import (
     augment_geometry,
@@ -11,65 +9,9 @@ from segmodel.dataset.augment import (
     get_augmented_inputs,
     pfm_mask,
 )
+# 保留原导入路径，采样实现集中在 sampling.py。
+from segmodel.dataset.sampling import EpochSampler as EpochSampler
 from segmodel.modules.spot_pooling import collate_spot_pools, prepare_spot_pool
-
-
-class EpochSampler(Sampler):
-    """把 epoch 和可选的分组 crop 计划发给 worker。"""
-
-    def __init__(self, dataset, batch_size=1, slides_per_batch=None):
-        self.dataset = dataset
-        self.batch_size = int(batch_size)
-        self.slides_per_batch = slides_per_batch
-        if slides_per_batch is not None:
-            if isinstance(slides_per_batch, bool) or not isinstance(slides_per_batch, int):
-                raise ValueError("slides_per_batch must be an integer or null")
-            if not 1 <= slides_per_batch <= min(self.batch_size, len(dataset.slide_names)):
-                raise ValueError("slides_per_batch must be between 1 and min(batch_size, training slides)")
-            if self.batch_size % slides_per_batch:
-                raise ValueError("batch_size must be divisible by slides_per_batch")
-            fraction = dataset.dataset_cfg.get("labeled_sampling_fraction")
-            if fraction is not None and not 0 < float(fraction) < 1:
-                raise ValueError("labeled_sampling_fraction must be between 0 and 1")
-
-    def set_epoch(self, epoch):
-        self.dataset.epoch = int(epoch)
-
-    def __iter__(self) -> Iterator[tuple]:
-        epoch = self.dataset.epoch
-        if self.slides_per_batch is None:
-            yield from ((epoch, index) for index in range(len(self.dataset)))
-            return
-        for start in range(0, len(self.dataset), self.batch_size):
-            count = min(self.batch_size, len(self.dataset) - start)
-            rng = np.random.default_rng(np.random.SeedSequence([self.dataset.seed, epoch, start, 1]))
-            names = self._sample_slides(rng, min(self.slides_per_batch, count))
-            crops, extra = divmod(count, len(names))
-            index = start
-            for position, name in enumerate(names):
-                for top, left in self.dataset._sample_slide_origins(name, crops + (position < extra), rng):
-                    yield epoch, index, name, top, left
-                    index += 1
-
-    def _sample_slides(self, rng, count):
-        dataset = self.dataset
-        fraction = dataset.dataset_cfg.get("labeled_sampling_fraction")
-        if fraction is None or not dataset.labeled_names or not dataset.expression_only_names:
-            return rng.choice(dataset.slide_names, size=count, replace=False).tolist()
-        expected = count * float(fraction)
-        labeled_count = int(np.floor(expected)) + int(rng.random() < expected % 1)
-        # 某组切片不足时，从另一组补足，保持 batch 内切片互不重复。
-        labeled_count = min(max(labeled_count, count - len(dataset.expression_only_names)),
-                            len(dataset.labeled_names))
-        names = (
-            rng.choice(dataset.labeled_names, size=labeled_count, replace=False).tolist()
-            + rng.choice(dataset.expression_only_names, size=count - labeled_count, replace=False).tolist()
-        )
-        rng.shuffle(names)
-        return names
-
-    def __len__(self):
-        return len(self.dataset)
 
 
 class SegmentationDataset(Dataset):
@@ -98,7 +40,7 @@ class SegmentationDataset(Dataset):
         self.shared_supervision = {}
         self.shared_crop_origins = {}
         if int(cfg.experiment.dataset.num_workers) > 0:
-            # 固定超像素也共享存储，避免 spawn worker 复制整片数组。
+            # 动态监督共享更新；固定超像素也共享，避免 spawn 复制整片数组。
             for name in self.labeled_names:
                 slide = self.slides[name]
                 self.shared_supervision[name] = {}
@@ -257,7 +199,6 @@ class SegmentationDataset(Dataset):
         arrays = {
             "cancer_probability": slide.cancer_probability,
             "valid": slide.pseudo_mask_uint8,
-            "superpixels": slide.superpixels,
             "tissue": slide.tissue_mask_bl,
         }
         supervision = {}
@@ -268,7 +209,6 @@ class SegmentationDataset(Dataset):
             supervision[key] = torch.from_numpy(crop[None].copy())
 
         supervision["valid"] = supervision["valid"] != 255
-        supervision["superpixels"] = supervision["superpixels"].int()
         return supervision
 
     def _spot_targets(self, name, top, left):
@@ -281,12 +221,11 @@ class SegmentationDataset(Dataset):
             "slide": name,
             "spots": torch.from_numpy(local[keep].astype(np.float32)),
             "gene_expression": self.gene_expression[indices],
-            "spot_labels": self.spot_labels[indices],
         }
 
 
 def collate_samples(samples):
-    variable_keys = {"spots", "gene_expression", "spot_labels"}
+    variable_keys = {"spots", "gene_expression"}
     batch = {}
     for key in samples[0]:
         values = [sample[key] for sample in samples]

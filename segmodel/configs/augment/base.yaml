@@ -36,22 +36,3 @@ pfm_mask:
 
 sampling:
   spot_sampling_fraction: 0.25
-
-mixup:
-  enabled: False         # 与 CutMix 分别做消融时单独开启
-  probability: 0.5
-  alpha: 0.8             # Beta(alpha, alpha) 的参数
-  weight: 0.5           # 额外分割损失的权重
-  start_epoch: 0         # 从 0 开始计数；0 表示第一个 epoch 即可启用
-  max_samples: 4         # 每次最多混合 4 个样本，限制显存
-
-cutmix:
-  enabled: False
-  probability: 0.5       # 每步额外执行 CutMix 分割前向的概率
-  weight: 0.5            # 额外分割损失的权重
-  start_epoch: 0         # 从 0 开始计数；0 表示第一个 epoch 即可启用
-  max_samples: 4         # 每次最多合成 4 个 crop，限制显存
-  positive_threshold: 0.9
-  negative_threshold: 0.1
-  min_cells: 1          # 矩形边长按共同特征网格单元计算
-  max_cells: 6

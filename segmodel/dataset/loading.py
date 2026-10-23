@@ -60,36 +60,40 @@ def load_feature_scales(root, feature_maps, resolution_cfg):
     return scales.pop()
 
 
-def load_training_slides(roots, names, dataset_cfg, resolution_cfg) -> dict[str, TrainingSlide]:
+def _load_slide(root, name, dataset_cfg, resolution_cfg):
+    """读取两种阶段共用的基础输入，返回切片和元数据中的 patch 步长。"""
+    target_mpp = float(resolution_cfg.target_mpp)
+    label_scale = resolve_label_scale(target_mpp, float(resolution_cfg.label_mpp))
+    feature_maps = list(dataset_cfg.image_feature_maps)
+    patch_scale, cls_scale = load_feature_scales(root, feature_maps, resolution_cfg)
+    sample_dir = root / "samples" / name
+    image, patch_maps, cls_maps = read_slide_inputs(
+        sample_dir / f"spatial/he_{target_mpp:g}mpp.png",
+        [root / str(feature_map) / name for feature_map in feature_maps],
+    )
+    return Slide(
+        name, image, patch_maps, cls_maps, cls_scale, label_scale,
+        has_segmentation=(sample_dir / "masks/training_mask.png").is_file(),
+    ), patch_scale
 
+
+def load_training_slides(roots, names, dataset_cfg, resolution_cfg) -> dict[str, TrainingSlide]:
     target_mpp = float(resolution_cfg.target_mpp)
     label_mpp = float(resolution_cfg.label_mpp)
-    label_scale = resolve_label_scale(target_mpp, label_mpp)
     spot_radius_px = float(dataset_cfg.spot_diameter_um) / (2.0 * target_mpp)
-    feature_maps = list(dataset_cfg.image_feature_maps)
     slides = {}
     for name in names:
         root = Path(roots[name])
         sample_dir = root / "samples" / name
-
-        _, cls_scale = load_feature_scales(
-            root, feature_maps, resolution_cfg
-        )
-
-        image, patch_maps, cls_maps = read_slide_inputs(
-            sample_dir / f"spatial/he_{target_mpp:g}mpp.png",
-            [root / str(feature_map) / name for feature_map in feature_maps],
-        )
-
+        slide, _ = _load_slide(root, name, dataset_cfg, resolution_cfg)
         label_dir = label_grid_root(root, target_mpp, label_mpp) / name
-        shape = tuple(size // label_scale for size in image.shape[:2])
-        spatial_dir = sample_dir / "spatial" if label_scale == 1 else label_dir / "spatial"
+        shape = (slide.height // slide.label_scale, slide.width // slide.label_scale)
+        spatial_dir = sample_dir / "spatial" if slide.label_scale == 1 else label_dir / "spatial"
         tissue_mask = np.asarray(cv2.imread(
             str(spatial_dir / "tissue_mask.png"),
             cv2.IMREAD_GRAYSCALE,
         ))
-        has_segmentation = (sample_dir / "masks/training_mask.png").is_file()
-        if has_segmentation:
+        if slide.has_segmentation:
             pseudo_dir = label_dir / str(dataset_cfg.pseudo_label_dir)
             pseudo_mask_uint8 = np.asarray(cv2.imread(str(pseudo_dir / "pseudo_mask.png"), cv2.IMREAD_GRAYSCALE))
             cancer_probability = np.asarray(cv2.imread(
@@ -110,41 +114,21 @@ def load_training_slides(roots, names, dataset_cfg, resolution_cfg) -> dict[str,
             )
 
         slides[name] = TrainingSlide(
-            name=name,
-            image=image,
-            patch_maps=patch_maps,
-            cls_maps=cls_maps,
-            cls_scale=cls_scale,
-            label_scale=label_scale,
+            **vars(slide),
             spot_radius_px=spot_radius_px,
             pseudo_mask_uint8=pseudo_mask_uint8,
             cancer_probability=cancer_probability,
             superpixels=superpixels,
             tissue_mask_bl=tissue_mask > 0,
-            has_segmentation=has_segmentation,
         )
     return slides
 
 
 def load_inference_slides(roots, names, dataset_cfg, resolution_cfg) -> dict[str, Slide]:
     """只读取 test/predict 所需的图像和离线特征。"""
-    target_mpp = float(resolution_cfg.target_mpp)
-    label_scale = resolve_label_scale(target_mpp, float(resolution_cfg.label_mpp))
-    feature_maps = list(dataset_cfg.image_feature_maps)
     slides = {}
     for name in names:
-        root = Path(roots[name])
-        patch_scale, cls_scale = load_feature_scales(
-            root, feature_maps, resolution_cfg
-        )
-        image, patch_maps, cls_maps = read_slide_inputs(
-            root / "samples" / name / f"spatial/he_{target_mpp:g}mpp.png",
-            [root / str(feature_map) / name for feature_map in feature_maps],
-        )
-        slide = Slide(
-            name, image, patch_maps, cls_maps, cls_scale, label_scale,
-            has_segmentation=(root / "samples" / name / "masks/training_mask.png").is_file(),
-        )
+        slide, patch_scale = _load_slide(Path(roots[name]), name, dataset_cfg, resolution_cfg)
         if slide.patch_scale != (patch_scale, patch_scale):
             raise ValueError(
                 f"{name}: loaded patch scale {slide.patch_scale} does not match "

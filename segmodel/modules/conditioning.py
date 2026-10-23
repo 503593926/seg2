@@ -50,13 +50,7 @@ class JointRouter(nn.Module):
         if available is not None:
             logits = logits.masked_fill(~available, float("-inf"))
 
-        k = min(self.top_k, logits.shape[-1])
-        values, indices = logits.topk(k, dim=-1)
-
-        topk_logits = torch.full_like(logits, float("-inf"))
-        topk_logits.scatter_(-1, indices, values)
-
-        return torch.softmax(topk_logits, dim=-1)
+        return _topk_softmax(logits, self.top_k, dim=-1)
 
 
 class SpatialRouter(nn.Module):
@@ -86,12 +80,7 @@ class SpatialRouter(nn.Module):
                 float("-inf"),
             )
 
-        k = min(self.top_k, logits.shape[1])
-        values, indices = logits.topk(k, dim=1)
-
-        topk_logits = torch.full_like(logits, float("-inf"))
-        topk_logits.scatter_(1, indices, values)
-        return torch.softmax(topk_logits, dim=1)
+        return _topk_softmax(logits, self.top_k, dim=1)
 
 
 class ConditionalNorm(nn.Module):
@@ -105,7 +94,7 @@ class ConditionalNorm(nn.Module):
 
         self.resize = Resize()
 
-    def forward(self, x, task_global, task_spatial, available, routing, global_router, spatial_router):
+    def forward(self, x, task_global, task_spatial, available, global_router, spatial_router):
         # 归一化用 FP32，输出转回特征精度后再施加条件调制。
         with torch.autocast(device_type=x.device.type, enabled=False):
             x_hat = F.layer_norm(
@@ -114,7 +103,6 @@ class ConditionalNorm(nn.Module):
         x_hat = x_hat.permute(0, 3, 1, 2).to(dtype=x.dtype)
 
         weight = global_router(x.mean(dim=(2, 3)), task_global, available)
-        routing.append(weight.detach())
         c_g = sum(weight[:, i : i + 1] * f for i, f in enumerate(task_global))
         gamma_g, beta_g = self.global_head(c_g).chunk(2, dim=-1)
 
@@ -143,3 +131,10 @@ def _zero_modulation(module):
     nn.init.zeros_(module.bias)
     return module
 
+
+def _topk_softmax(logits, top_k, dim):
+    """仅保留指定轴的 top-k logits，其余 expert 的权重严格为零。"""
+    values, indices = logits.topk(min(top_k, logits.shape[dim]), dim=dim)
+    selected = torch.full_like(logits, float("-inf"))
+    selected.scatter_(dim, indices, values)
+    return torch.softmax(selected, dim=dim)

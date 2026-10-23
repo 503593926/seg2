@@ -24,27 +24,27 @@ def init_convnext_backbone(module):
 class ConvNeXtUnet(nn.Module):
     def __init__(
         self,
-        encoder_chans=(64, 96, 128),
-        decoder_chans=(96, 64),
-        drop_path=(0.1, 0.3, 0.5),
-        blocks=2,
-        global_dim=256,
-        spatial_dim=64,
-        pfm_count=5,
-        g_top_k=2,
-        s_top_k=2,
-        skip_drop_path=0.1,
-        gradient_checkpointing=False,
-        downsample_factor=2,
-        encoder_spatial=None,
-        decoder_spatial=None,
+        *,
+        encoder_chans,
+        decoder_chans,
+        drop_path,
+        blocks,
+        global_dim,
+        spatial_dim,
+        pfm_count,
+        g_top_k,
+        s_top_k,
+        skip_drop_path,
+        gradient_checkpointing,
+        downsample_factor,
+        encoder_spatial,
+        decoder_spatial,
     ):
         super().__init__()
 
-        if encoder_spatial is None:
-            encoder_spatial = [False] * len(encoder_chans)
-        if decoder_spatial is None:
-            decoder_spatial = [False] * len(decoder_chans)
+        if not (len(encoder_chans) == len(drop_path) == len(encoder_spatial)
+                and len(decoder_chans) == len(decoder_spatial) == len(encoder_chans) - 1):
+            raise ValueError("Channel, drop_path and spatial settings must match the encoder/decoder stages")
         self.use_spatial = any(encoder_spatial) or any(decoder_spatial)
 
         cnorm_kwargs = dict(
@@ -55,33 +55,24 @@ class ConvNeXtUnet(nn.Module):
             s_top_k=s_top_k,
         )
 
-        self.encoder_stages = nn.ModuleList()
-
-        for i, (channels, rate) in enumerate(zip(encoder_chans, drop_path)):
-            self.encoder_stages.append(
-                ConvNeXtStage(
-                    channels, rate, blocks, cnorm_kwargs,
-                    use_spatial=encoder_spatial[i],
-                    gradient_checkpointing=gradient_checkpointing,
-                )
+        self.encoder_stages = nn.ModuleList(
+            ConvNeXtStage(
+                channels, rate, blocks, cnorm_kwargs,
+                use_spatial=encoder_spatial[i],
+                gradient_checkpointing=gradient_checkpointing,
             )
-
-        self.downsamples = nn.ModuleList()
-
-        for i in range(len(encoder_chans) - 1):
-            self.downsamples.append(
-                Downsample(encoder_chans[i], encoder_chans[i + 1], factor=downsample_factor)
-            )
+            for i, (channels, rate) in enumerate(zip(encoder_chans, drop_path))
+        )
+        self.downsamples = nn.ModuleList(
+            Downsample(in_chans, out_chans, factor=downsample_factor)
+            for in_chans, out_chans in zip(encoder_chans, encoder_chans[1:])
+        )
 
         self.decoder_stages = nn.ModuleList()
-
         current_chans = encoder_chans[-1]
-
-        skip_chans_list = list(reversed(encoder_chans[:-1]))
-
         for i, (out_chans, skip_chans, rate) in enumerate(zip(
             decoder_chans,
-            skip_chans_list,
+            reversed(encoder_chans[:-1]),
             reversed(drop_path[:-1]),
         )):
             self.decoder_stages.append(
@@ -98,24 +89,18 @@ class ConvNeXtUnet(nn.Module):
                     upsample_factor=downsample_factor,
                 )
             )
-
             current_chans = out_chans
 
-        self.out_channels = current_chans
-
-    def forward(self, x, task_global, task_spatial, available, routing):
-
+    def forward(self, x, task_global, task_spatial, available):
         skips = []
-
         for i, stage in enumerate(self.encoder_stages):
-            x = stage(x, task_global, task_spatial, available, routing)
-
+            x = stage(x, task_global, task_spatial, available)
             if i < len(self.downsamples):
                 skips.append(x)
                 x = self.downsamples[i](x)
 
         for stage, skip in zip(self.decoder_stages, reversed(skips)):
-            x = stage(x, skip, task_global, task_spatial, available, routing)
+            x = stage(x, skip, task_global, task_spatial, available)
 
         return x
 
@@ -156,9 +141,9 @@ class ConvNeXtStage(nn.Module):
             for _ in range(blocks)
         )
 
-    def forward(self, x, task_global, task_spatial, available, routing):
+    def forward(self, x, task_global, task_spatial, available):
         for block in self.blocks:
-            arguments = (x, task_global, task_spatial, available, routing,
+            arguments = (x, task_global, task_spatial, available,
                          self.global_router, self.spatial_router)
             if self.gradient_checkpointing and self.training and torch.is_grad_enabled():
                 x = checkpoint(block, *arguments, use_reentrant=False)
@@ -172,13 +157,7 @@ class ConvNeXtBlock(nn.Module):
                  use_spatial=False):
         super().__init__()
 
-        self.dwconv = nn.Conv2d(
-            dim, dim,
-            kernel_size=7,
-            padding=3,
-            groups=dim
-        )
-
+        self.dwconv = nn.Conv2d(dim, dim, kernel_size=7, padding=3, groups=dim)
         self.cnorm = ConditionalNorm(
             dim,
             cnorm_kwargs["global_dim"],
@@ -187,34 +166,20 @@ class ConvNeXtBlock(nn.Module):
         )
 
         self.pwconv1 = nn.Conv2d(dim, dim * 4, kernel_size=1)
-
         self.act = nn.GELU()
-
         self.pwconv2 = nn.Conv2d(dim * 4, dim, kernel_size=1)
-
         self.drop_path = DropPath(drop_path)
+        self.gamma = nn.Parameter(layer_scale_init_value * torch.ones(dim))
 
-        self.gamma = nn.Parameter(
-            layer_scale_init_value * torch.ones(dim)
-        )
-
-    def forward(self, x, task_global, task_spatial, available, routing, global_router, spatial_router):
+    def forward(self, x, task_global, task_spatial, available, global_router, spatial_router):
         shortcut = x
-
         x = self.dwconv(x)
-
-        x = self.cnorm(x, task_global, task_spatial, available, routing, global_router, spatial_router)
-
+        x = self.cnorm(x, task_global, task_spatial, available, global_router, spatial_router)
         x = self.pwconv1(x)
-
         x = self.act(x)
-
         x = self.pwconv2(x)
-
         gamma = self.gamma.to(dtype=x.dtype)[None, :, None, None]
-        x = shortcut + self.drop_path(gamma * x)
-
-        return x
+        return shortcut + self.drop_path(gamma * x)
 
 
 class Downsample(nn.Module):
@@ -269,28 +234,14 @@ class DecoderStage(nn.Module):
 
         return self.fuse(x)
 
-    def forward(self, x, skip, task_global, task_spatial, available, routing):
+    def forward(self, x, skip, task_global, task_spatial, available):
         # 融合与 block 分别重算，释放高分辨率插值、拼接和归一化的中间激活。
         if self.gradient_checkpointing and self.training and torch.is_grad_enabled():
             x = checkpoint(self._upsample_and_fuse, x, skip, use_reentrant=False)
         else:
             x = self._upsample_and_fuse(x, skip)
-        return self.blocks(x, task_global, task_spatial, available, routing)
+        return self.blocks(x, task_global, task_spatial, available)
 
-
-# class Upsample(nn.Module):
-#     def __init__(self, in_chans, out_chans, factor=2):
-#         super().__init__()
-#
-#         self.up = nn.ConvTranspose2d(
-#             in_chans,
-#             out_chans,
-#             kernel_size=factor,
-#             stride=factor,
-#         )
-#
-#     def forward(self, x):
-#         return self.up(x)
 
 class Upsample(nn.Module):
     def __init__(self, in_chans, out_chans, factor=4):
