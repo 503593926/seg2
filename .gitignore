@@ -12,6 +12,7 @@ __pycache__/
 *.log
 
 data1/
+/data/
 /outputs
 /lightning_logs
 /pretrained_model
@@ -34,3 +35,8 @@ baselines/
 
 # 本地编译的 SNIC 共享库（每台机器自行编译，不入库）
 *.so
+
+# Local package build products
+/build/
+/dist/
+*.egg-info/

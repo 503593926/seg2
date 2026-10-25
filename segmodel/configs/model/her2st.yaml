@@ -1,9 +1,0 @@
-defaults:
-  - base
-  - _self_
-
-# MoMu 输出 F 后预测共享软状态；表达模板随机初始化并参与训练。
-image:
-  output_scale: 2  # Stem 3×3、stride=2、padding=1；1 mpp 输入，原生输出 2 mpp
-  gradient_checkpointing: true  # 重算 ConvNeXt block、解码融合和状态头的激活
-  tissue_state_dim: 32  # 单层 1×1 状态编码器输出通道数，不是状态数

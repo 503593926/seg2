@@ -1,7 +1,0 @@
-# 唯一实验入口：患者隔离、混合监督、分割与表达联合预测。
-defaults:
-  - /dataset: her2st
-  - /model: her2st
-  - /training: her2st
-  - /augment: her2st
-  - /dynamic: her2st
