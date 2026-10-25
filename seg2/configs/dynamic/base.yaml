@@ -1,0 +1,6 @@
+enabled: true
+warmup_epochs: 5
+interval_epochs: 1
+save_intermediate: true
+batch_size: 1
+learned_weight: 1.0

@@ -1,0 +1,12 @@
+split_mode: patient_loocv
+patient_names: []
+labeled_sampling_fraction: null
+slides_per_batch: 4
+data_dir: ""
+ref_dataset: ""
+tgt_dataset: ""
+gene_expression_file: '${.ref_dataset}_to_${.tgt_dataset}.h5ad'
+num_workers: 4
+persistent_workers: true
+prefetch_factor: 2
+pin_memory: true

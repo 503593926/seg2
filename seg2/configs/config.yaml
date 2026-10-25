@@ -1,0 +1,16 @@
+defaults:
+  - experiment@_global_: her2st
+  - _self_
+
+paths:
+  project_root: /home/yfm/works/seg2
+  data_root: ${paths.project_root}/data
+  weights_root: ${paths.project_root}/pretrained_model
+  output_root: ${paths.project_root}/outputs
+
+experiment_name: ${dataset.dataset}
+seeds: [0, 2027, 3407]
+
+hydra:
+  run:
+    dir: ${paths.output_root}/${experiment_name}/${now:%Y-%m-%d}/${now:%H-%M-%S}

@@ -1,0 +1,34 @@
+resolution:
+  target_mpp: 1.0
+  label_mpp: 1.0
+  tile_size: 224
+
+snic:
+  superpixel_size_um: 64.0
+  compactness: 10.0
+
+rw:
+  beta: 1.0
+  non_cancer_threshold: 0.2
+  cancer_threshold: 0.8
+  max_snap_distance_um: 100.0
+  pseudo_label_ratio: 1.0
+
+seeds:
+  ratios: [1.0]
+  seed: 0
+
+gene:
+  selection_mode: svgs
+  n_top_genes: 512
+  union_rank_and_truncate: false
+  target_sum: 10000.0
+  svg_n_neighbors: 8
+
+features:
+  extractors: [h_optimus_1, uni2, virchow2]
+  batch_size: 512
+  device: cuda
+  resize: true
+  overlap_average: true
+  overlap_cls: false

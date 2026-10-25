@@ -1,0 +1,10 @@
+defaults:
+  - base
+  - _self_
+dataset: xenium
+data_dir: ${paths.data_root}/hbc_10x_xenium_ffpe_rep1/1mpp
+raw_root: /home/yfm/data/datasets/spatial_transcriptomics/xenium/hbc_10x_xenium_ffpe_rep1
+sample: XeHBC_Rep1
+patient_names: []
+labeled_names: []
+spot_diameter_um: 0.0

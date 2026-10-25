@@ -1,0 +1,7 @@
+defaults:
+  - /dataset: her2st
+  - /model: her2st
+  - /training: her2st
+  - /augment: her2st
+  - /dynamic: her2st
+  - /prep: her2st

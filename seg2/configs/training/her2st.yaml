@@ -1,0 +1,14 @@
+defaults:
+  - base
+  - _self_
+
+image:
+  batch_size: 8
+  accumulate_grad_batches: 1
+  loss_weights:
+    segmentation: 1.0
+    gene_prediction: 1.0
+    gene_correlation: 0.5
+    state_balance: 0.1
+    template_orthogonal: 0.1
+    template_entropy: 0.01

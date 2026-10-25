@@ -1,0 +1,275 @@
+from itertools import pairwise
+
+import torch
+import torch.nn.functional as F
+from timm.layers.drop import DropPath
+from torch import nn
+from torch.utils.checkpoint import checkpoint
+
+from seg2.models.conditioning import ConditionalNorm, GlobalRouter, SpatialRouter
+
+from conditioning import LayerNorm
+
+
+def init_convnext_backbone(module):
+    if isinstance(module, (ConditionalNorm, GlobalRouter, SpatialRouter)):
+        return
+    if isinstance(module, (nn.Conv2d, nn.ConvTranspose2d, nn.Linear)):
+        nn.init.trunc_normal_(module.weight, std=0.02)
+        if module.bias is not None:
+            nn.init.zeros_(module.bias)
+    for child in module.children():
+        init_convnext_backbone(child)
+
+
+class ConvNeXtUnet(nn.Module):
+    def __init__(
+        self,
+        encoder_chans,
+        decoder_chans,
+        drop_path,
+        blocks,
+        global_dim,
+        spatial_dim,
+        pfm_count,
+        g_top_k,
+        s_top_k,
+        skip_drop_path,
+        gradient_checkpointing,
+        downsample_factor,
+        encoder_spatial,
+        decoder_spatial,
+    ):
+        super().__init__()
+        self.use_spatial = any(encoder_spatial) or any(decoder_spatial)
+        cnorm_kwargs = {
+            "global_dim": global_dim,
+            "spatial_dim": spatial_dim,
+            "pfm_count": pfm_count,
+            "g_top_k": g_top_k,
+            "s_top_k": s_top_k,
+        }
+        self.encoder_stages = nn.ModuleList(
+            (
+                ConvNeXtStage(
+                    channels,
+                    rate,
+                    blocks,
+                    cnorm_kwargs,
+                    use_spatial=encoder_spatial[i],
+                    gradient_checkpointing=gradient_checkpointing,
+                )
+                for i, (channels, rate) in enumerate(zip(encoder_chans, drop_path))
+            )
+        )
+        self.downsamples = nn.ModuleList(
+            (
+                Downsample(in_chans, out_chans, factor=downsample_factor)
+                for in_chans, out_chans in pairwise(encoder_chans)
+            )
+        )
+        self.decoder_stages = nn.ModuleList()
+        current_chans = encoder_chans[-1]
+        for i, (out_chans, skip_chans, rate) in enumerate(
+            zip(decoder_chans, reversed(encoder_chans[:-1]), reversed(drop_path[:-1]))
+        ):
+            self.decoder_stages.append(
+                DecoderStage(
+                    in_chans=current_chans,
+                    skip_chans=skip_chans,
+                    out_chans=out_chans,
+                    drop_path=rate,
+                    blocks=blocks,
+                    cnorm_kwargs=cnorm_kwargs,
+                    use_spatial=decoder_spatial[i],
+                    skip_drop_path=skip_drop_path,
+                    gradient_checkpointing=gradient_checkpointing,
+                    upsample_factor=downsample_factor,
+                )
+            )
+            current_chans = out_chans
+
+    def forward(self, x, task_global, task_spatial):
+        skips = []
+        for i, stage in enumerate(self.encoder_stages):
+            x = stage(x, task_global, task_spatial)
+            if i < len(self.downsamples):
+                skips.append(x)
+                x = self.downsamples[i](x)
+        for stage, skip in zip(self.decoder_stages, reversed(skips)):
+            x = stage(x, skip, task_global, task_spatial)
+        return x
+
+
+class Stem(nn.Module):
+    def __init__(self, in_chans=3, out_chans=64, down_factor=7):
+        super().__init__()
+        self.block1 = nn.Sequential(
+            nn.Conv2d(
+                in_chans,
+                out_chans,
+                kernel_size=3 if down_factor in (1, 2) else down_factor,
+                stride=down_factor,
+                padding=1 if down_factor in (1, 2) else 0,
+            ),
+            LayerNorm(out_chans, eps=1e-06),
+        )
+
+    def forward(self, image):
+        return self.block1(image)
+
+
+class ConvNeXtStage(nn.Module):
+    def __init__(
+        self,
+        channels,
+        drop_path,
+        blocks,
+        cnorm_kwargs,
+        use_spatial=False,
+        gradient_checkpointing=False,
+    ):
+        super().__init__()
+        self.use_spatial = bool(use_spatial)
+        self.gradient_checkpointing = bool(gradient_checkpointing)
+        self.global_router = GlobalRouter(
+            channels,
+            cnorm_kwargs["global_dim"],
+            cnorm_kwargs["pfm_count"],
+            cnorm_kwargs["g_top_k"],
+        )
+        self.spatial_router = SpatialRouter(
+            channels,
+            cnorm_kwargs["spatial_dim"],
+            cnorm_kwargs["pfm_count"],
+            cnorm_kwargs["s_top_k"],
+        )
+        self.blocks = nn.ModuleList(
+            ConvNeXtBlock(
+                channels, drop_path, cnorm_kwargs, use_spatial=self.use_spatial
+            )
+            for _ in range(blocks)
+        )
+
+    def forward(self, x, task_global, task_spatial):
+        for block in self.blocks:
+            arguments = (
+                x,
+                task_global,
+                task_spatial,
+                self.global_router,
+                self.spatial_router,
+            )
+            if (
+                self.gradient_checkpointing
+                and self.training
+                and torch.is_grad_enabled()
+            ):
+                x = checkpoint(block, *arguments, use_reentrant=False)
+            else:
+                x = block(*arguments)
+        return x
+
+
+class ConvNeXtBlock(nn.Module):
+    def __init__(
+        self,
+        dim,
+        drop_path,
+        cnorm_kwargs,
+        layer_scale_init_value=1e-06,
+        use_spatial=False,
+    ):
+        super().__init__()
+        self.dwconv = nn.Conv2d(dim, dim, kernel_size=7, padding=3, groups=dim)
+        self.cnorm = ConditionalNorm(
+            dim,
+            cnorm_kwargs["global_dim"],
+            cnorm_kwargs["spatial_dim"],
+            use_spatial=use_spatial,
+        )
+        self.pwconv1 = nn.Conv2d(dim, dim * 4, kernel_size=1)
+        self.act = nn.GELU()
+        self.pwconv2 = nn.Conv2d(dim * 4, dim, kernel_size=1)
+        self.drop_path = DropPath(drop_path)
+        self.gamma = nn.Parameter(layer_scale_init_value * torch.ones(dim))
+
+    def forward(self, x, task_global, task_spatial, global_router, spatial_router):
+        shortcut = x
+        x = self.dwconv(x)
+        x = self.cnorm(x, task_global, task_spatial, global_router, spatial_router)
+        x = self.pwconv1(x)
+        x = self.act(x)
+        x = self.pwconv2(x)
+        gamma = self.gamma.to(dtype=x.dtype)[None, :, None, None]
+        return shortcut + self.drop_path(gamma * x)
+
+
+class Downsample(nn.Module):
+    def __init__(self, in_chans, out_chans, factor=2):
+        super().__init__()
+        self.down = nn.Sequential(
+            LayerNorm(in_chans, eps=1e-06),
+            nn.Conv2d(in_chans, out_chans, kernel_size=factor, stride=factor),
+        )
+
+    def forward(self, x):
+        return self.down(x)
+
+
+class DecoderStage(nn.Module):
+    def __init__(
+        self,
+        in_chans,
+        skip_chans,
+        out_chans,
+        drop_path,
+        blocks,
+        cnorm_kwargs,
+        use_spatial=False,
+        skip_drop_path=0.0,
+        gradient_checkpointing=False,
+        upsample_factor=2,
+    ):
+        super().__init__()
+        self.gradient_checkpointing = bool(gradient_checkpointing)
+        self.up = Upsample(in_chans, out_chans, factor=upsample_factor)
+        self.skip_drop_path = DropPath(skip_drop_path)
+        self.fuse = nn.Sequential(
+            LayerNorm(out_chans + skip_chans, eps=1e-06),
+            nn.Conv2d(out_chans + skip_chans, out_chans, kernel_size=1),
+        )
+        self.blocks = ConvNeXtStage(
+            out_chans,
+            drop_path,
+            blocks,
+            cnorm_kwargs,
+            use_spatial=use_spatial,
+            gradient_checkpointing=gradient_checkpointing,
+        )
+
+    def _upsample_and_fuse(self, x, skip):
+        x = self.up(x)
+        x = torch.cat([x, self.skip_drop_path(skip)], dim=1)
+        return self.fuse(x)
+
+    def forward(self, x, skip, task_global, task_spatial):
+        if self.gradient_checkpointing and self.training and torch.is_grad_enabled():
+            x = checkpoint(self._upsample_and_fuse, x, skip, use_reentrant=False)
+        else:
+            x = self._upsample_and_fuse(x, skip)
+        return self.blocks(x, task_global, task_spatial)
+
+
+class Upsample(nn.Module):
+    def __init__(self, in_chans, out_chans, factor=4):
+        super().__init__()
+        self.factor = factor
+        self.conv = nn.Conv2d(in_chans, out_chans, kernel_size=3, stride=1, padding=1)
+
+    def forward(self, x):
+        x = F.interpolate(
+            x, scale_factor=self.factor, mode="bilinear", align_corners=False
+        )
+        return self.conv(x)
+

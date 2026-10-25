@@ -1,0 +1,32 @@
+defaults:
+  - base
+  - _self_
+
+spot_diameter_um: 100.0
+data_dir: ${paths.data_root}/her2st/1mpp
+patient_names: [E, B, A, C, D, F, G, H]
+split_mode: patient_loocv
+
+gene_expression_dir: gene_expression/patient_loocv
+
+image_feature_maps:
+  - 'feature_ho1/tile_224_mpp_1_resize_1_overlap_1'
+  - 'feature_uni2/tile_224_mpp_1_resize_1_overlap_1'
+  - 'feature_virchow2/tile_224_mpp_1_resize_1_overlap_1'
+
+pseudo_label_dir: 'pseudo_label_ratio@100'
+
+
+labeled_sampling_fraction: null
+crop_size: 896
+samples_per_epoch: 4000
+min_valid_fraction: 0.25
+
+num_workers: 8
+prefetch_factor: 1
+pin_memory: false
+
+dataset: her2st
+raw_root: /home/yfm/data/bioinfo/her2st-master/data
+array_pitch_um: 200.0
+labeled_names: [A1, B1, C1, D1, E1, F1, G2, H1]

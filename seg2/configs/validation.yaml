@@ -1,0 +1,14 @@
+defaults:
+  - config
+  - _self_
+
+
+validation:
+  every_n_epochs: 1
+  weights: ema
+  crop_size: 896
+  stride: null
+  batch_size: 8
+  precision: bf16-mixed
+  expression_transform: log1p
+  top_genes: 1

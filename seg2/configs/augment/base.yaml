@@ -1,0 +1,33 @@
+enabled: true
+geometry:
+  enabled: true
+  rotation_quarter_turns: [0, 1, 2, 3]
+  horizontal_flip_probability: 0.5
+  vertical_flip_probability: 0.5
+
+stain:
+  probability: 0.1
+  method: random_preset
+  preset: null
+  intensity_scale_range: [0.8, 1.2]
+  intensity_shift_range: [-0.1, 0.1]
+  augment_background: true
+  tissue_only: true
+
+brightness:
+  probability: 0.1
+  multiplier_range: [0.8, 1.2]
+  tissue_only: true
+
+contrast:
+  probability: 0.1
+  factor_range: [0.8, 1.2]
+  tissue_only: true
+
+low_resolution:
+  probability: 0.1
+  scale_range: [0.5, 1.0]
+  tissue_only: false
+
+sampling:
+  spot_sampling_fraction: 0.25
