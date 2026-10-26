@@ -27,7 +27,8 @@ class ValidationCallback(pl.Callback):
         dataset = self.cfg.dataset
         model = module.ema_model if str(options.weights) == "ema" else module.model
         with tempfile.TemporaryDirectory(prefix="seg2_validation_model_") as directory:
-            artifact = save_model(model, Path(directory) / "model.pt")
+            artifact = Path(directory) / "model.pt"
+            save_model(model, artifact)
             command = [
                 sys.executable,
                 "-m",

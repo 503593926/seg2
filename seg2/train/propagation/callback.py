@@ -98,11 +98,12 @@ class DynamicPropagationCallback(pl.Callback):
             del lab
         cache = self.slide_cache[name]
         topology = cache["topology"]
-        model_probability, learned = predict_slide(
+        _, learned = predict_slide(
             model,
             slide,
             device=device,
             crop_size=dataset.crop_size,
+            stride=int(self.config.stride),
             batch_size=int(self.config.batch_size),
             return_features=True,
             superpixel_pool=cache["feature_pool"],
@@ -135,11 +136,7 @@ class DynamicPropagationCallback(pl.Callback):
                 tissue,
                 probability,
                 mask,
-                cache["spots"],
                 cache["spot_labels"],
-                model_probability=cv2.resize(
-                    model_probability, (width, height), interpolation=cv2.INTER_AREA
-                ),
                 non_cancer_threshold=float(self.rw.non_cancer_threshold),
                 cancer_threshold=float(self.rw.cancer_threshold),
                 metadata={

@@ -59,7 +59,7 @@ def label_grid_root(root, target_mpp, label_mpp):
 
 def read_sample(root, name, feature_maps, target_mpp, label_mpp):
     root = Path(root)
-    patch_step, cls_step = load_feature_scales(root, feature_maps, target_mpp)
+    _, cls_step = load_feature_scales(root, feature_maps, target_mpp)
     sample_dir = root / "samples" / name
     image, patch_maps, cls_maps = read_slide_inputs(
         sample_dir / f"spatial/he_{float(target_mpp):g}mpp.png",
@@ -67,8 +67,8 @@ def read_sample(root, name, feature_maps, target_mpp, label_mpp):
     )
     height, width = image.shape[:2]
     shapes = {values.shape[:2] for values in patch_maps}
-    rows, columns = shapes.pop()
-    patch_scale = (height // rows, width // columns)
+    rows, _ = shapes.pop()
+    patch_scale = height // rows
     scale = label_scale(target_mpp, label_mpp)
     return dict(
         name=name,
@@ -81,7 +81,7 @@ def read_sample(root, name, feature_maps, target_mpp, label_mpp):
         height=height,
         width=width,
         patch_scale=patch_scale,
-        alignment=lcm(scale, patch_scale[0], cls_step),
+        alignment=lcm(scale, patch_scale, cls_step),
         patch_dims=tuple((values.shape[-1] for values in patch_maps)),
         cls_dims=tuple((values.shape[-1] for values in cls_maps)),
     )

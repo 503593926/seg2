@@ -1,6 +1,7 @@
 enabled: true
-warmup_epochs: 5
-interval_epochs: 1
+warmup_epochs: 2
+interval_epochs: 2
 save_intermediate: true
 batch_size: 1
+stride: 896
 learned_weight: 1.0

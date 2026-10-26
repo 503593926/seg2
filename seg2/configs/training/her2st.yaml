@@ -8,7 +8,7 @@ image:
   loss_weights:
     segmentation: 1.0
     gene_prediction: 1.0
-    gene_correlation: 0.5
+    gene_correlation: 1.0
     state_balance: 0.1
     template_orthogonal: 0.1
     template_entropy: 0.01

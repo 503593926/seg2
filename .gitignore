@@ -1,42 +1,8 @@
-# Python cache
-__pycache__/
-*.py[cod]
-.pytest_cache/
-.ruff_cache/
-.cache/
-.agents/
-.claude/
-.codex/
-# PyCharm / IntelliJ
-.idea/
-*.log
-
-data1/
-/data/
-/outputs
-/lightning_logs
-/pretrained_model
-*.ckpt
-
-UNI2/
-UNI/
-GenBio_PathFM/
-HOptimus1/
-Virchow2/
-
-/paper
-/figure
-/SNIC
-/analyse
-
-evaluate/
+.*
 baselines/
-
-
-# 本地编译的 SNIC 共享库（每台机器自行编译，不入库）
-*.so
-
-# Local package build products
-/build/
-/dist/
-*.egg-info/
+data/
+evaluate/
+figure/
+outputs/
+paper/
+pretrained_model/

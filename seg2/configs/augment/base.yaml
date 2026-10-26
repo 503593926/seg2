@@ -30,4 +30,4 @@ low_resolution:
   tissue_only: false
 
 sampling:
-  spot_sampling_fraction: 0.25
+  spot_sampling_fraction: 0.5

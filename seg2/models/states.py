@@ -2,6 +2,8 @@ import torch
 from torch import nn
 from torch.nn import functional as F
 
+from seg2.models.conditioning import LayerNorm
+
 STATE_USAGE_CHUNK_ELEMENTS = 4194304
 
 
@@ -9,7 +11,11 @@ class TissueStateDecoder(nn.Module):
     def __init__(self, in_channels, gene_count, state_count, hidden_dim):
         super().__init__()
         self.gene_count = int(gene_count)
-        self.encoder = nn.Sequential(nn.Conv2d(in_channels, hidden_dim, 1), nn.GELU())
+        self.encoder = nn.Sequential(
+            nn.Conv2d(in_channels, hidden_dim, 1),
+            LayerNorm(hidden_dim),
+            nn.GELU(),
+        )
         self.state_head = nn.Conv2d(hidden_dim, state_count, 1)
         self.amplitude_head = nn.Conv2d(hidden_dim, 1, 1)
         self.template_logits = nn.Parameter(torch.empty(state_count, gene_count).normal_(std=0.5))

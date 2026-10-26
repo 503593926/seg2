@@ -9,11 +9,6 @@ def _write_image(path, image, parameters=()):
     cv2.imwrite(str(path), image, list(parameters))
 
 
-def _uint16_probability(probability):
-    values = np.nan_to_num(probability, nan=0.5, posinf=1.0, neginf=0.0)
-    return np.rint(np.clip(values, 0.0, 1.0) * 65535).astype(np.uint16)
-
-
 def _blend(image, selected, color, alpha=0.45):
     image[selected] = np.rint(
         image[selected].astype(np.float32) * (1.0 - alpha) + np.asarray(color, dtype=np.float32) * alpha
@@ -42,23 +37,14 @@ def _overview_panel(image, title, size=512):
     return canvas
 
 
-def _probability_heatmap(probability, tissue):
-    values = (_uint16_probability(probability) / 257).astype(np.uint8)
-    heatmap = cv2.applyColorMap(values, cv2.COLORMAP_TURBO)
-    heatmap[~tissue] = 255
-    return heatmap
-
-
 def save_soft_label_result(
     directory,
     image_rgb,
     tissue,
     probability,
     mask,
-    spots,
     spot_labels,
     *,
-    model_probability,
     non_cancer_threshold,
     cancer_threshold,
     metadata,
@@ -67,26 +53,8 @@ def save_soft_label_result(
     directory.mkdir(parents=True, exist_ok=True)
     image_bgr = cv2.cvtColor(image_rgb, cv2.COLOR_RGB2BGR)
     pseudo_overlay = _mask_overlay(image_bgr, mask, tissue)
-    heatmap = _probability_heatmap(probability, tissue)
-    model_heatmap = _probability_heatmap(model_probability, tissue)
-    seed_overlay = image_bgr.copy()
-    height, width = tissue.shape
-    for (x, y), label in zip(np.rint(spots).astype(np.int64), spot_labels):
-        if label in (0, 1) and 0 <= x < width and (0 <= y < height):
-            cv2.circle(seed_overlay, (int(x), int(y)), 3, (255, 0, 0) if label == 0 else (0, 0, 255), -1)
     jpg = (cv2.IMWRITE_JPEG_QUALITY, 90)
-    panels = [
-        (seed_overlay, "H&E + spot seeds"),
-        (model_heatmap, "Model probability"),
-        (heatmap, "RW probability"),
-        (pseudo_overlay, "RW pseudo label"),
-    ]
-    overview = np.vstack(
-        [
-            np.hstack([_overview_panel(values, title) for values, title in panels[start : start + 2]])
-            for start in (0, 2)
-        ]
-    )
+    overview = _overview_panel(pseudo_overlay, "RW pseudo label")
     _write_image(directory / "overview.jpg", overview, jpg)
     values = probability[tissue]
     record = {

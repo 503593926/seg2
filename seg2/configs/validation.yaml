@@ -11,4 +11,4 @@ validation:
   batch_size: 8
   precision: bf16-mixed
   expression_transform: log1p
-  top_genes: 1
+  top_genes: 0

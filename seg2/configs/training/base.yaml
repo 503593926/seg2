@@ -2,15 +2,15 @@ image:
   epochs: 10
   warmup_steps: 0.15
   progress_every_n_steps: 1
-  batch_size: 8
+  batch_size: 16
   expression_transform: log1p
   gene_correlation_min_spots: 8
   gene_correlation_std_floor: 0.02
   ema_decay: 0.999
-  state_balance_alpha: 0.5
+  state_balance_alpha: 1.0
 
   lr: 4e-3
-  weight_decay: 0.05
+  weight_decay: 0.00
   loss_weights:
     segmentation: 0.0
     gene_prediction: 1.0

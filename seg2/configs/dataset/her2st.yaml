@@ -4,7 +4,7 @@ defaults:
 
 spot_diameter_um: 100.0
 data_dir: ${paths.data_root}/her2st/1mpp
-patient_names: [E, B, A, C, D, F, G, H]
+patient_names: [E, F, D, G, B, A, C, H]
 split_mode: patient_loocv
 
 gene_expression_dir: gene_expression/patient_loocv
@@ -24,7 +24,7 @@ min_valid_fraction: 0.25
 
 num_workers: 8
 prefetch_factor: 1
-pin_memory: false
+pin_memory: true
 
 dataset: her2st
 raw_root: /home/yfm/data/bioinfo/her2st-master/data

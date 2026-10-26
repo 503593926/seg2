@@ -4,6 +4,7 @@ import torch
 from torch import nn
 from torch.nn import functional as F
 
+
 class LayerNorm(nn.Module):
     def __init__(self, normalized_shape, eps=1e-06):
         super().__init__()
@@ -48,8 +49,16 @@ class PFMProjector(nn.Module):
         )
 
     def forward(self, values):
-        values = [F.normalize(value, p=2, dim=1, eps=1e-06) for value in values]
-        return [project(value) for project, value in zip(self.projects, values)]
+        outputs = []
+        for project, value in zip(self.projects, values):
+            value = project(F.normalize(value, p=2, dim=1, eps=1e-6))
+            normalized = F.layer_norm(
+                value.float().movedim(1, -1),
+                (value.shape[1],),
+                eps=1e-6,
+            )
+            outputs.append(normalized.movedim(-1, 1).to(dtype=value.dtype))
+        return outputs
 
 
 class GlobalRouter(nn.Module):
@@ -60,9 +69,7 @@ class GlobalRouter(nn.Module):
         self.top_k = int(top_k)
         input_dim = channels + pfm_count * feature_dim
         self.router = nn.Sequential(
-            nn.Linear(input_dim, input_dim // 4),
-            nn.GELU(),
-            nn.Linear(input_dim // 4, pfm_count),
+            nn.Linear(input_dim, pfm_count),
         )
 
     def forward(self, state, features):
@@ -82,9 +89,7 @@ class SpatialRouter(nn.Module):
         self.top_k = top_k
         in_channels = channels + pfm_count * feature_dim
         self.router = nn.Sequential(
-            nn.Conv2d(in_channels, in_channels // 4, 1),
-            nn.GELU(),
-            nn.Conv2d(in_channels // 4, pfm_count, 1),
+            nn.Conv2d(in_channels, pfm_count, 1),
         )
 
     def forward(self, state, features):

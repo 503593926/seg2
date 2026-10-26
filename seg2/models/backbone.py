@@ -6,9 +6,12 @@ from timm.layers.drop import DropPath
 from torch import nn
 from torch.utils.checkpoint import checkpoint
 
-from seg2.models.conditioning import ConditionalNorm, GlobalRouter, SpatialRouter
-
-from conditioning import LayerNorm
+from seg2.models.conditioning import (
+    ConditionalNorm,
+    GlobalRouter,
+    LayerNorm,
+    SpatialRouter,
+)
 
 
 def init_convnext_backbone(module):
