@@ -8,6 +8,7 @@ image:
 
   encoder_spatial: [false, false, true, true]  # 2, 4, 8, 16
   decoder_spatial: [true, false, false]  # 8, 4, 2
-  skip_drop_path: 0.5
-  drop_path: [0.0, 0.0, 0.0, 0.0]
+  skip_drop_path: 0.25
+  drop_path: [0.1, 0.1, 0.1, 0.1]
   tissue_state_count: 32
+  auxiliary_scales: [8, 4]

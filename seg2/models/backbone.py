@@ -92,15 +92,20 @@ class ConvNeXtUnet(nn.Module):
             )
             current_chans = out_chans
 
-    def forward(self, x, task_global, task_spatial):
+    def forward(self, x, task_global, task_spatial, return_decoder_features=False):
         skips = []
         for i, stage in enumerate(self.encoder_stages):
             x = stage(x, task_global, task_spatial)
             if i < len(self.downsamples):
                 skips.append(x)
                 x = self.downsamples[i](x)
+        decoder_features = []
         for stage, skip in zip(self.decoder_stages, reversed(skips)):
             x = stage(x, skip, task_global, task_spatial)
+            if return_decoder_features:
+                decoder_features.append(x)
+        if return_decoder_features:
+            return x, decoder_features
         return x
 
 
@@ -262,7 +267,6 @@ class DecoderStage(nn.Module):
         else:
             x = self._upsample_and_fuse(x, skip)
         return self.blocks(x, task_global, task_spatial)
-
 
 class Upsample(nn.Module):
     def __init__(self, in_chans, out_chans, factor=4):

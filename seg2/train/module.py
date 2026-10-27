@@ -7,6 +7,7 @@ from torchmetrics.classification import BinaryF1Score, BinaryJaccardIndex
 
 from seg2.train.diagnostics import state_diagnostics
 from seg2.train.losses import (
+    auxiliary_prediction_losses,
     gene_prediction_losses,
     image_losses,
     state_balance_loss,
@@ -26,11 +27,25 @@ class SegmentationModule(pl.LightningModule):
         self.image_cfg = image_cfg
         self.state_balance_alpha = float(image_cfg.state_balance_alpha)
         self.expression_transform = str(image_cfg.expression_transform)
+        self.auxiliary_weights = {
+            str(scale): float(weight)
+            for scale, weight in image_cfg.get("auxiliary_weights", {}).items()
+            if float(weight)
+        }
+        self.use_auxiliary = bool(self.auxiliary_weights) and any(
+            float(image_cfg.loss_weights[name])
+            for name in ("segmentation", "gene_prediction", "gene_correlation")
+        )
+        if self.use_auxiliary and not set(self.auxiliary_weights).issubset(
+            str(scale) for scale in model.auxiliary_scales
+        ):
+            raise ValueError("Auxiliary weights must refer to model.image.auxiliary_scales")
         self.train_dice = BinaryF1Score(threshold=0.5)
         self.train_iou = BinaryJaccardIndex(threshold=0.5)
 
     def forward(
-        self, image, patch, cls, *, state_usage_mask=None, state_usage_grad=True
+        self, image, patch, cls, *, state_usage_mask=None, state_usage_grad=True,
+        compute_auxiliary=False,
     ):
         return self.model(
             image,
@@ -38,6 +53,7 @@ class SegmentationModule(pl.LightningModule):
             cls,
             state_usage_mask=state_usage_mask,
             state_usage_grad=state_usage_grad,
+            compute_auxiliary=compute_auxiliary,
         )
 
     def _update_expression_loss(self, losses, output, batch):
@@ -84,6 +100,7 @@ class SegmentationModule(pl.LightningModule):
             batch["cls"],
             state_usage_mask=batch["tissue"],
             state_usage_grad=bool(balance_weight),
+            compute_auxiliary=self.use_auxiliary,
         )
         losses = image_losses(output, batch, weights)
         self._update_expression_loss(losses, output, batch)
@@ -101,6 +118,26 @@ class SegmentationModule(pl.LightningModule):
             ),
             output["logits"].sum() * 0,
         )
+        if self.use_auxiliary:
+            auxiliary_losses, spot_counts = auxiliary_prediction_losses(
+                {scale: output["auxiliary"][scale] for scale in self.auxiliary_weights},
+                batch, weights=weights,
+                expression_transform=self.expression_transform,
+                correlation_min_spots=int(self.image_cfg.gene_correlation_min_spots),
+                correlation_std_floor=float(self.image_cfg.gene_correlation_std_floor),
+            )
+            for scale, branch_losses in auxiliary_losses.items():
+                branch_loss = output["auxiliary"][scale]["logits"].sum() * 0
+                for name, value in branch_losses.items():
+                    losses[f"aux_{scale}/{name}"] = value
+                    branch_loss = branch_loss + float(weights[name]) * value
+                losses[f"aux_{scale}/loss"] = branch_loss
+                loss = loss + self.auxiliary_weights[scale] * branch_loss
+            for scale, count in spot_counts.items():
+                self.log(
+                    f"train/aux_{scale}/gene_spots", float(count),
+                    on_step=False, on_epoch=True, batch_size=len(batch["image"]),
+                )
         self._log_training(loss, losses, output, batch)
         return loss
 

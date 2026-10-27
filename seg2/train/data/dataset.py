@@ -61,6 +61,24 @@ class TrainingDataset(Dataset):
         self.label_scale = first_slide["label_scale"]
         self.alignment = first_slide["alignment"]
         self.spot_radius_px = first_slide["spot_radius_px"]
+        auxiliary_weights = {
+            str(scale): float(weight)
+            for scale, weight in cfg.training.image.get("auxiliary_weights", {}).items()
+        }
+        task_weights = cfg.training.image.loss_weights
+        self.auxiliary_pool_scales = (
+            tuple(
+                int(scale) for scale in cfg.model.image.get("auxiliary_scales", ())
+                if float(auxiliary_weights.get(str(scale), 0))
+            )
+            if any(float(task_weights[name]) for name in ("gene_prediction", "gene_correlation"))
+            else ()
+        )
+        if any(
+            scale < self.label_scale or scale % self.label_scale or self.crop_size % scale
+            for scale in self.auxiliary_pool_scales
+        ):
+            raise ValueError("Auxiliary scales must divide crop_size and be multiples of label_scale")
 
         self.crop_origins = {}
         for name in self.slide_names:
@@ -96,6 +114,15 @@ class TrainingDataset(Dataset):
             self.spot_radius_px,
             self.label_scale,
         )
+        if self.auxiliary_pool_scales:
+            # Rebuild after geometry augmentation, using each native grid's pixel spacing.
+            sample["auxiliary_spot_pools"] = {}
+            for scale in self.auxiliary_pool_scales:
+                factor = scale // self.label_scale
+                tissue = sample["tissue"][0, ::factor, ::factor]
+                sample["auxiliary_spot_pools"][str(scale)] = prepare_spot_pool(
+                    tissue, sample["spots"], self.spot_radius_px, scale,
+                )
         return sample
 
     def _refresh_slide(self, name):
@@ -200,6 +227,15 @@ def collate_samples(samples):
         values = [sample[key] for sample in samples]
         if key == "spot_pool":
             batch[key] = collate_spot_pools(values, samples[0]["tissue"].shape[-2:])
+        elif key == "auxiliary_spot_pools":
+            height, width = samples[0]["image"].shape[-2:]
+            batch[key] = {
+                scale: collate_spot_pools(
+                    [value[scale] for value in values],
+                    (height // int(scale), width // int(scale)),
+                )
+                for scale in values[0]
+            }
         else:
             batch[key] = values if key in variable_keys else default_collate(values)
     return batch

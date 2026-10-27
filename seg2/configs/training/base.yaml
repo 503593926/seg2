@@ -11,6 +11,10 @@ image:
 
   lr: 4e-3
   weight_decay: 0.00
+  # Each branch reuses loss_weights for segmentation, expression MSE and correlation.
+  auxiliary_weights:
+    "8": 0.1
+    "4": 0.1
   loss_weights:
     segmentation: 0.0
     gene_prediction: 1.0

@@ -63,14 +63,49 @@ def _masked_mean(values, weights):
     return (values * weights).sum() / weights.sum().clamp_min(1)
 
 
-def segmentation_loss(logits, target, valid):
+def segmentation_loss(logits, target, valid, *, soft_targets=False):
     logits, target, valid = (logits.float(), target.float(), valid.float())
-    target = (target >= 0.5).float()
+    if not soft_targets:
+        target = (target >= 0.5).float()
     bce = _masked_mean(F.binary_cross_entropy_with_logits(logits, target, reduction="none"), valid)
     probability = logits.sigmoid()
     intersection = (probability * target * valid).sum()
     dice = 1 - (2 * intersection + 1) / ((probability * valid).sum() + (target * valid).sum() + 1)
     return bce + dice
+
+
+def auxiliary_prediction_losses(
+    auxiliary, batch, *, weights, expression_transform,
+    correlation_min_spots, correlation_std_floor,
+):
+    losses, spot_counts = {}, {}
+    for scale, output in auxiliary.items():
+        branch_losses = {}
+        if float(weights.get("segmentation", 0)):
+            shape = output["logits"].shape[-2:]
+            valid = batch["valid"].float()
+            positive = (batch["cancer_probability"] >= 0.5).float() * valid
+            area = (valid.shape[-2] / shape[0]) * (valid.shape[-1] / shape[1])
+            native_valid = F.adaptive_avg_pool2d(valid, shape) * area
+            native_target = (
+                F.adaptive_avg_pool2d(positive, shape) * area / native_valid.clamp_min(1e-12)
+            )
+            # A coarse pixel represents the positive fraction of its valid source pixels.
+            branch_losses["segmentation"] = segmentation_loss(
+                output["logits"], native_target, native_valid, soft_targets=True,
+            )
+        if any(float(weights.get(name, 0)) for name in ("gene_prediction", "gene_correlation")):
+            native_batch = {**batch, "spot_pool": batch["auxiliary_spot_pools"][scale]}
+            gene_losses, count = gene_prediction_losses(
+                output, native_batch, weights=weights,
+                expression_transform=expression_transform,
+                correlation_min_spots=correlation_min_spots,
+                correlation_std_floor=correlation_std_floor,
+            )
+            branch_losses.update(gene_losses)
+            spot_counts[scale] = count
+        losses[scale] = branch_losses
+    return losses, spot_counts
 
 
 def state_balance_loss(log_usage, pixels, *, alpha=0.1):

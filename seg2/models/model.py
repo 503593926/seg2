@@ -31,6 +31,7 @@ class JointModel(nn.Module):
         downsample_factor,
         encoder_spatial,
         decoder_spatial,
+        auxiliary_scales=(),
     ):
         super().__init__()
         self.pfm_patch_dims = tuple(pfm_patch_dims)
@@ -40,6 +41,20 @@ class JointModel(nn.Module):
         self.output_scale = int(output_scale)
         self.gradient_checkpointing = bool(gradient_checkpointing)
         self.downsample_factor = int(downsample_factor)
+        self.auxiliary_scales = tuple(int(scale) for scale in auxiliary_scales)
+        decoder_scales = [
+            self.output_scale * self.downsample_factor ** (len(encoder_chans) - 2 - i)
+            for i in range(len(decoder_chans))
+        ]
+        if len(set(self.auxiliary_scales)) != len(self.auxiliary_scales) or any(
+            scale not in decoder_scales[:-1] for scale in self.auxiliary_scales
+        ):
+            raise ValueError(
+                f"auxiliary_scales must be distinct intermediate decoder scales: {decoder_scales[:-1]}"
+            )
+        self._auxiliary_stage_indices = {
+            str(scale): decoder_scales.index(scale) for scale in self.auxiliary_scales
+        }
         self.stem = Stem(
             in_chans=3, out_chans=encoder_chans[0], down_factor=self.output_scale
         )
@@ -73,6 +88,15 @@ class JointModel(nn.Module):
                 self.tissue_state_count,
                 tissue_state_dim,
             )
+        # Construct auxiliary adapters after the main model without changing its RNG state.
+        with torch.random.fork_rng(devices=[]):
+            self.auxiliary_projections = nn.ModuleDict(
+                {
+                    scale: nn.Conv2d(decoder_chans[index], self.feature_channels, 1)
+                    for scale, index in self._auxiliary_stage_indices.items()
+                }
+            )
+            init_convnext_backbone(self.auxiliary_projections)
 
     def forward(
         self,
@@ -82,6 +106,7 @@ class JointModel(nn.Module):
         compute_expression=True,
         state_usage_mask=None,
         state_usage_grad=True,
+        compute_auxiliary=False,
     ):
         task_global = self.global_projector(
             [value.float().mean(dim=(-2, -1)) for value in cls]
@@ -97,7 +122,15 @@ class JointModel(nn.Module):
         )
         if image.dtype == torch.uint8:
             image = image.float().mul_(2.0 / 255.0).sub_(1.0)
-        decoded_fm = self.unet(self.stem(image), task_global, task_spatial)
+        use_auxiliary = compute_auxiliary and bool(self.auxiliary_scales)
+        decoded = self.unet(
+            self.stem(image), task_global, task_spatial,
+            return_decoder_features=use_auxiliary,
+        )
+        if use_auxiliary:
+            decoded_fm, decoder_features = decoded
+        else:
+            decoded_fm = decoded
         output = {"features": decoded_fm}
         decoder_args = (
             decoded_fm,
@@ -112,4 +145,16 @@ class JointModel(nn.Module):
         else:
             states = self.tissue_state_decoder(*decoder_args)
         output.update(states)
+        if use_auxiliary:
+            auxiliary = {}
+            for scale, index in self._auxiliary_stage_indices.items():
+                features = self.auxiliary_projections[scale](decoder_features[index])
+                if self.gradient_checkpointing and self.training and torch.is_grad_enabled():
+                    auxiliary[scale] = checkpoint(
+                        self.tissue_state_decoder, features, compute_expression,
+                        use_reentrant=False,
+                    )
+                else:
+                    auxiliary[scale] = self.tissue_state_decoder(features, compute_expression)
+            output["auxiliary"] = auxiliary
         return output

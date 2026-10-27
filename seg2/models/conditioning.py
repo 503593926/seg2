@@ -24,21 +24,6 @@ class LayerNorm(nn.Module):
             )
         return x.permute(0, 3, 1, 2)
 
-# class PFMProjector(nn.Module):
-#     def __init__(self, input_dims, feature_dim, spatial):
-#         super().__init__()
-#         project = partial(nn.Conv2d, kernel_size=1) if spatial else nn.Linear
-#         self.projects = nn.ModuleList(
-#             project(int(input_dim), feature_dim) for input_dim in input_dims
-#         )
-#         self.shared_proj = project(feature_dim, feature_dim)
-#
-#     def forward(self, values):
-#         values = [F.normalize(value, p=2, dim=1, eps=1e-06) for value in values]
-#         return [
-#             self.shared_proj(project(value))
-#             for project, value in zip(self.projects, values)
-#         ]
 
 class PFMProjector(nn.Module):
     def __init__(self, input_dims, feature_dim, spatial):
