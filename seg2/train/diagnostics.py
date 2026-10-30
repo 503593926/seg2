@@ -1,14 +1,11 @@
 import torch
 
-from seg2.models.states import STATE_USAGE_CHUNK_ELEMENTS
-
-
 @torch.no_grad()
 def state_diagnostics(output, batch):
     metrics = {}
     states = output["tissue_states"].detach()
     valid = batch["valid"].to(dtype=states.dtype)
-    chunk_rows = max(1, STATE_USAGE_CHUNK_ELEMENTS // (states.shape[0] * states.shape[1] * states.shape[3]))
+    chunk_rows = 32
     entropy = states.new_zeros((), dtype=torch.float32)
     usage = states.new_zeros(states.shape[1], dtype=torch.float32)
     valid_pixels = states.new_zeros((), dtype=torch.float32)

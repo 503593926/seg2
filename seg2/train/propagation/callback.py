@@ -98,16 +98,18 @@ class DynamicPropagationCallback(pl.Callback):
             del lab
         cache = self.slide_cache[name]
         topology = cache["topology"]
-        _, learned = predict_slide(
+        result = predict_slide(
             model,
             slide,
             device=device,
             crop_size=dataset.crop_size,
             stride=int(self.config.stride),
             batch_size=int(self.config.batch_size),
-            return_features=True,
-            superpixel_pool=cache["feature_pool"],
+            outputs=("features",),
+            feature_pool=cache["feature_pool"],
         )
+        learned = result.get("features")
+        assert learned is not None
         probability = propagate_features(
             superpixels,
             learned,

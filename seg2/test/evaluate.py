@@ -6,7 +6,6 @@ import torch
 
 from seg2.infer.predictor import predict_slide
 from seg2.models.spot_pooling import prepare_spot_pool
-from seg2.test.data import label_grid_root
 from seg2.test.metrics import expression_metrics, segmentation_metrics
 
 
@@ -14,7 +13,7 @@ def load_expert_masks(root, slide, mpp=1.0):
     sample = (
         Path(root) / "samples"
         if slide["label_scale"] == 1
-        else label_grid_root(root, mpp, float(mpp) * slide["label_scale"])
+        else Path(root) / "label_mpp" / f"{float(mpp) * slide['label_scale']:g}mpp"
     ) / slide["name"]
     labels = np.asarray(
         cv2.imread(str(sample / "masks/training_mask.png"), cv2.IMREAD_GRAYSCALE)
@@ -58,8 +57,6 @@ def validate_slide(
         and (expression_results is not None)
     )
     metrics = {}
-    factors = {}
-    spot_pool = None
     if gene_adata is not None:
         selected = gene_adata.obs["name"].astype(str).to_numpy() == slide["name"]
         spots = torch.from_numpy(
@@ -80,7 +77,7 @@ def validate_slide(
         tissue_root = (
             Path(root) / "samples"
             if slide["label_scale"] == 1
-            else label_grid_root(root, mpp, float(mpp) * slide["label_scale"])
+            else Path(root) / "label_mpp" / f"{float(mpp) * slide['label_scale']:g}mpp"
         )
         tissue = torch.from_numpy(
             np.asarray(
@@ -101,21 +98,25 @@ def validate_slide(
             "indices": plan["indices"].numpy(),
         }
         del plan
-        probability, _ = predict_slide(
+        outputs = ["probability", "expression"]
+        if cache_dense:
+            outputs.append("dense_expression")
+        result = predict_slide(
             model,
             slide,
             crop_size=crop_size,
             stride=stride,
             device=device,
             batch_size=batch_size,
-            return_features=False,
-            expression_factors=factors if cache_dense else None,
-            spot_pool=spot_pool,
+            outputs=outputs,
+            expression_pool=spot_pool,
         )
+        expression = result.get("expression")
+        assert expression is not None
         valid = torch.zeros(len(spots), dtype=torch.bool)
         valid[torch.from_numpy(spot_pool["indices"])] = True
-        prediction = torch.from_numpy(spot_pool["coefficients"]) @ torch.from_numpy(
-            spot_pool["templates"]
+        prediction = torch.from_numpy(expression["coefficients"]) @ torch.from_numpy(
+            expression["templates"]
         )
         target, observed = (truth[valid].float(), observed[valid])
         if expression_transform == "log1p":
@@ -131,20 +132,23 @@ def validate_slide(
                 "spots": spots.numpy()[valid],
             }
             if cache_dense:
+                factors = result.get("dense_expression")
+                assert factors is not None
                 spot_results["dense_expression"] = factors
                 spot_results["dense_tissue"] = tissue.numpy()
                 spot_results["dense_mpp"] = float(mpp) * slide["label_scale"]
             expression_results[slide["name"]] = spot_results
     else:
-        probability, _ = predict_slide(
+        result = predict_slide(
             model,
             slide,
             crop_size=crop_size,
             stride=stride,
             device=device,
             batch_size=batch_size,
-            return_features=False,
         )
+    probability = result.get("probability")
+    assert probability is not None
     if evaluate_segmentation:
         labels, valid = load_expert_masks(root, slide, mpp)
         metrics = {

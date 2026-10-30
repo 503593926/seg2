@@ -1,17 +1,5 @@
 import torch
 
-_copy_streams: dict[int, torch.cuda.Stream] = {}
-
-
-def inference_copy_stream(device):
-    device = torch.device(device)
-    if device.type != "cuda":
-        return None
-    index = device.index if device.index is not None else torch.cuda.current_device()
-    if index not in _copy_streams:
-        _copy_streams[index] = torch.cuda.Stream(device=index)
-    return _copy_streams[index]
-
 
 def release_inference_cache(device, stage):
     device = torch.device(device)

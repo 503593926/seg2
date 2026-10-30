@@ -12,3 +12,6 @@ image:
     state_balance: 0.1
     template_orthogonal: 0.1
     template_entropy: 0.01
+  auxiliary_weights:
+    "8": 0.1
+    "4": 0.2

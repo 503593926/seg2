@@ -4,7 +4,8 @@ defaults:
 
 spot_diameter_um: 100.0
 data_dir: ${paths.data_root}/her2st/1mpp
-patient_names: [E, F, D, G, B, A, C, H]
+#patient_names: [G, E, F, D, B, A, C, H]
+patient_names: [A, B, C, D, E, F, G, H]
 split_mode: patient_loocv
 
 gene_expression_dir: gene_expression/patient_loocv

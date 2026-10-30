@@ -1,11 +1,24 @@
+from collections.abc import Iterable
 from math import ceil
-from typing import cast
+from typing import TypedDict
 
-import cv2
 import numpy as np
 import torch
 
-from seg2.infer.prefetch import _prefetch_batches
+from seg2.infer.accumulator import PredictionAccumulator
+from seg2.infer.prefetch import prefetch_batches
+
+
+class ExpressionPrediction(TypedDict):
+    coefficients: np.ndarray
+    templates: np.ndarray
+
+
+class SlidePrediction(TypedDict, total=False):
+    probability: np.ndarray
+    features: np.ndarray
+    expression: ExpressionPrediction
+    dense_expression: ExpressionPrediction
 
 
 def tile_origins(length, crop_size, stride, alignment):
@@ -18,51 +31,6 @@ def tile_origins(length, crop_size, stride, alignment):
     return origins
 
 
-def _pool_pixels(field, pixels, rows, pixel_counts):
-    pixels = torch.as_tensor(pixels, device=field.device, dtype=torch.long)
-    rows = torch.as_tensor(rows, device=field.device, dtype=torch.long)
-    counts = torch.as_tensor(pixel_counts, device=field.device, dtype=torch.float64)
-    sums = torch.zeros(
-        (len(counts), field.shape[0]), device=field.device, dtype=torch.float64
-    )
-    values = field.flatten(1).T
-    for offset in range(0, len(pixels), 262144):
-        part = slice(offset, offset + 262144)
-        selected = values.index_select(0, pixels[part]).to(torch.float64)
-        sums.index_add_(0, rows[part], selected)
-        del selected
-    return sums / counts.clamp_min(1)[:, None]
-
-
-class _PredictionGrid:
-    def __init__(
-        self, height, width, crop_size, tile_shape, origins, device, cached_weights=None
-    ):
-        _, tile = tile_shape
-        scale = crop_size // tile
-        self.shape = (height // scale, width // scale)
-        window = np.maximum(
-            np.outer(np.hanning(crop_size), np.hanning(crop_size)), 0.01
-        ).astype(np.float32)
-        window = cv2.resize(window, (tile, tile), interpolation=cv2.INTER_AREA)
-        window = torch.as_tensor(window, device=device)
-        self.windows = {}
-        for top, left in origins:
-            y, x = (top // scale, left // scale)
-            h, w = (
-                min(crop_size, height - top) // scale,
-                min(crop_size, width - left) // scale,
-            )
-            self.windows[top, left] = (slice(y, y + h), slice(x, x + w), window[:h, :w])
-        if cached_weights is None:
-            self.weights = torch.zeros(self.shape, device=device, dtype=torch.float32)
-            for y, x, weight in self.windows.values():
-                self.weights[y, x].add_(weight)
-        else:
-            self.weights = torch.as_tensor(cached_weights, device=device)
-        self.denominator = self.weights.clamp_min(1e-6)
-
-
 @torch.inference_mode()
 def predict_slide(
     model,
@@ -71,127 +39,128 @@ def predict_slide(
     device,
     batch_size=1,
     stride=None,
-    return_features=True,
-    expression_factors=None,
-    superpixel_pool=None,
-    spot_pool=None,
-):
+    outputs: Iterable[str] = ("probability",),
+    feature_pool=None,
+    expression_pool=None,
+) -> SlidePrediction:
+    """Return only the requested NumPy predictions.
+
+    outputs selects probability, features, expression (regional), or dense_expression.
+    expression requires expression_pool. Both expression outputs contain
+    coefficients and templates for decoding with @; dense_expression can be
+    requested alongside regional expression.
+    Pools provide output-grid pixels, rows and pixel_counts. feature_pool may also
+    retain a reusable stitching cache in weights; expression results are never
+    written into either pool.
+    """
+    outputs = frozenset((outputs,) if isinstance(outputs, str) else outputs)
+    unknown = outputs - {"probability", "features", "expression", "dense_expression"}
+    if unknown:
+        raise ValueError(f"Unknown outputs: {', '.join(sorted(unknown))}")
+    if not outputs:
+        raise ValueError("outputs must contain at least one prediction name")
+    if "expression" in outputs and expression_pool is None:
+        raise ValueError("expression_pool is required for the 'expression' output")
     batch_size = int(batch_size)
+
     alignment = slide["alignment"]
-    stride = (
-        max(alignment, crop_size // 2 // alignment * alignment)
-        if stride is None
-        else int(stride)
-    )
+    stride = (crop_size // 2 if stride is None else int(stride))
+    assert stride % alignment == 0 and stride > 0
+
     height, width = slide["image"].shape[:2]
     rows = tile_origins(height, crop_size, stride, alignment)
     columns = tile_origins(width, crop_size, stride, alignment)
+
     origins = [(top, left) for top in rows for left in columns]
-    grid = None
-    probability_sum = None
-    templates = None
-    dense_sums = {}
-    compute_expression = expression_factors is not None or spot_pool is not None
-    batches = _prefetch_batches(slide, origins, crop_size, batch_size, device)
+
+    accumulator = PredictionAccumulator(
+        height,
+        width,
+        crop_size,
+        origins,
+        outputs=outputs,
+        feature_pool=feature_pool,
+        expression_pool=expression_pool,
+    )
     was_training = model.training
     model.eval()
+
+    batches = prefetch_batches(slide, origins, crop_size, batch_size, device)
     try:
         for batch_origins, inputs in batches:
             output = model(
                 inputs["image"][0],
                 inputs["patch"],
                 inputs["cls"],
-                compute_expression=compute_expression,
+                compute_expression=accumulator.compute_expression,
             )
-            probability_grid = output["logits"].float().sigmoid()[:, 0]
-            dense_fields = {}
-            if return_features:
-                dense_fields["features"] = output["features"].float()
-            if compute_expression:
-                dense_fields["coefficients"] = (
-                    output["tissue_states"].float()
-                    * output["expression_amplitude"].float()
-                )
-                if templates is None:
-                    templates = output["expression_templates"].float()
-            if grid is None:
-                grid = _PredictionGrid(
-                    height,
-                    width,
-                    crop_size,
-                    probability_grid.shape[-2:],
-                    origins,
-                    probability_grid.device,
-                    superpixel_pool["weights"] if superpixel_pool is not None else None,
-                )
-                probability_sum = torch.zeros(
-                    grid.shape, device=probability_grid.device, dtype=torch.float32
-                )
-                if superpixel_pool is not None:
-                    superpixel_pool["weights"] = grid.weights
-                dense_sums = {
-                    name: torch.zeros(
-                        (field.shape[1], *grid.shape),
-                        device=field.device,
-                        dtype=(
-                            torch.float64
-                            if (name == "features" and superpixel_pool is not None)
-                            or (name == "coefficients" and spot_pool is not None)
-                            else torch.float32
-                        ),
-                    )
-                    for name, field in dense_fields.items()
-                }
-            probability_sum = cast(torch.Tensor, probability_sum)
-            for index, origin in enumerate(batch_origins):
-                y, x, weight = grid.windows[origin]
-                h, w = weight.shape
-                probability_sum[y, x].addcmul_(probability_grid[index, :h, :w], weight)
-                for name, field in dense_fields.items():
-                    dense_sums[name][:, y, x].addcmul_(
-                        field[index, :, :h, :w], weight
-                    )
-            del output, inputs, dense_fields
+            accumulator.add_batch(batch_origins, output)
+            del output, inputs
     finally:
         batches.close()
         model.train(was_training)
-    grid = cast(_PredictionGrid, grid)
-    probability_sum = cast(torch.Tensor, probability_sum)
-    probability_sum.div_(grid.denominator)
-    for field in dense_sums.values():
-        field.div_(grid.denominator)
-    results = {"probability": probability_sum}
-    if return_features:
-        field = dense_sums["features"]
-        if superpixel_pool is not None:
-            labels = superpixel_pool["superpixels"].ravel()
-            pixels = np.flatnonzero(labels)
-            results["features"] = _pool_pixels(
-                field, pixels, labels[pixels], superpixel_pool["pixel_counts"]
+    return finalize_predictions(
+        accumulator.finish(),
+        outputs=outputs,
+        feature_pool=accumulator.feature_pool,
+        expression_pool=accumulator.expression_pool,
+    )
+
+
+def _pool_pixels(field, pixels, rows, pixel_counts):
+    pixels = torch.as_tensor(pixels, device=field.device, dtype=torch.long)
+    rows = torch.as_tensor(rows, device=field.device, dtype=torch.long)
+    counts = torch.as_tensor(pixel_counts, device=field.device, dtype=torch.float64)
+    sums = torch.zeros(
+        (len(counts), field.shape[0]), device=field.device, dtype=torch.float64
+    )
+    values = field.flatten(1).T
+    chunk = max(1,ceil(len(pixels) / 32))
+    for offset in range(0, len(pixels), chunk):
+        part = slice(offset, offset + chunk)
+        selected = values.index_select(0, pixels[part]).to(torch.float64)
+        sums.index_add_(0, rows[part], selected)
+        del selected
+    return sums / counts.clamp_min(1)[:, None]
+
+
+def finalize_predictions(
+    fields: dict[str, torch.Tensor],
+    outputs: frozenset[str],
+    feature_pool=None,
+    expression_pool=None,
+) -> SlidePrediction:
+    result: SlidePrediction = {}
+    if "probability" in outputs:
+        result["probability"] = fields["probability"].cpu().numpy()
+    if "features" in outputs:
+        field = fields["features"]
+        if feature_pool is not None:
+            field = _pool_pixels(
+                field,
+                feature_pool["pixels"],
+                feature_pool["rows"],
+                feature_pool["pixel_counts"],
             )
-            results["features"][0] = 0
         else:
-            results["features"] = field.permute(1, 2, 0).contiguous()
-    if compute_expression:
-        results["templates"] = cast(torch.Tensor, templates)
-    if spot_pool is not None:
-        results["spot_coefficients"] = _pool_pixels(
-            dense_sums["coefficients"],
-            spot_pool["pixels"],
-            spot_pool["rows"],
-            spot_pool["pixel_counts"],
-        ).float()
-    if expression_factors is not None:
-        results["dense_coefficients"] = (
-            dense_sums["coefficients"].float().permute(1, 2, 0).contiguous()
-        )
-    results = {name: value.cpu().numpy() for name, value in results.items()}
-    if spot_pool is not None:
-        spot_pool.update(
-            coefficients=results["spot_coefficients"], templates=results["templates"]
-        )
-    if expression_factors is not None:
-        expression_factors.update(
-            coefficients=results["dense_coefficients"], templates=results["templates"]
-        )
-    return (results["probability"], results.get("features"))
+            field = field.permute(1, 2, 0).contiguous()
+        result["features"] = field.cpu().numpy()
+    if outputs & {"expression", "dense_expression"}:
+        templates = fields["templates"].cpu().numpy()
+        if "expression" in outputs:
+            assert expression_pool is not None
+            coefficients = _pool_pixels(
+                fields["coefficients"],
+                expression_pool["pixels"],
+                expression_pool["rows"],
+                expression_pool["pixel_counts"],
+            ).float()
+            result["expression"] = {
+                "coefficients": coefficients.cpu().numpy(), "templates": templates
+            }
+        if "dense_expression" in outputs:
+            coefficients = fields["coefficients"].float().permute(1, 2, 0).contiguous()
+            result["dense_expression"] = {
+                "coefficients": coefficients.cpu().numpy(), "templates": templates
+            }
+    return result

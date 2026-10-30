@@ -25,9 +25,15 @@ def prepare_propagation(superpixels, lab, coordinates, spot_labels, label_scale,
     probability[votes == 1] = 0.0
     probability[votes == 2] = 1.0
     solvable = ~seeded & np.isin(topology.component_labels, np.unique(topology.component_labels[seeded]))
+    pixels = np.flatnonzero(flat_superpixels)
     return {
         "topology": topology,
-        "feature_pool": {"superpixels": superpixels, "pixel_counts": topology.pixel_counts, "weights": None},
+        "feature_pool": {
+            "pixels": pixels,
+            "rows": flat_superpixels[pixels],
+            "pixel_counts": topology.pixel_counts,
+            "weights": None,
+        },
         "lab_means": standardize(lab_means),
         "spot_labels": spot_labels,
         "seeded": seeded,

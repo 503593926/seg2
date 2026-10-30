@@ -1,6 +1,6 @@
 image:
   epochs: 10
-  warmup_steps: 0.15
+  warmup_steps: 0.2
   progress_every_n_steps: 1
   batch_size: 16
   expression_transform: log1p

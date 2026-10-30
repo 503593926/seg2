@@ -1,6 +1,7 @@
 import json
 from math import lcm
 from pathlib import Path
+from typing import Any
 
 import anndata as ad
 import cv2
@@ -24,9 +25,8 @@ def load_gene_adata(path, names):
     finally:
         adata.file.close()
     expression = gene_adata.X
-    if sp.issparse(expression):
-        sparse_expression = expression
-        expression = sparse_expression.astype(np.float32, copy=False).toarray()
+    if isinstance(expression, (sp.spmatrix, sp.sparray)):
+        expression = sp.csr_matrix(expression, dtype=np.float32).toarray()
     else:
         expression = np.asarray(expression, dtype=np.float32)
     gene_adata.X = expression
@@ -44,20 +44,7 @@ def load_feature_scales(root, feature_maps, target_mpp):
     return scales.pop()
 
 
-def label_scale(target_mpp, label_mpp):
-    ratio = float(label_mpp) / float(target_mpp)
-    scale = round(ratio)
-    return scale
-
-
-def label_grid_root(root, target_mpp, label_mpp):
-    directory = Path(root) / "label_mpp"
-    if label_scale(target_mpp, label_mpp) != 1:
-        directory /= f"{float(label_mpp):g}mpp"
-    return directory
-
-
-def read_sample(root, name, feature_maps, target_mpp, label_mpp):
+def read_sample(root, name, feature_maps, target_mpp, label_mpp) -> dict[str, Any]:
     root = Path(root)
     _, cls_step = load_feature_scales(root, feature_maps, target_mpp)
     sample_dir = root / "samples" / name
@@ -69,7 +56,7 @@ def read_sample(root, name, feature_maps, target_mpp, label_mpp):
     shapes = {values.shape[:2] for values in patch_maps}
     rows, _ = shapes.pop()
     patch_scale = height // rows
-    scale = label_scale(target_mpp, label_mpp)
+    scale = round(float(label_mpp) / float(target_mpp))
     return dict(
         name=name,
         image=image,

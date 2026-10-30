@@ -1,45 +1,32 @@
-import argparse
 from pathlib import Path
-
+from seg2.test import run_test
 
 def main():
-    parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--artifact", type=Path, required=True)
-    parser.add_argument("--data-root", type=Path, required=True)
-    parser.add_argument("--gene-path", type=Path, required=True)
-    parser.add_argument("--output", type=Path, required=True)
-    parser.add_argument("--slides", nargs="+", required=True)
-    parser.add_argument("--feature-maps", nargs="+", required=True)
-    parser.add_argument("--target-mpp", type=float, required=True)
-    parser.add_argument("--crop-size", type=int, default=896)
-    parser.add_argument("--stride", type=int)
-    parser.add_argument("--device", default="cpu")
-    parser.add_argument("--precision", default="32-true")
-    parser.add_argument("--inference-batch-size", type=int, default=1)
-    parser.add_argument("--spot-diameter-um", type=float, required=True)
-    parser.add_argument("--expression-transform", default="log1p")
-    parser.add_argument("--threshold", type=float, default=0.5)
-    parser.add_argument("--visualization-top-n", type=int, default=0)
-    args = parser.parse_args()
-    from seg2.test import run_test
+    project_root = Path(__file__).resolve().parents[2]
+    model_dir = project_root / "outputs/her2st/2026-10-29/13-55-09/test_A/seed_0"
+    data_root = project_root / "data/her2st/1mpp"
 
     run_test(
-        args.artifact,
-        args.data_root,
-        args.gene_path,
-        args.output,
-        names=args.slides,
-        feature_maps=args.feature_maps,
-        target_mpp=args.target_mpp,
-        crop_size=args.crop_size,
-        stride=args.stride,
-        device=args.device,
-        precision=args.precision,
-        inference_batch_size=args.inference_batch_size,
-        spot_diameter_um=args.spot_diameter_um,
-        expression_transform=args.expression_transform,
-        threshold=args.threshold,
-        visualization_top_n=args.visualization_top_n,
+        artifact_path=model_dir / "final_ema_model.pt",
+        data_root=data_root,
+        gene_path=data_root / "gene_expression/patient_loocv/test_A.h5ad",
+        output_dir=model_dir / "test",
+        names=["A1", "A2", "A3", "A4", "A5", "A6"],
+        feature_maps=[
+            "feature_ho1/tile_224_mpp_1_resize_1_overlap_1",
+            "feature_uni2/tile_224_mpp_1_resize_1_overlap_1",
+            "feature_virchow2/tile_224_mpp_1_resize_1_overlap_1",
+        ],
+        target_mpp=1.0,
+        crop_size=896,
+        stride=None,
+        device="cuda:0",
+        precision="bf16-mixed",
+        inference_batch_size=8,
+        spot_diameter_um=100.0,
+        expression_transform="log1p",
+        threshold=0.5,
+        visualization_top_n=0,
     )
 
 
