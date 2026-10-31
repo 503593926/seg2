@@ -6,6 +6,7 @@ import numpy as np
 from numpy.typing import NDArray
 from PIL import Image
 
+from seg2.derive import sample_names
 from seg2.derive.pfm.common import FeatureMapExtractor
 from seg2.derive.qc.visualization import qc_visualize_feature_map
 
@@ -27,9 +28,10 @@ def process_sample(
     print(f"[{name}] patch_map={patch_map.shape} cls_map={cls_map.shape}", flush=True)
 
 
-def run(cfg, force=False):
+def run(cfg):
     from importlib import import_module
 
+    dataset = cfg.dataset
     registry = {
         "h_optimus_0": "HO0Extractor",
         "h_optimus_1": "HO1Extractor",
@@ -43,14 +45,10 @@ def run(cfg, force=False):
     options = cfg.prep.features
     weights_root = Path(str(cfg.paths.weights_root)).expanduser().resolve()
     root, target_mpp = (
-        Path(str(cfg.dataset.data_dir)).expanduser().resolve(),
+        Path(str(dataset.data_dir)).expanduser().resolve(),
         float(cfg.prep.resolution.target_mpp),
     )
-    names = [
-        path.parent.name
-        for patient in sorted(cfg.dataset.patient_names)
-        for path in sorted((root / "samples").glob(f"{patient}*/gene_counts.tsv.gz"))
-    ]
+    names = sample_names(dataset=dataset)
     for key in options.extractors:
         extractor_type = getattr(import_module(f"seg2.derive.pfm.{key}"), registry[key])
         extractor = extractor_type(
@@ -77,16 +75,15 @@ def run(cfg, force=False):
             json.dumps({"patch_mpp": patch_mpp, "cls_mpp": cls_mpp}, indent=2) + "\n"
         )
         for name in names:
-            if force or not all(
-                (output / name / f).is_file() for f in ("patch_map.npy", "cls_map.npy")
-            ):
-                process_sample(
-                    extractor,
-                    name,
-                    root / "samples" / name / "spatial",
-                    output / name,
-                    target_mpp,
-                )
+            process_sample(
+                extractor=extractor,
+                name=name,
+                spatial_dir=root / "samples" / name / "spatial",
+                output_dir=output / name,
+                target_mpp=target_mpp,
+            )
         del extractor
         gc.collect()
-        qc_visualize_feature_map(output, names, patch_mpp=patch_mpp, cls_mpp=cls_mpp)
+        qc_visualize_feature_map(
+            feature_root=output, names=names, patch_mpp=patch_mpp, cls_mpp=cls_mpp
+        )

@@ -1,0 +1,4 @@
+defaults:
+  - paths: base
+  - task@_global_: her2st_to_stnet
+  - _self_

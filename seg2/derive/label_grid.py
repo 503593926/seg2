@@ -1,9 +1,10 @@
-import json
 from pathlib import Path
 
 import cv2
 import numpy as np
 import pandas as pd
+
+from seg2.derive import sample_names
 
 
 def _read_image(path, mode):
@@ -50,6 +51,8 @@ def process_sample(target_root, output_root, name, target_mpp, label_mpp):
     spatial = pd.read_csv(source / f"spatial/spatial_{target_mpp:g}mpp.tsv", sep="\t")
     spatial["pixel_x"] /= scale
     spatial["pixel_y"] /= scale
+    if "spot_radius_px" in spatial:
+        spatial["spot_radius_px"] /= scale
     inside = spatial.pixel_x.between(0, shape[1] - 1) & spatial.pixel_y.between(
         0, shape[0] - 1
     )
@@ -62,34 +65,23 @@ def process_sample(target_root, output_root, name, target_mpp, label_mpp):
     spatial.to_csv(
         destination / f"spatial/spatial_{label_mpp:g}mpp.tsv", sep="\t", index=False
     )
-    (destination / "grid.json").write_text(
-        json.dumps(
-            {
-                "target_mpp": float(target_mpp),
-                "label_mpp": float(label_mpp),
-                "label_scale": scale,
-                "input_shape": [height, width],
-                "prediction_shape": list(shape),
-            },
-            indent=2,
-        )
-        + "\n"
-    )
 
 
-def run(cfg, force=False):
+def run(cfg):
+    dataset = cfg.dataset
     target_mpp, label_mpp = (
         float(cfg.prep.resolution[key]) for key in ("target_mpp", "label_mpp")
     )
-    root = Path(str(cfg.dataset.data_dir)).expanduser().resolve()
+    root = Path(str(dataset.data_dir)).expanduser().resolve()
     output = root / "label_mpp"
     if round(label_mpp / target_mpp) != 1:
         output /= f"{label_mpp:g}mpp"
-    names = {
-        path.parent.name
-        for patient in cfg.dataset.patient_names
-        for path in (root / "samples").glob(f"{patient}*/gene_counts.tsv.gz")
-    } | set(cfg.dataset.labeled_names)
+    names = set(sample_names(dataset=dataset)) | set(dataset.labeled_names)
     for name in sorted(names):
-        if force or not (output / name / "grid.json").is_file():
-            process_sample(root / "samples", output, name, target_mpp, label_mpp)
+        process_sample(
+            target_root=root / "samples",
+            output_root=output,
+            name=name,
+            target_mpp=target_mpp,
+            label_mpp=label_mpp,
+        )

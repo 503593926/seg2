@@ -45,7 +45,7 @@ class TrainingDataset(Dataset):
             }
 
         self.shared_supervision = {}
-        if int(cfg.dataset.num_workers) > 0:
+        if int(cfg.training.runtime.num_workers) > 0:
             for name in self.labeled_names:
                 slide = self.slides[name]
                 self.shared_supervision[name] = {}
@@ -55,7 +55,7 @@ class TrainingDataset(Dataset):
                     slide[key] = shared.numpy()
 
         self.stain_transform = build_stain_transform(self.cfg.augment)
-        self.crop_size = int(self.cfg.dataset.crop_size)
+        self.crop_size = int(self.cfg.training.image.crop_size)
 
         first_slide = next(iter(self.slides.values()))
         self.label_scale = first_slide["label_scale"]
@@ -68,24 +68,32 @@ class TrainingDataset(Dataset):
         task_weights = cfg.training.image.loss_weights
         self.auxiliary_pool_scales = (
             tuple(
-                int(scale) for scale in cfg.model.image.get("auxiliary_scales", ())
+                int(scale)
+                for scale in cfg.model.image.get("auxiliary_scales", ())
                 if float(auxiliary_weights.get(str(scale), 0))
             )
-            if any(float(task_weights[name]) for name in ("gene_prediction", "gene_correlation"))
+            if any(
+                float(task_weights[name])
+                for name in ("gene_prediction", "gene_correlation")
+            )
             else ()
         )
         if any(
-            scale < self.label_scale or scale % self.label_scale or self.crop_size % scale
+            scale < self.label_scale
+            or scale % self.label_scale
+            or self.crop_size % scale
             for scale in self.auxiliary_pool_scales
         ):
-            raise ValueError("Auxiliary scales must divide crop_size and be multiples of label_scale")
+            raise ValueError(
+                "Auxiliary scales must divide crop_size and be multiples of label_scale"
+            )
 
         self.crop_origins = {}
         for name in self.slide_names:
             self._refresh_slide(name)
 
     def __len__(self):
-        return int(self.cfg.dataset.samples_per_epoch)
+        return int(self.cfg.training.image.samples_per_epoch)
 
     def __getitem__(self, index):
         epoch, index, name, top, left = index
@@ -121,7 +129,10 @@ class TrainingDataset(Dataset):
                 factor = scale // self.label_scale
                 tissue = sample["tissue"][0, ::factor, ::factor]
                 sample["auxiliary_spot_pools"][str(scale)] = prepare_spot_pool(
-                    tissue, sample["spots"], self.spot_radius_px, scale,
+                    tissue,
+                    sample["spots"],
+                    self.spot_radius_px,
+                    scale,
                 )
         return sample
 
@@ -152,7 +163,7 @@ class TrainingDataset(Dataset):
             - integral[size::step, :-size:step]
             + integral[:-size:step, :-size:step]
         )
-        keep = area >= self.cfg.dataset.min_valid_fraction * size * size
+        keep = area >= self.cfg.training.image.min_valid_fraction * size * size
         y, x = np.nonzero(keep)
         return np.stack((y * step, x * step), axis=1) * self.label_scale
 

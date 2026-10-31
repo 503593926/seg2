@@ -20,10 +20,14 @@ def process_sample(
     sample_dir = input_root / name / "spatial"
     output_dir = output_root / name / "snic"
     output_dir.mkdir(parents=True, exist_ok=True)
-    image_bgr = cv2.imread(
-        str(sample_dir / f"he_{label_mpp:g}mpp.png"), cv2.IMREAD_COLOR
+    image_bgr = np.asarray(
+        cv2.imread(str(sample_dir / f"he_{label_mpp:g}mpp.png"), cv2.IMREAD_COLOR),
+        dtype=np.uint8,
     )
-    tissue_mask = cv2.imread(str(sample_dir / "tissue_mask.png"), cv2.IMREAD_GRAYSCALE)
+    tissue_mask = np.asarray(
+        cv2.imread(str(sample_dir / "tissue_mask.png"), cv2.IMREAD_GRAYSCALE),
+        dtype=np.uint8,
+    )
     tissue: NDArray[np.bool_] = tissue_mask > 0
     requested_superpixels = requested_superpixel_count(
         int(tissue.sum()), superpixel_size_um, label_mpp
@@ -38,21 +42,21 @@ def process_sample(
     qc_visualize_superpixels(image_bgr, superpixels, label_mpp, output_dir)
 
 
-def run(cfg, force=False):
+def run(cfg):
+    dataset = cfg.dataset
     target_mpp, label_mpp = (
         float(cfg.prep.resolution.target_mpp),
         float(cfg.prep.resolution.label_mpp),
     )
-    output = Path(str(cfg.dataset.data_dir)).expanduser().resolve() / "label_mpp"
+    output = Path(str(dataset.data_dir)).expanduser().resolve() / "label_mpp"
     if round(label_mpp / target_mpp) != 1:
         output /= f"{label_mpp:g}mpp"
-    for name in cfg.dataset.labeled_names:
-        if force or not (output / name / "snic/superpixels.npy").is_file():
-            process_sample(
-                output,
-                output,
-                name,
-                label_mpp,
-                float(cfg.prep.snic.superpixel_size_um),
-                float(cfg.prep.snic.compactness),
-            )
+    for name in dataset.labeled_names:
+        process_sample(
+            input_root=output,
+            output_root=output,
+            name=name,
+            label_mpp=label_mpp,
+            superpixel_size_um=float(cfg.prep.snic.superpixel_size_um),
+            compactness=float(cfg.prep.snic.compactness),
+        )

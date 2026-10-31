@@ -1,8 +1,14 @@
 image:
+  crop_size: 896
+  samples_per_epoch: 4000
+  min_valid_fraction: 0.25
+  labeled_sampling_fraction: null
+  slides_per_batch: 4
   epochs: 10
-  warmup_steps: 0.2
+  warmup_steps: 0.15
   progress_every_n_steps: 1
-  batch_size: 16
+  batch_size: 8
+  accumulate_grad_batches: 1
   expression_transform: log1p
   gene_correlation_min_spots: 8
   gene_correlation_std_floor: 0.02
@@ -14,16 +20,20 @@ image:
   # Each branch reuses loss_weights for segmentation, expression MSE and correlation.
   auxiliary_weights:
     "8": 0.1
-    "4": 0.1
+    "4": 0.2
   loss_weights:
-    segmentation: 0.0
+    segmentation: 1.0
     gene_prediction: 1.0
-    gene_correlation: 0.5
-    state_balance: 0.0
-    template_orthogonal: 0.0
-    template_entropy: 0.0
+    gene_correlation: 1.0
+    state_balance: 0.1
+    template_orthogonal: 0.1
+    template_entropy: 0.01
 
 runtime:
+  num_workers: 8
+  persistent_workers: true
+  prefetch_factor: 1
+  pin_memory: true
   accelerator: gpu
   devices: 1
   precision: bf16-mixed

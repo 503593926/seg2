@@ -1,0 +1,9 @@
+defaults:
+  - paths: base
+  - dataset: her2st
+  - prepare@prep: her2st
+  - _self_
+
+prep:
+  resolution:
+    target_mpp: ${dataset.target_mpp}

@@ -1,0 +1,8 @@
+defaults:
+  - base
+  - /dataset@source_dataset: her2st
+  - _self_
+
+task:
+  name: her2st_patient_loocv
+  split_mode: patient_loocv

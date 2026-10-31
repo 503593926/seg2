@@ -1,6 +1,5 @@
 import os
-from pathlib import Path
-from typing import Any
+from typing import cast
 
 import cv2
 import pytorch_lightning as pl
@@ -9,8 +8,8 @@ from lightning_fabric.utilities.seed import pl_worker_init_function
 from omegaconf import DictConfig
 from threadpoolctl import threadpool_limits
 from torch.utils.data import DataLoader
-from typing import Any, cast
 from torch.utils.data.dataloader import _MultiProcessingDataLoaderIter
+
 from seg2.train.data.dataset import TrainingDataset, collate_samples
 from seg2.train.data.loading import load_gene_adata, load_training_slides
 from seg2.train.data.sampling import EpochSampler
@@ -63,20 +62,23 @@ class FoldDataModule(pl.LightningDataModule):
             dataset = self.train_dataset
             assert dataset is not None
 
-            workers = int(self.cfg.dataset.num_workers)
+            runtime = self.cfg.training.runtime
+            workers = int(runtime.num_workers)
             if workers:
                 cv2.setNumThreads(1)
             batch_size = int(self.cfg.training.image.batch_size)
             self._train_loader = DataLoader(
                 dataset,
                 batch_size=batch_size,
-                sampler=EpochSampler(dataset, batch_size, self.cfg.dataset.slides_per_batch),
+                sampler=EpochSampler(
+                    dataset, batch_size, self.cfg.training.image.slides_per_batch
+                ),
                 num_workers=workers,
                 collate_fn=collate_samples,
                 worker_init_fn=initialize_training_worker,
-                persistent_workers=workers > 0 and bool(self.cfg.dataset.persistent_workers),
-                pin_memory=bool(self.cfg.dataset.pin_memory),
+                persistent_workers=workers > 0 and bool(runtime.persistent_workers),
+                pin_memory=bool(runtime.pin_memory),
                 generator=self.train_generator,
-                prefetch_factor=int(self.cfg.dataset.prefetch_factor) if workers > 0 else None,
+                prefetch_factor=int(runtime.prefetch_factor) if workers > 0 else None,
             )
         return self._train_loader

@@ -1,7 +1,6 @@
 defaults:
-  - /dataset: her2st
-  - /model: her2st
-  - /training: her2st
-  - /augment: her2st
-  - /dynamic: her2st
-  - /prep: her2st
+  - base
+  - /task@_global_: her2st_patient_loocv
+  - _self_
+
+experiment_name: her2st

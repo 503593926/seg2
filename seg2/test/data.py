@@ -6,6 +6,7 @@ from typing import Any
 import anndata as ad
 import cv2
 import numpy as np
+import pandas as pd
 import scipy.sparse as sp
 
 
@@ -33,6 +34,35 @@ def load_gene_adata(path, names):
     return gene_adata
 
 
+def align_gene_adata(gene_adata, gene_names):
+    gene_names = list(map(str, gene_names))
+    present = set(map(str, gene_adata.var_names))
+    missing = [name for name in gene_names if name not in present]
+    if not missing:
+        return gene_adata[:, gene_names].copy()
+    columns = {name: index for index, name in enumerate(gene_names)}
+    values = np.zeros((gene_adata.n_obs, len(gene_names)), dtype=np.float32)
+    for index, name in enumerate(map(str, gene_adata.var_names)):
+        if name in columns:
+            values[:, columns[name]] = gene_adata.X[:, index]
+    aligned = ad.AnnData(
+        X=values,
+        obs=gene_adata.obs.copy(),
+        var=pd.DataFrame(index=pd.Index(gene_names, name="gene")),
+        uns=dict(gene_adata.uns),
+    )
+    missing_by_slide = {
+        str(slide): set(map(str, names))
+        for slide, names in gene_adata.uns.get("missing_selected_genes_by_slide", {}).items()
+    }
+    for slide in aligned.obs["name"].astype(str).unique():
+        missing_by_slide[slide] = missing_by_slide.get(slide, set()) | set(missing)
+    aligned.uns["missing_selected_genes_by_slide"] = {
+        slide: sorted(names) for slide, names in missing_by_slide.items()
+    }
+    return aligned
+
+
 def load_feature_scales(root, feature_maps, target_mpp):
     target_mpp = float(target_mpp)
     scales = set()
@@ -42,6 +72,13 @@ def load_feature_scales(root, feature_maps, target_mpp):
         cls_scale = round(float(metadata["cls_mpp"]) / target_mpp)
         scales.add((patch_scale, cls_scale))
     return scales.pop()
+
+
+def label_sample_dir(root, name, label_mpp, target_mpp=1.0):
+    root = Path(root)
+    if round(float(label_mpp), 6) == round(float(target_mpp), 6):
+        return root / "samples" / name
+    return root / "label_mpp" / f"{float(label_mpp):g}mpp" / name
 
 
 def read_sample(root, name, feature_maps, target_mpp, label_mpp) -> dict[str, Any]:

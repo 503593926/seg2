@@ -1,0 +1,5 @@
+project_root: /home/yfm/works/seg2
+data_root: ${paths.project_root}/data
+task_root: ${paths.data_root}/task
+weights_root: ${paths.project_root}/pretrained_model
+output_root: ${paths.project_root}/outputs

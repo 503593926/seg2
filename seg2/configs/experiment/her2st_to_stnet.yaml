@@ -1,0 +1,10 @@
+defaults:
+  - base
+  - /task@_global_: her2st_to_stnet
+  - _self_
+
+experiment_name: her2st_to_stnet
+
+evaluation:
+  test:
+    spot_classification: true

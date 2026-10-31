@@ -5,14 +5,10 @@ import pandas as pd
 from seg2.common.imaging.estimate_mpp_from_spatial import estimate_mpp_from_spatial
 
 
-def run(cfg, force=False):
+def run(cfg):
     dataset = cfg.dataset
     raw_data_root = Path(str(dataset.raw_root))
-    save_path = (
-        Path(str(cfg.dataset.data_dir)).expanduser().resolve().parent / "mpp.csv"
-    )
-    if save_path.is_file() and (not force):
-        return
+    save_path = Path(str(dataset.data_dir)).expanduser().resolve().parent / "mpp.csv"
     save_path.parent.mkdir(parents=True, exist_ok=True)
     patient_names = sorted(dataset.patient_names)
     spot_pitch_um = float(dataset.array_pitch_um)
@@ -26,7 +22,9 @@ def run(cfg, force=False):
             selected = spatial.loc[spatial["selected"] == 1].rename(
                 columns={"new_x": "array_x", "new_y": "array_y"}
             )
-            axis_fit, affine_fit = estimate_mpp_from_spatial(selected, spot_pitch_um)
+            axis_fit, affine_fit = estimate_mpp_from_spatial(
+                spatial=selected, spot_pitch_um=spot_pitch_um
+            )
             records.append(
                 {
                     "name": name,

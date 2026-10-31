@@ -17,7 +17,9 @@ class EpochSampler(Sampler):
         epoch = self.dataset.epoch
         for start in range(0, len(self.dataset), self.batch_size):
             count = min(self.batch_size, len(self.dataset) - start)
-            rng = np.random.default_rng(np.random.SeedSequence([self.dataset.seed, epoch, start, 1]))
+            rng = np.random.default_rng(
+                np.random.SeedSequence([self.dataset.seed, epoch, start, 1])
+            )
             names = self._sample_slides(rng, min(self.slides_per_batch, count))
             crops, extra = divmod(count, len(names))
             index = start
@@ -30,7 +32,7 @@ class EpochSampler(Sampler):
 
     def _sample_slides(self, rng, count):
         dataset = self.dataset
-        fraction = dataset.cfg.dataset.labeled_sampling_fraction
+        fraction = dataset.cfg.training.image.labeled_sampling_fraction
         if fraction is None:
             return rng.choice(dataset.slide_names, size=count, replace=False).tolist()
         expected = count * float(fraction)
@@ -40,8 +42,12 @@ class EpochSampler(Sampler):
             len(dataset.labeled_names),
         )
         names = (
-            rng.choice(dataset.labeled_names, size=labeled_count, replace=False).tolist()
-            + rng.choice(dataset.expression_only_names, size=count - labeled_count, replace=False).tolist()
+            rng.choice(
+                dataset.labeled_names, size=labeled_count, replace=False
+            ).tolist()
+            + rng.choice(
+                dataset.expression_only_names, size=count - labeled_count, replace=False
+            ).tolist()
         )
         rng.shuffle(names)
         return names

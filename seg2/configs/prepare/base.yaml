@@ -1,6 +1,5 @@
 resolution:
-  target_mpp: 1.0
-  label_mpp: 1.0
+  label_mpp: 2.0
   tile_size: 224
 
 snic:
@@ -19,11 +18,7 @@ seeds:
   seed: 0
 
 gene:
-  selection_mode: svgs
-  n_top_genes: 512
-  union_rank_and_truncate: false
-  target_sum: 10000.0
-  svg_n_neighbors: 8
+  mapping_reference: ${paths.data_root}/reference/hgnc_complete_set.txt
 
 features:
   extractors: [h_optimus_1, uni2, virchow2]

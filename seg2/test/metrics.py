@@ -4,10 +4,76 @@ import numpy as np
 import torch
 
 
+def spot_classification_metrics(probability, labels, threshold=0.5):
+    from sklearn.metrics import average_precision_score, roc_auc_score
+
+    probability, labels = np.asarray(probability), np.asarray(labels)
+    valid = np.isfinite(probability) & np.isin(labels, [0, 1])
+    probability, labels = probability[valid], labels[valid].astype(bool)
+    prediction = probability >= threshold
+    tp = int(np.count_nonzero(prediction & labels))
+    fp = int(np.count_nonzero(prediction & ~labels))
+    fn = int(np.count_nonzero(~prediction & labels))
+    count = len(labels)
+    return {
+        "spots": count,
+        "positive_spots": int(labels.sum()),
+        "threshold": float(threshold),
+        "auc": float(roc_auc_score(labels, probability))
+        if count and np.unique(labels).size == 2
+        else None,
+        "ap": float(average_precision_score(labels, probability))
+        if labels.any()
+        else None,
+        "f1": 2 * tp / (2 * tp + fp + fn)
+        if 2 * tp + fp + fn
+        else (0.0 if count else None),
+        "acc": float((prediction == labels).mean()) if count else None,
+    }
+
+
+def summarize_spot_classification(records, threshold=0.5):
+    if not records:
+        return {}
+    import pandas as pd
+
+    combined = pd.concat(list(records.values()), ignore_index=True)
+    valid = combined[combined["classification_valid"]].copy()
+    slides = {
+        name: spot_classification_metrics(
+            table.loc[table.classification_valid, "probability"],
+            table.loc[table.classification_valid, "spot_label"],
+            threshold,
+        )
+        for name, table in records.items()
+    }
+    patients = {
+        str(name): spot_classification_metrics(
+            table.probability, table.spot_label, threshold
+        )
+        for name, table in valid.groupby("patient_id")
+    }
+    macro = {}
+    for key in ("auc", "ap", "f1", "acc"):
+        values = [scores[key] for scores in slides.values() if scores[key] is not None]
+        macro[key] = float(np.mean(values)) if values else None
+        macro[f"{key}_slides"] = len(values)
+    return {
+        "micro": spot_classification_metrics(
+            valid.probability, valid.spot_label, threshold
+        ),
+        "macro": macro,
+        "slides": slides,
+        "patients": patients,
+    }
+
+
 def probability_loss(probability, target, valid):
     probability = np.clip(probability[valid], 1e-07, 1 - 1e-07)
     target = target[valid].astype(np.float32)
-    bce = -(target * np.log(probability) + (1 - target) * np.log1p(-probability)).mean(dtype=np.float64)
+    bce = -(target * np.log(probability) + (1 - target) * np.log1p(-probability)).mean(
+        dtype=np.float64
+    )
     dice = 1 - (2 * np.sum(probability * target, dtype=np.float64) + 1) / (
         probability.sum(dtype=np.float64) + target.sum(dtype=np.float64) + 1
     )
@@ -54,20 +120,33 @@ def segmentation_metrics(probability, labels, valid, threshold=0.5):
 
 
 def _summarize_head(metrics_list):
-    counts = [sum((scores[key] for scores in metrics_list)) for key in ("tp", "fp", "fn", "tn")]
+    counts = [
+        sum(scores[key] for scores in metrics_list) for key in ("tp", "fp", "fn", "tn")
+    ]
     macro_keys = ("loss", "dice", "iou")
     return {
-        "macro": {key: float(np.mean([scores[key] for scores in metrics_list])) for key in macro_keys},
+        "macro": {
+            key: float(np.mean([scores[key] for scores in metrics_list]))
+            for key in macro_keys
+        },
         "micro": scores_from_counts(*counts),
     }
 
 
 def gene_pearson_correlations(prediction, target, observed=None):
     prediction, target = (prediction.float(), target.float())
-    observed = torch.ones_like(target, dtype=torch.bool) if observed is None else observed.bool()
+    observed = (
+        torch.ones_like(target, dtype=torch.bool)
+        if observed is None
+        else observed.bool()
+    )
     counts = observed.sum(0).clamp_min(1)
-    centered_prediction = torch.where(observed, prediction - (prediction * observed).sum(0) / counts, 0.0)
-    centered_target = torch.where(observed, target - (target * observed).sum(0) / counts, 0.0)
+    centered_prediction = torch.where(
+        observed, prediction - (prediction * observed).sum(0) / counts, 0.0
+    )
+    centered_target = torch.where(
+        observed, target - (target * observed).sum(0) / counts, 0.0
+    )
     p_std = (centered_prediction.square().sum(0) / counts).sqrt()
     t_std = (centered_target.square().sum(0) / counts).sqrt()
     usable = (counts >= 2) & (p_std > 1e-06) & (t_std > 1e-06)
@@ -82,7 +161,11 @@ def gene_pearson_correlations(prediction, target, observed=None):
 
 def expression_metrics(prediction, target, observed=None):
     prediction, target = (prediction.float(), target.float())
-    observed = torch.ones_like(target, dtype=torch.bool) if observed is None else observed.bool()
+    observed = (
+        torch.ones_like(target, dtype=torch.bool)
+        if observed is None
+        else observed.bool()
+    )
     metrics: dict[str, int | float] = {
         "gene_spots": len(prediction),
         "gene_pcc_genes": 0,
@@ -103,13 +186,19 @@ def expression_metrics(prediction, target, observed=None):
     pcc = correlations[torch.isfinite(correlations)]
     metrics["gene_pcc_genes"] = pcc.numel()
     metrics["gene_prediction_pcc"] = float(pcc.mean()) if pcc.numel() else float("nan")
-    metrics["gene_prediction_pcc_max"] = float(pcc.max()) if pcc.numel() else float("nan")
-    metrics["gene_prediction_pcc_min"] = float(pcc.min()) if pcc.numel() else float("nan")
+    metrics["gene_prediction_pcc_max"] = (
+        float(pcc.max()) if pcc.numel() else float("nan")
+    )
+    metrics["gene_prediction_pcc_min"] = (
+        float(pcc.min()) if pcc.numel() else float("nan")
+    )
     return metrics
 
 
 def summarize_expression_metrics(slides, expression_results):
-    valid = [record for record in expression_results.values() if len(record["prediction"])]
+    valid = [
+        record for record in expression_results.values() if len(record["prediction"])
+    ]
     if not valid:
         return {}
     micro = expression_metrics(
@@ -124,7 +213,9 @@ def summarize_expression_metrics(slides, expression_results):
     }
     macro = {}
     for key in ("gene_prediction", "gene_prediction_rmse", "gene_prediction_pcc"):
-        values = [metrics[key] for metrics in per_slide.values() if np.isfinite(metrics[key])]
+        values = [
+            metrics[key] for metrics in per_slide.values() if np.isfinite(metrics[key])
+        ]
         macro[key] = float(np.mean(values)) if values else float("nan")
     return {"micro": micro, "macro": macro, "slides": per_slide}
 

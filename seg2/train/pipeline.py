@@ -48,6 +48,14 @@ def _train_model(cfg, data_module, output_dir, extra_callbacks=()):
     slide = next(iter(data_module.train_slides.values()))
     train_cfg = cfg.training.image
     model = build_model(cfg.model.image, slide, data_module.train_gene_adata.var_names)
+    gene_data = data_module.train_gene_adata
+    if "normalization_genes" in gene_data.uns:
+        model.expression_spec = {
+            "normalization_genes": list(map(str, gene_data.uns["normalization_genes"])),
+            "target_sum": float(gene_data.uns["target_sum"]),
+            "expression_transform": str(train_cfg.expression_transform),
+            "preprocessing_id": str(gene_data.uns.get("preprocessing_id", "")),
+        }
     module = SegmentationModule(model, train_cfg)
     callbacks: list[pl.Callback] = [
         DatasetEpochCallback(),
@@ -95,6 +103,7 @@ def save_model(model, path):
             },
             "model_config": model.model_config,
             "gene_names": list(model.gene_names),
+            "expression_spec": getattr(model, "expression_spec", None),
         },
         path,
     )

@@ -72,6 +72,64 @@ def save_prediction_result(directory, image_rgb, probability, labels, valid, sca
     _write_image(directory / "overview.jpg", overview, jpg_parameters)
 
 
+def _scale_bar(image, length_px, label="100 um"):
+    left, bottom = 32, image.shape[0] - 32
+    right = round(left + length_px)
+    for color, thickness in (((0, 0, 0), 9), ((255, 255, 255), 4)):
+        cv2.line(image, (left, bottom), (right, bottom), color, thickness, cv2.LINE_AA)
+    for color, thickness in (((0, 0, 0), 6), ((255, 255, 255), 2)):
+        cv2.putText(
+            image, label, (left, bottom - 16), cv2.FONT_HERSHEY_SIMPLEX, 1.2, color, thickness, cv2.LINE_AA
+        )
+
+
+def save_spot_overlay(directory, image_bgr, spots, radius_px):
+    directory = Path(directory)
+    directory.mkdir(parents=True, exist_ok=True)
+    centers = np.rint(spots).astype(np.int32)
+    radius = round(radius_px)
+    filled = image_bgr.copy()
+    for center in centers:
+        cv2.circle(filled, tuple(center), radius, (255, 255, 0), -1, cv2.LINE_AA)
+    overlay = cv2.addWeighted(filled, 0.25, image_bgr, 0.75, 0)
+    outline = max(1, round(radius_px * 0.08))
+    for center in centers:
+        cv2.circle(overlay, tuple(center), radius, (255, 255, 0), outline, cv2.LINE_AA)
+    _scale_bar(overlay, 2 * radius_px)
+    _write_image(directory / "spot_overlay.jpg", overlay, (cv2.IMWRITE_JPEG_QUALITY, 92))
+
+
+def _probability_legend(width, title):
+    legend = np.full((88, width, 3), 255, dtype=np.uint8)
+    cv2.putText(legend, title, (24, 26), cv2.FONT_HERSHEY_SIMPLEX, 0.9, (20, 20, 20), 2, cv2.LINE_AA)
+    gradient = np.tile(np.linspace(0, 255, width - 48).astype(np.uint8), (18, 1))
+    legend[36:54, 24 : width - 24] = cv2.applyColorMap(gradient, cv2.COLORMAP_TURBO)
+    labels = ("0", "0.5", "1")
+    widths = [cv2.getTextSize(text, cv2.FONT_HERSHEY_SIMPLEX, 0.7, 2)[0][0] for text in labels]
+    for text, left in zip(labels, (24, (width - widths[1]) // 2, width - 24 - widths[2])):
+        cv2.putText(
+            legend, text, (left, 82), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (20, 20, 20), 2, cv2.LINE_AA
+        )
+    return legend
+
+
+def save_probability_overlay(directory, image_bgr, tissue, probability, title, threshold=0.5):
+    directory = Path(directory)
+    directory.mkdir(parents=True, exist_ok=True)
+    encoded = np.rint(np.clip(probability, 0.0, 1.0) * 255).astype(np.uint8)
+    blended = cv2.addWeighted(
+        cv2.applyColorMap(encoded, cv2.COLORMAP_TURBO), 0.5, image_bgr, 0.5, 0
+    )
+    overlay = image_bgr.copy()
+    overlay[tissue] = blended[tissue]
+    legend = _probability_legend(overlay.shape[1], f"{title} | threshold {threshold:g}")
+    _write_image(
+        directory / "probability_overlay.jpg",
+        np.vstack((overlay, legend)),
+        (cv2.IMWRITE_JPEG_QUALITY, 92),
+    )
+
+
 def _expression_background(image_rgb, spots, spot_radius_px, size=512):
     height, width = image_rgb.shape[:2]
     scale = min((size - 24) / width, (size - 100) / height)

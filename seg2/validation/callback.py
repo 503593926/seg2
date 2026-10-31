@@ -7,12 +7,14 @@ from pathlib import Path
 import pytorch_lightning as pl
 
 from seg2.infer.memory import release_inference_cache
+from seg2.test.configuration import evaluation_parameters
 from seg2.train.pipeline import save_model
 
 
 class ValidationCallback(pl.Callback):
-    def __init__(self, cfg, names, data_root, gene_path, output_dir):
+    def __init__(self, cfg, names, data_root, gene_path, output_dir, *, dataset):
         self.cfg = cfg
+        self.dataset = dataset
         self.names = list(names)
         self.data_root = Path(data_root)
         self.gene_path = Path(gene_path)
@@ -20,39 +22,38 @@ class ValidationCallback(pl.Callback):
 
     def on_train_epoch_end(self, trainer, pl_module):
         epoch = trainer.current_epoch + 1
-        options = self.cfg.validation
+        options = self.cfg.evaluation.validation
         if epoch % int(options.every_n_epochs):
             return
         output = self.output_dir / f"epoch_{epoch:04d}"
-        dataset = self.cfg.dataset
-        model = pl_module.ema_model if str(options.weights) == "ema" else pl_module.model
+        if str(options.weights) not in {"ema", "model"}:
+            raise ValueError("Validation weights must be 'ema' or 'model'")
+        model = (
+            pl_module.ema_model if str(options.weights) == "ema" else pl_module.model
+        )
         with tempfile.TemporaryDirectory(prefix="seg2_validation_model_") as directory:
             artifact = Path(directory) / "model.pt"
             save_model(model, artifact)
             command = [
                 sys.executable,
                 "-c",
-                "import json, sys\n"
-                "from seg2.test import run_test\n"
-                "run_test(**json.load(sys.stdin))\n",
+                (
+                    "import json, sys\n"
+                    "from seg2.test import run_test\n"
+                    "run_test(**json.load(sys.stdin))\n"
+                ),
             ]
-            parameters = {
-                "artifact_path": str(artifact),
-                "data_root": str(self.data_root),
-                "gene_path": str(self.gene_path),
-                "output_dir": str(output),
-                "names": self.names,
-                "feature_maps": list(map(str, dataset.image_feature_maps)),
-                "target_mpp": float(self.cfg.prep.resolution.target_mpp),
-                "spot_diameter_um": float(dataset.spot_diameter_um),
-                "crop_size": int(options.crop_size),
-                "stride": None if options.stride is None else int(options.stride),
-                "inference_batch_size": int(options.batch_size),
-                "device": str(pl_module.device),
-                "precision": str(options.precision),
-                "expression_transform": str(options.expression_transform),
-                "visualization_top_n": int(options.top_genes),
-            }
+            parameters = evaluation_parameters(
+                self.cfg,
+                dataset=self.dataset,
+                artifact_path=artifact,
+                data_root=self.data_root,
+                gene_path=self.gene_path,
+                output_dir=output,
+                names=self.names,
+                device=pl_module.device,
+                validation=True,
+            )
             release_inference_cache(
                 pl_module.device, f"development validation epoch {epoch} begin"
             )
@@ -73,11 +74,19 @@ class ValidationCallback(pl.Callback):
         expression = summary["expression"]
         if expression:
             metrics.update(
-                {f"val/{key}": value for key, value in expression["micro"].items()}
+                {f"val/{key}": value for key, value in expression["macro"].items()}
             )
             metrics["val/gene_prediction_pcc_macro"] = expression["macro"][
                 "gene_prediction_pcc"
             ]
+        spot_metrics = summary.get("spot_classification", {}).get("macro", {})
+        metrics.update(
+            {
+                f"val/spot_{key}": spot_metrics[key]
+                for key in ("auc", "ap", "f1", "acc")
+                if spot_metrics.get(key) is not None
+            }
+        )
         pl_module.log_dict(
             metrics, on_step=False, on_epoch=True, prog_bar=True, batch_size=1
         )

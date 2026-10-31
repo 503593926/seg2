@@ -61,16 +61,17 @@ def process(
     qc_visualize_mask(semantic_mask, name, classes, img_path, raw_data_root, save_root)
 
 
-def run(cfg, force=False):
+def run(cfg):
     from seg2.ingest.her2st.annotation import CLASSES
 
     dataset = cfg.dataset
     save_root = (
-        Path(str(cfg.dataset.data_dir)).expanduser().resolve().parent / "original_mask"
+        Path(str(dataset.data_dir)).expanduser().resolve().parent / "original_mask"
     )
     for name in dataset.labeled_names:
-        if force or not all(
-            (save_root / name / f).is_file()
-            for f in ("training_mask.png", "valid_mask.png")
-        ):
-            process(Path(str(dataset.raw_root)), name, CLASSES, save_root)
+        process(
+            raw_data_root=Path(str(dataset.raw_root)),
+            name=name,
+            classes=CLASSES,
+            save_root=save_root,
+        )

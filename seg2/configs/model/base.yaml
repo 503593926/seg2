@@ -1,4 +1,7 @@
 image:
+  output_scale: 2
+  gradient_checkpointing: true
+  tissue_state_dim: 32
   top_k: 2
   encoder_chans: [48, 96, 192, 384]
   decoder_chans: [192, 96, 48]
@@ -8,7 +11,7 @@ image:
 
   encoder_spatial: [false, false, true, true]  # 2, 4, 8, 16
   decoder_spatial: [true, false, false]  # 8, 4, 2
-  skip_drop_path: 0.25
+  skip_drop_path: 0.5
   drop_path: [0.1, 0.1, 0.1, 0.1]
   tissue_state_count: 32
   auxiliary_scales: [8, 4]

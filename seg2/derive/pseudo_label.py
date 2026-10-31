@@ -37,11 +37,13 @@ def process_sample(
     snic_dir = processing_root / name / "snic"
     output_dir = processing_root / name / f"pseudo_label_ratio@{ratio * 100:g}"
     output_dir.mkdir(parents=True, exist_ok=True)
-    image_bgr = cv2.imread(
-        str(sample_dir / f"he_{label_mpp:g}mpp.png"), cv2.IMREAD_COLOR
+    image_bgr = np.asarray(
+        cv2.imread(str(sample_dir / f"he_{label_mpp:g}mpp.png"), cv2.IMREAD_COLOR),
+        dtype=np.uint8,
     )
-    tissue_mask_uint8 = cv2.imread(
-        str(sample_dir / "tissue_mask.png"), cv2.IMREAD_GRAYSCALE
+    tissue_mask_uint8 = np.asarray(
+        cv2.imread(str(sample_dir / "tissue_mask.png"), cv2.IMREAD_GRAYSCALE),
+        dtype=np.uint8,
     )
     tissue_mask_bl: NDArray[np.bool_] = tissue_mask_uint8 > 0
     superpixels: NDArray[np.int32] = np.load(snic_dir / "superpixels.npy")
@@ -105,8 +107,9 @@ def process_sample(
     )
 
 
-def run(cfg, force=False):
-    root = Path(str(cfg.dataset.data_dir)).expanduser().resolve()
+def run(cfg):
+    dataset = cfg.dataset
+    root = Path(str(dataset.data_dir)).expanduser().resolve()
     target_mpp, label_mpp = (
         float(cfg.prep.resolution.target_mpp),
         float(cfg.prep.resolution.label_mpp),
@@ -117,21 +120,16 @@ def run(cfg, force=False):
     processing.mkdir(parents=True, exist_ok=True)
     ratio = float(cfg.prep.rw.pseudo_label_ratio)
     options = cfg.prep.rw
-    for name in cfg.dataset.labeled_names:
-        destination = processing / name / f"pseudo_label_ratio@{ratio * 100:g}"
-        if force or not all(
-            (destination / f).is_file()
-            for f in ("pseudo_mask.png", "cancer_probability.png")
-        ):
-            process_sample(
-                processing,
-                root / "samples",
-                name,
-                label_mpp,
-                ratio,
-                float(options.max_snap_distance_um),
-                float(options.beta),
-                float(options.non_cancer_threshold),
-                float(options.cancer_threshold),
-                float(cfg.dataset.spot_diameter_um),
-            )
+    for name in dataset.labeled_names:
+        process_sample(
+            processing_root=processing,
+            samples_root=root / "samples",
+            name=name,
+            label_mpp=label_mpp,
+            ratio=ratio,
+            max_snap_distance_um=float(options.max_snap_distance_um),
+            beta=float(options.beta),
+            non_cancer_threshold=float(options.non_cancer_threshold),
+            cancer_threshold=float(options.cancer_threshold),
+            qc_spot_diameter_um=float(dataset.spot_diameter_um),
+        )

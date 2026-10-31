@@ -79,22 +79,17 @@ def process_sample(
     selection.to_csv(spatial_dir / "point_selection.tsv", sep="\t", index=False)
 
 
-def run(cfg, force=False):
-    samples_root = Path(str(cfg.dataset.data_dir)).expanduser().resolve() / "samples"
-    names = list(cfg.dataset.labeled_names)
+def run(cfg):
+    dataset = cfg.dataset
+    samples_root = Path(str(dataset.data_dir)).expanduser().resolve() / "samples"
+    names = list(dataset.labeled_names)
     ratios = list(map(float, cfg.prep.seeds.ratios))
     for index, name in enumerate(names):
-        expected = [
-            samples_root / name / "masks" / f"point_mask_{round(ratio * 100)}.png"
-            for ratio in ratios
-        ]
-        expected.append(samples_root / name / "spatial/point_selection.tsv")
-        if force or not all(p.is_file() for p in expected):
-            process_sample(
-                samples_root,
-                name,
-                index,
-                float(cfg.prep.resolution.target_mpp),
-                ratios,
-                int(cfg.prep.seeds.seed),
-            )
+        process_sample(
+            samples_root=samples_root,
+            name=name,
+            name_index=index,
+            target_mpp=float(cfg.prep.resolution.target_mpp),
+            ratios=ratios,
+            seed=int(cfg.prep.seeds.seed),
+        )

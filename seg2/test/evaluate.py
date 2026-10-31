@@ -1,12 +1,82 @@
+import math
 from pathlib import Path
 
 import cv2
 import numpy as np
+import pandas as pd
 import torch
 
 from seg2.infer.predictor import predict_slide
 from seg2.models.spot_pooling import prepare_spot_pool
 from seg2.test.metrics import expression_metrics, segmentation_metrics
+
+
+def evaluate_spot_probabilities(
+    probability, root, name, target_mpp, prediction_mpp, spot_diameter_um, threshold=0.5
+):
+    """Pool probabilities over physical disks independently of expression QC."""
+    from seg2.test.data import label_sample_dir
+
+    spatial = pd.read_csv(
+        Path(root) / "samples" / name / "spatial" / f"spatial_{target_mpp:g}mpp.tsv",
+        sep="\t",
+    )
+    canvas_path = (
+        label_sample_dir(root, name, prediction_mpp, target_mpp)
+        / "spatial/canvas_mask.png"
+    )
+    canvas = cv2.imread(str(canvas_path), cv2.IMREAD_GRAYSCALE)
+    if canvas is None or canvas.shape != probability.shape:
+        raise ValueError(f"[{name}] Probability and canvas grids do not match")
+    if float(spot_diameter_um) <= 0:
+        raise ValueError("Spot classification requires a positive physical diameter")
+    points = torch.from_numpy(
+        spatial[["pixel_x", "pixel_y"]].to_numpy(dtype=np.float32)
+    )
+    plan = prepare_spot_pool(
+        torch.from_numpy((canvas > 0) & np.isfinite(probability)),
+        points,
+        float(spot_diameter_um) / (2 * target_mpp),
+        prediction_mpp / target_mpp,
+    )
+    rows, pixels = plan["rows"].numpy(), plan["pixels"].numpy()
+    counts = np.bincount(rows, minlength=plan["count"])
+    sums = np.bincount(
+        rows, weights=probability.ravel()[pixels], minlength=plan["count"]
+    )
+    indices = plan["indices"].numpy()
+    spatial["probability"] = np.nan
+    spatial.loc[indices, "probability"] = sums / counts
+    spatial["valid_pixel_count"] = 0
+    spatial.loc[indices, "valid_pixel_count"] = counts
+    radius = spot_diameter_um / (2 * prediction_mpp)
+    expected = []
+    for center in points / (prediction_mpp / target_mpp):
+        x, y = center.tolist()
+        xx = torch.arange(math.ceil(x - radius), math.floor(x + radius) + 1)
+        yy = torch.arange(math.ceil(y - radius), math.floor(y + radius) + 1)
+        expected.append(
+            int(
+                ((xx[None, :] - x).square() + (yy[:, None] - y).square() <= radius**2)
+                .sum()
+                .item()
+            )
+        )
+    spatial["coverage"] = spatial.valid_pixel_count / np.maximum(expected, 1)
+    spatial["classification_valid"] = (
+        spatial.spot_label.isin([0, 1])
+        & spatial.in_content
+        & spatial.selected.eq(1)
+        & spatial.probability.notna()
+    )
+    spatial["prediction"] = pd.array(
+        [int(p >= threshold) if np.isfinite(p) else pd.NA for p in spatial.probability],
+        dtype="Int64",
+    )
+    if "patient_id" not in spatial:
+        spatial["patient_id"] = name
+    spatial["name"] = name
+    return spatial
 
 
 def load_expert_masks(root, slide, mpp=1.0):

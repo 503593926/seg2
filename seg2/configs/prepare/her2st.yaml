@@ -1,0 +1,14 @@
+defaults:
+  - base
+  - _self_
+
+ingest_stages: [mpp, masks, counts, canvas]
+derive_stages:
+  - seed_selection
+  - label_grid
+  - superpixels
+  - pseudo_label
+  - pfm_features
+
+seeds:
+  ratios: [1.0, 0.75, 0.5, 0.25, 0.1]

@@ -1,8 +1,0 @@
-defaults:
-  - base
-  - _self_
-
-image:
-  output_scale: 2
-  gradient_checkpointing: true
-  tissue_state_dim: 32

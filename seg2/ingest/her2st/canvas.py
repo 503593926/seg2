@@ -1,4 +1,3 @@
-import shutil
 from collections.abc import Sequence
 from pathlib import Path
 
@@ -13,6 +12,7 @@ from seg2.common.imaging.resize_image_to_mpp import resize_image_to_mpp
 from seg2.common.imaging.tissue_bbox_in_image import tissue_bbox_in_image
 from seg2.ingest.her2st.qc import qc_visualize_target_mpp
 from seg2.ingest.utils.annotation2mask import ClassInfo
+from seg2.ingest.utils.spatial_qc import write_spot_overlay
 
 
 def _write_image(path: Path, image: NDArray[np.uint8], parameters: list[int]) -> None:
@@ -27,12 +27,18 @@ def resize_discrete_mask(
     tile_size: int,
 ) -> NDArray[np.uint8]:
     mask = cv2.imread(str(path), cv2.IMREAD_UNCHANGED)
+    if mask is None:
+        raise ValueError(f"Could not read {path}")
     background = 255 if path.name == "training_mask.png" else 0
     mask_target_mpp = cv2.resize(
         mask, (full_width, full_height), interpolation=cv2.INTER_NEAREST
     )
     x0, y0, x1, y1 = bbox
-    return pad_to_tile(mask_target_mpp[y0:y1, x0:x1], tile_size, (background,))
+    return pad_to_tile(
+        np.asarray(mask_target_mpp[y0:y1, x0:x1], dtype=np.uint8),
+        tile_size,
+        (background,),
+    )
 
 
 def transform_spatial(
@@ -100,6 +106,7 @@ def process_sample(
     classes: Sequence[ClassInfo],
     spot_label_map: dict[str, int],
     tile_size: int = 112,
+    spot_diameter_um: float = 100.0,
 ) -> None:
     detection_mpp = 4.0
     margin_um = 112
@@ -113,11 +120,15 @@ def process_sample(
     spatial_dir.mkdir(parents=True, exist_ok=True)
     image_path = next((data_root / "ST-imgs" / name[0] / name).glob("*.jpg"))
     img_bgr = cv2.imread(str(image_path), cv2.IMREAD_COLOR)
+    if img_bgr is None:
+        raise ValueError(f"Could not read {image_path}")
     mpp_x = float(mpp_record["axis_mpp_x"])
     mpp_y = float(mpp_record["axis_mpp_y"])
     scale_x = mpp_x / target_mpp
     scale_y = mpp_y / target_mpp
-    image_target_mpp = resize_image_to_mpp(img_bgr, mpp_x, mpp_y, target_mpp)
+    image_target_mpp = resize_image_to_mpp(
+        np.asarray(img_bgr, dtype=np.uint8), mpp_x, mpp_y, target_mpp
+    )
     full_height, full_width = image_target_mpp.shape[:2]
     del img_bgr
     tissue_detection = detect_tissue(
@@ -136,8 +147,11 @@ def process_sample(
     crop_height = y1 - y0
     padded_image = pad_to_tile(image_target_mpp[y0:y1, x0:x1], tile_size)
     canvas_height, canvas_width = padded_image.shape[:2]
-    tissue_target_mpp = cv2.resize(
-        tissue_detection, (full_width, full_height), interpolation=cv2.INTER_NEAREST
+    tissue_target_mpp = np.asarray(
+        cv2.resize(
+            tissue_detection, (full_width, full_height), interpolation=cv2.INTER_NEAREST
+        ),
+        dtype=np.uint8,
     )
     tissue_padded = pad_to_tile(tissue_target_mpp[y0:y1, x0:x1], tile_size, (0,))
     canvas_mask = np.zeros((canvas_height, canvas_width), dtype=np.uint8)
@@ -179,7 +193,6 @@ def process_sample(
     spatial.to_csv(
         spatial_dir / f"spatial_{target_mpp:g}mpp.tsv", sep="\t", index=False
     )
-    shutil.copyfile(count_path, output_dir / "gene_counts.tsv.gz")
     qc_visualize_target_mpp(
         output_dir,
         image_target_mpp,
@@ -191,20 +204,23 @@ def process_sample(
         bbox,
         classes,
     )
+    write_spot_overlay(
+        spatial_dir, padded_image, spatial, spot_diameter_um / (2 * target_mpp)
+    )
 
 
-def run(cfg, force=False):
+def run(cfg):
     from seg2.ingest.her2st.annotation import CLASSES
 
     dataset = cfg.dataset
     raw_data_root = Path(str(dataset.raw_root))
-    data_directory = Path(str(cfg.dataset.data_dir)).expanduser().resolve().parent
+    data_directory = Path(str(dataset.data_dir)).expanduser().resolve().parent
     mask_root = data_directory / "original_mask"
     target_mpp, tile_size = (
         float(cfg.prep.resolution.target_mpp),
         int(cfg.prep.resolution.tile_size),
     )
-    samples_root = Path(str(cfg.dataset.data_dir)).expanduser().resolve() / "samples"
+    samples_root = Path(str(dataset.data_dir)).expanduser().resolve() / "samples"
     samples_root.mkdir(parents=True, exist_ok=True)
     mpp_table = pd.read_csv(data_directory / "mpp.csv", index_col=0)
     spot_label_map = {
@@ -221,21 +237,31 @@ def run(cfg, force=False):
             (raw_data_root / "ST-spotfiles").glob(f"{patient}*_selection.tsv")
         ):
             name = selection.stem.removesuffix("_selection")
-            if force or not all(
-                (samples_root / name / f).is_file()
-                for f in (
-                    "gene_counts.tsv.gz",
-                    f"spatial/he_{target_mpp:g}mpp.png",
-                    "spatial/canvas_mask.png",
+            mpp_record = mpp_table.loc[name]
+            if not isinstance(mpp_record, pd.Series):
+                raise TypeError(f"[{name}] MPP lookup must return a single record")
+            process_sample(
+                data_root=raw_data_root,
+                samples_root=samples_root,
+                mask_root=mask_root,
+                mpp_record=mpp_record,
+                target_mpp=target_mpp,
+                classes=CLASSES,
+                spot_label_map=spot_label_map,
+                tile_size=tile_size,
+                spot_diameter_um=float(dataset.spot_diameter_um),
+            )
+            spatial_dir = samples_root / name / "spatial"
+            if not (spatial_dir / "spot_qc_overlay.jpg").is_file():
+                image = cv2.imread(str(spatial_dir / f"he_{target_mpp:g}mpp.png"))
+                if image is None:
+                    raise ValueError(f"[{name}] Could not read prepared H&E")
+                spatial = pd.read_csv(
+                    spatial_dir / f"spatial_{target_mpp:g}mpp.tsv", sep="\t"
                 )
-            ):
-                process_sample(
-                    raw_data_root,
-                    samples_root,
-                    mask_root,
-                    mpp_table.loc[name],
-                    target_mpp,
-                    classes=CLASSES,
-                    spot_label_map=spot_label_map,
-                    tile_size=tile_size,
+                write_spot_overlay(
+                    spatial_dir,
+                    np.asarray(image, dtype=np.uint8),
+                    spatial,
+                    float(dataset.spot_diameter_um) / (2 * target_mpp),
                 )

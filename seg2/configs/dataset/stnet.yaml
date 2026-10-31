@@ -1,0 +1,9 @@
+defaults:
+  - base
+  - _self_
+
+dataset_name: stnet
+data_dir: ${paths.data_root}/stnet/1mpp
+raw_root: /home/yfm/data/datasets/spatial_transcriptomics/legacy_st/hbc_stnet_2020
+spot_diameter_um: 100.0
+array_pitch_um: 200.0

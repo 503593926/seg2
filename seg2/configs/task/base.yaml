@@ -1,0 +1,8 @@
+task:
+  gene_expression_dir: ${paths.task_root}/${task.name}
+  gene:
+    selection_mode: svgs
+    n_top_genes: 512
+    union_rank_and_truncate: false
+    target_sum: 10000.0
+    svg_n_neighbors: 8
