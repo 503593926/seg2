@@ -1,0 +1,10 @@
+defaults:
+  - base
+  - _self_
+
+dataset_name: visium_cytassist_ffpe
+data_dir: ${paths.data_root}/visium_cytassist_ffpe/1mpp
+raw_root: /home/yfm/data/datasets/spatial_transcriptomics/visium/standard/hbc_10x_cytassist_ffpe
+bundle_name: CytAssist_FFPE_Human_Breast_Cancer
+spot_diameter_um: 55.0
+array_pitch_um: 100.0

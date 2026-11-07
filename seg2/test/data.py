@@ -81,7 +81,7 @@ def label_sample_dir(root, name, label_mpp, target_mpp=1.0):
     return root / "label_mpp" / f"{float(label_mpp):g}mpp" / name
 
 
-def read_sample(root, name, feature_maps, target_mpp, label_mpp) -> dict[str, Any]:
+def read_sample(root, name, feature_maps, target_mpp, label_mpp, region_type="circle") -> dict[str, Any]:
     root = Path(root)
     _, cls_step = load_feature_scales(root, feature_maps, target_mpp)
     sample_dir = root / "samples" / name
@@ -94,7 +94,17 @@ def read_sample(root, name, feature_maps, target_mpp, label_mpp) -> dict[str, An
     rows, _ = shapes.pop()
     patch_scale = height // rows
     scale = round(float(label_mpp) / float(target_mpp))
+    if region_type not in {"circle", "polygon"}:
+        raise ValueError(f"Unknown region geometry: {region_type}")
+    region_map = None
+    if region_type == "polygon":
+        directory = label_sample_dir(root=root, name=name, label_mpp=label_mpp, target_mpp=target_mpp)
+        region_map = np.load(file=directory / "spatial/region_map.npy", mmap_mode="r")
+        if region_map.shape != (height // scale, width // scale):
+            raise ValueError(f"[{name}] Region map and model output grids differ")
     return dict(
+        region_type=region_type,
+        region_map=region_map,
         name=name,
         image=image,
         patch_maps=patch_maps,

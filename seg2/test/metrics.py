@@ -3,8 +3,10 @@ import math
 import numpy as np
 import torch
 
+PCC_TOP_K = (50, 100)
 
-def spot_classification_metrics(probability, labels, threshold=0.5):
+
+def region_classification_metrics(probability, labels, threshold=0.5):
     from sklearn.metrics import average_precision_score, roc_auc_score
 
     probability, labels = np.asarray(probability), np.asarray(labels)
@@ -16,8 +18,8 @@ def spot_classification_metrics(probability, labels, threshold=0.5):
     fn = int(np.count_nonzero(~prediction & labels))
     count = len(labels)
     return {
-        "spots": count,
-        "positive_spots": int(labels.sum()),
+        "regions": count,
+        "positive_regions": int(labels.sum()),
         "threshold": float(threshold),
         "auc": float(roc_auc_score(labels, probability))
         if count and np.unique(labels).size == 2
@@ -32,7 +34,7 @@ def spot_classification_metrics(probability, labels, threshold=0.5):
     }
 
 
-def summarize_spot_classification(records, threshold=0.5):
+def summarize_region_classification(records, threshold=0.5):
     if not records:
         return {}
     import pandas as pd
@@ -40,16 +42,15 @@ def summarize_spot_classification(records, threshold=0.5):
     combined = pd.concat(list(records.values()), ignore_index=True)
     valid = combined[combined["classification_valid"]].copy()
     slides = {
-        name: spot_classification_metrics(
-            table.loc[table.classification_valid, "probability"],
-            table.loc[table.classification_valid, "spot_label"],
-            threshold,
+        name: region_classification_metrics(
+            probability=table.loc[table.classification_valid, "probability"],
+            labels=table.loc[table.classification_valid, "spot_label"], threshold=threshold,
         )
         for name, table in records.items()
     }
     patients = {
-        str(name): spot_classification_metrics(
-            table.probability, table.spot_label, threshold
+        str(name): region_classification_metrics(
+            probability=table.probability, labels=table.spot_label, threshold=threshold
         )
         for name, table in valid.groupby("patient_id")
     }
@@ -59,8 +60,8 @@ def summarize_spot_classification(records, threshold=0.5):
         macro[key] = float(np.mean(values)) if values else None
         macro[f"{key}_slides"] = len(values)
     return {
-        "micro": spot_classification_metrics(
-            valid.probability, valid.spot_label, threshold
+        "micro": region_classification_metrics(
+            probability=valid.probability, labels=valid.spot_label, threshold=threshold
         ),
         "macro": macro,
         "slides": slides,
@@ -167,7 +168,7 @@ def expression_metrics(prediction, target, observed=None):
         else observed.bool()
     )
     metrics: dict[str, int | float] = {
-        "gene_spots": len(prediction),
+        "gene_regions": len(prediction),
         "gene_pcc_genes": 0,
         "gene_values": int(observed.sum()),
     }
@@ -179,6 +180,7 @@ def expression_metrics(prediction, target, observed=None):
             "gene_prediction_pcc": float("nan"),
             "gene_prediction_pcc_max": float("nan"),
             "gene_prediction_pcc_min": float("nan"),
+            **{f"gene_prediction_pcc_top{k}": float("nan") for k in PCC_TOP_K},
         }
     mse = float((prediction - target)[observed].square().mean())
     metrics.update(gene_prediction=mse, gene_prediction_rmse=math.sqrt(mse))
@@ -192,6 +194,11 @@ def expression_metrics(prediction, target, observed=None):
     metrics["gene_prediction_pcc_min"] = (
         float(pcc.min()) if pcc.numel() else float("nan")
     )
+    for k in PCC_TOP_K:
+        top = pcc.topk(min(k, pcc.numel())).values
+        metrics[f"gene_prediction_pcc_top{k}"] = (
+            float(top.mean()) if top.numel() else float("nan")
+        )
     return metrics
 
 
@@ -212,7 +219,12 @@ def summarize_expression_metrics(slides, expression_results):
         if "gene_prediction" in metrics
     }
     macro = {}
-    for key in ("gene_prediction", "gene_prediction_rmse", "gene_prediction_pcc"):
+    for key in (
+        "gene_prediction",
+        "gene_prediction_rmse",
+        "gene_prediction_pcc",
+        *(f"gene_prediction_pcc_top{k}" for k in PCC_TOP_K),
+    ):
         values = [
             metrics[key] for metrics in per_slide.values() if np.isfinite(metrics[key])
         ]

@@ -6,15 +6,111 @@ import re
 from collections import defaultdict
 from collections.abc import Iterable, Mapping
 from pathlib import Path
+from typing import cast
 
+import h5py
 import numpy as np
 import pandas as pd
+from scipy.io import mmread
+from scipy.sparse import csc_matrix
+from threadpoolctl import threadpool_limits
+
+
+def _h5_values(group: h5py.Group, key: str, *, text: bool = False) -> np.ndarray:
+    dataset = cast(h5py.Dataset, group[key])
+    return np.asarray(dataset.asstr()[()] if text else dataset[()])
+
+
+def open_count_text(path: Path):
+    """Read either gzip or plain text, including incorrectly suffixed .gz files."""
+    with path.open(mode="rb") as handle:
+        compressed = handle.read(2) == b"\x1f\x8b"
+    return gzip.open(filename=path, mode="rt") if compressed else path.open(mode="r")
+
+
+def read_mtx_table(path: Path) -> pd.DataFrame:
+    with open_count_text(path=path) as handle:
+        return pd.read_csv(filepath_or_buffer=handle, sep="\t", header=None, dtype=str)
+
+
+def _mtx_features(path: Path):
+    features = read_mtx_table(path=path / "features.tsv.gz")
+    if features.shape[1] == 1:
+        selected = np.ones(len(features), dtype=bool)
+    elif features.shape[1] == 3:
+        selected = features[2].eq("Gene Expression").to_numpy()
+    else:
+        raise ValueError(
+            "Matrix Market features require one gene column or three 10x columns"
+        )
+    return features, selected
 
 
 def gene_header(path: Path) -> list[str]:
+    if path.is_dir():
+        features, selected = _mtx_features(path=path)
+        return features.loc[selected, 0].tolist()
+    if path.suffix == ".h5":
+        with h5py.File(name=path, mode="r") as handle:
+            features = cast(h5py.Group, handle["matrix/features"])
+            selected = (
+                _h5_values(group=features, key="feature_type", text=True)
+                == "Gene Expression"
+            )
+            return _h5_values(group=features, key="id", text=True)[selected].tolist()
     opener = gzip.open if path.suffix == ".gz" else open
     with opener(path, "rt") as handle:
         return next(csv.reader(handle, delimiter="\t"))[1:]
+
+
+def read_count_matrix(path: Path) -> pd.DataFrame:
+    if path.is_dir():
+        features, selected = _mtx_features(path=path)
+        barcodes = read_mtx_table(path=path / "barcodes.tsv.gz")[0].to_numpy(dtype=str)
+        with (
+            open_count_text(path=path / "matrix.mtx.gz") as handle,
+            threadpool_limits(limits=1),
+        ):
+            matrix = csc_matrix(mmread(source=handle))
+        if matrix.shape != (len(features), len(barcodes)):
+            raise ValueError(
+                "Matrix Market dimensions do not match features and barcodes"
+            )
+        if (
+            not np.issubdtype(matrix.dtype, np.integer)
+            or (matrix.data < 0).any()
+            or matrix.data.max(initial=0) > np.iinfo(np.int32).max
+        ):
+            raise ValueError(
+                "Matrix Market input must contain nonnegative int32 raw counts"
+            )
+        return pd.DataFrame(
+            data=matrix[selected].T.astype(dtype=np.int32).toarray(),
+            index=barcodes,
+            columns=features.loc[selected, 0].tolist(),
+        )
+    if path.suffix != ".h5":
+        return pd.read_csv(filepath_or_buffer=path, sep="\t", index_col=0)
+    with h5py.File(name=path, mode="r") as handle:
+        matrix = cast(h5py.Group, handle["matrix"])
+        features = cast(h5py.Group, matrix["features"])
+        selected = (
+            _h5_values(group=features, key="feature_type", text=True)
+            == "Gene Expression"
+        )
+        counts = csc_matrix(
+            (
+                _h5_values(group=matrix, key="data"),
+                _h5_values(group=matrix, key="indices"),
+                _h5_values(group=matrix, key="indptr"),
+            ),
+            shape=tuple(_h5_values(group=matrix, key="shape")),
+        )
+        return pd.DataFrame(
+            data=counts[selected].T.toarray(),
+            index=_h5_values(group=matrix, key="barcodes", text=True),
+            columns=_h5_values(group=features, key="id", text=True)[selected],
+        )
 
 
 def build_gene_mapping(
@@ -125,7 +221,7 @@ def prepare_counts(
     for name, source in sources.items():
         output = data_dir / "samples" / name / "gene_counts.tsv.gz"
 
-        counts = pd.read_csv(source, sep="\t", index_col=0)
+        counts = read_count_matrix(path=source)
         counts.columns = pd.Index(headers[name])
         counts.index = counts.index.astype(str)
 

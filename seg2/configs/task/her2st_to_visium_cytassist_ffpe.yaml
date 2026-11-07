@@ -1,0 +1,9 @@
+defaults:
+  - base
+  - /dataset@source_dataset: her2st
+  - /dataset@target_dataset: visium_cytassist_ffpe
+  - _self_
+
+task:
+  name: her2st_to_visium_cytassist_ffpe
+  split_mode: transfer

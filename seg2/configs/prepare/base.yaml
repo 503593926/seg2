@@ -22,7 +22,7 @@ gene:
 
 features:
   extractors: [h_optimus_1, uni2, virchow2]
-  batch_size: 512
+  batch_size: 256
   device: cuda
   resize: true
   overlap_average: true

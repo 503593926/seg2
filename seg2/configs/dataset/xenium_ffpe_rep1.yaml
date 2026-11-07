@@ -1,0 +1,9 @@
+defaults:
+  - base
+  - _self_
+
+dataset_name: xenium_ffpe_rep1
+data_dir: ${paths.data_root}/xenium_ffpe_rep1/1mpp
+raw_root: /home/yfm/data/datasets/spatial_transcriptomics/xenium/hbc_10x_xenium_ffpe_rep1
+bundle_name: Xenium_FFPE_Human_Breast_Cancer_Rep1
+region_type: polygon

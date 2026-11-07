@@ -1,10 +1,10 @@
 image:
   crop_size: 896
+  epochs: 10
   samples_per_epoch: 4000
   min_valid_fraction: 0.25
   labeled_sampling_fraction: null
   slides_per_batch: 4
-  epochs: 10
   warmup_steps: 0.15
   progress_every_n_steps: 1
   batch_size: 8

@@ -62,6 +62,9 @@ def read_sample(data_dir, name, feature_maps, cfg):
     tissue_mask = np.asarray(
         cv2.imread(str(spatial_dir / "tissue_mask.png"), cv2.IMREAD_GRAYSCALE)
     )
+    canvas_mask = cv2.imread(str(spatial_dir / "canvas_mask.png"), cv2.IMREAD_GRAYSCALE)
+    if canvas_mask is None or canvas_mask.shape != tissue_mask.shape:
+        raise ValueError(f"[{name}] Missing canvas mask or mask grids differ")
     has_segmentation = (sample_dir / "masks/training_mask.png").is_file()
 
     sample: dict[str, Any] = {
@@ -75,6 +78,7 @@ def read_sample(data_dir, name, feature_maps, cfg):
         "has_segmentation": has_segmentation,
         "alignment": alignment,
         "tissue_mask_bl": tissue_mask > 0,
+        "canvas_mask_bl": canvas_mask > 0,
         "spot_radius_px": float(cfg.source_dataset.spot_diameter_um) / (2 * target_mpp),
     }
 

@@ -83,20 +83,27 @@ def _scale_bar(image, length_px, label="100 um"):
         )
 
 
-def save_spot_overlay(directory, image_bgr, spots, radius_px):
+def save_region_overlay(directory, image_bgr, coordinates, radius_px=None, region_map=None, mpp=1.0):
     directory = Path(directory)
     directory.mkdir(parents=True, exist_ok=True)
-    centers = np.rint(spots).astype(np.int32)
-    radius = round(radius_px)
     filled = image_bgr.copy()
-    for center in centers:
-        cv2.circle(filled, tuple(center), radius, (255, 255, 0), -1, cv2.LINE_AA)
+    if region_map is None:
+        centers = np.rint(coordinates).astype(np.int32)
+        if radius_px is None:
+            raise ValueError("Circular overlays require a radius")
+        radius = max(1, round(radius_px))
+        for center in centers:
+            cv2.circle(filled, tuple(center), radius, (255, 255, 0), -1, cv2.LINE_AA)
+    else:
+        filled[region_map > 0] = (255, 255, 0)
     overlay = cv2.addWeighted(filled, 0.25, image_bgr, 0.75, 0)
-    outline = max(1, round(radius_px * 0.08))
-    for center in centers:
-        cv2.circle(overlay, tuple(center), radius, (255, 255, 0), outline, cv2.LINE_AA)
-    _scale_bar(overlay, 2 * radius_px)
-    _write_image(directory / "spot_overlay.jpg", overlay, (cv2.IMWRITE_JPEG_QUALITY, 92))
+    if region_map is not None:
+        edges = np.zeros(region_map.shape, dtype=bool)
+        edges[1:] |= region_map[1:] != region_map[:-1]
+        edges[:, 1:] |= region_map[:, 1:] != region_map[:, :-1]
+        overlay[edges & (region_map > 0)] = (255, 255, 0)
+    _scale_bar(image=overlay, length_px=100 / mpp)
+    _write_image(path=directory / "region_overlay.jpg", image=overlay, parameters=(cv2.IMWRITE_JPEG_QUALITY, 92))
 
 
 def _probability_legend(width, title):
@@ -165,7 +172,25 @@ def _expression_spot_panel(background, centers, radius, values, maximum, title):
             1,
             cv2.LINE_AA,
         )
-    return _expression_colorbar(panel, maximum, f"{title} ({len(values)} spots)")
+    return _expression_colorbar(panel, maximum, f"{title} ({len(values)} regions)")
+
+
+def _expression_region_panel(region_map, region_ids, values, maximum, title):
+    # Use the same frame/letterboxing as the dense prediction panel.
+    height, width = region_map.shape
+    scale = min(488 / width, 412 / height)
+    regions = cv2.resize(src=region_map, dsize=(max(1, round(width * scale)), max(1, round(height * scale))), interpolation=cv2.INTER_NEAREST)
+    ids = np.asarray(region_ids, dtype=np.int64)
+    lookup = np.full(max(int(region_map.max(initial=0)), int(ids.max(initial=0))) + 1, -1, dtype=np.int64)
+    lookup[ids] = np.arange(len(ids))
+    rows = lookup[regions]
+    heatmap = np.full((*regions.shape, 3), 255, dtype=np.uint8)
+    if len(values):
+        encoded = np.rint(np.clip(np.asarray(values) / maximum, 0, 1) * 255).astype(np.uint8)
+        colors = cv2.applyColorMap(encoded[:, None], cv2.COLORMAP_VIRIDIS)[:, 0]
+        selected = rows >= 0
+        heatmap[selected] = colors[rows[selected]]
+    return _expression_dense_panel(heatmap=heatmap, maximum=maximum, title=title)
 
 
 def _expression_colorbar(panel, maximum, title):
@@ -203,7 +228,8 @@ def _expression_records(expression_results):
             "prediction": torch.as_tensor(source["prediction"]).detach().float().cpu(),
             "target": target,
             "observed": torch.as_tensor(source["observed"]).bool().cpu(),
-            "spots": np.asarray(source["spots"]),
+            "coordinates": np.asarray(source["coordinates"]),
+            "region_ids": np.asarray(source["region_ids"]),
         }
     return records
 
@@ -228,7 +254,7 @@ def _rank_expression_genes(records, gene_names, top_n):
                 "gene": str(gene_names[index]),
                 "gene_index": int(index),
                 "pcc": float(correlations[index]),
-                "observed_spots": int(mask.sum()),
+                "observed_regions": int(mask.sum()),
                 "normalization": normalization,
                 "slides": {},
             }
@@ -272,7 +298,7 @@ def _save_gene_comparisons(
         slide_dir = directory / name
         slide_dir.mkdir(exist_ok=True)
         background, centers, radius = _expression_background(
-            slides[name]["image"], record["spots"], spot_radius_px
+            slides[name]["image"], record["coordinates"], spot_radius_px or 1.0
         )
         local_pcc = gene_pearson_correlations(
             record["prediction"][:, indices], record["target"][:, indices], record["observed"][:, indices]
@@ -302,10 +328,19 @@ def _save_gene_comparisons(
             encoded = np.rint(np.clip(normalized_dense, 0, 1) * 255).astype(np.uint8)
             heatmap = cv2.applyColorMap(encoded, cv2.COLORMAP_VIRIDIS)
             heatmap[~record["dense_tissue"]] = 255
-            panels = [
-                _expression_spot_panel(background, centers[mask], radius, value, 1.0, f"{label} normalized")
-                for value, label in zip(normalized_values, ("Observed", "Predicted"))
-            ]
+            region_map = slides[name].get("region_map")
+            if region_map is None:
+                panels = [
+                    _expression_spot_panel(background=background, centers=centers[mask], radius=radius,
+                                           values=value, maximum=1.0, title=f"{label} normalized")
+                    for value, label in zip(normalized_values, ("Observed", "Predicted"))
+                ]
+            else:
+                panels = [
+                    _expression_region_panel(region_map=region_map, region_ids=record["region_ids"][mask],
+                                             values=value, maximum=1.0, title=f"{label} ({int(mask.sum())} cells)")
+                    for value, label in zip(normalized_values, ("Observed", "Predicted"))
+                ]
             panels.append(
                 _expression_dense_panel(heatmap, 1.0, f"Predicted {record['dense_mpp']:g}mpp normalized")
             )
@@ -315,7 +350,7 @@ def _save_gene_comparisons(
             )
             cv2.putText(
                 comparison,
-                f"Source: {source_model} | {expression_transform} | PCC from spots | independent min-max for observed/spot/dense predictions",
+                f"Source: {source_model} | {expression_transform} | PCC from regions | independent min-max for observed/region/dense predictions",
                 (12, 49),
                 cv2.FONT_HERSHEY_SIMPLEX,
                 0.5,
@@ -327,7 +362,7 @@ def _save_gene_comparisons(
             _write_image(slide_dir / filename, comparison, (cv2.IMWRITE_PNG_COMPRESSION, 3))
             gene["slides"][name] = {
                 "pcc": pcc,
-                "observed_spots": int(mask.sum()),
+                "observed_regions": int(mask.sum()),
                 "dense_comparison_normalized_file": f"{name}/{filename}",
                 "dense_mpp": record["dense_mpp"],
                 "dense_shape": list(dense_values.shape),
@@ -341,7 +376,7 @@ def save_top_gene_predictions(
     slides,
     *,
     top_n=10,
-    spot_radius_px=50.0,
+    spot_radius_px: float | None = 50.0,
     expression_transform="log1p",
     source_model="ema",
 ):
@@ -357,14 +392,14 @@ def save_top_gene_predictions(
     _save_gene_comparisons(
         directory, records, selected, slides, spot_radius_px, expression_transform, source_model
     )
-    columns = ("rank", "gene", "gene_index", "pcc", "observed_spots")
+    columns = ("rank", "gene", "gene_index", "pcc", "observed_regions")
     with (directory / "top_genes.csv").open("w", newline="", encoding="utf-8") as handle:
         writer = csv.DictWriter(handle, fieldnames=columns)
         writer.writeheader()
         writer.writerows(({key: gene[key] for key in columns} for gene in selected))
     metadata = {
         "source_model": source_model,
-        "ranking_scope": "pooled_validation_spots",
+        "ranking_scope": "pooled_validation_regions",
         "expression_transform": expression_transform,
         "requested_top_n": int(top_n),
         "eligible_genes": eligible_count,

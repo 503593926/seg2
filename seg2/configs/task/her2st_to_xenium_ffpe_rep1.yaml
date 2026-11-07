@@ -1,0 +1,9 @@
+defaults:
+  - base
+  - /dataset@source_dataset: her2st
+  - /dataset@target_dataset: xenium_ffpe_rep1
+  - _self_
+
+task:
+  name: her2st_to_xenium_ffpe_rep1
+  split_mode: transfer

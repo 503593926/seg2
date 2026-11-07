@@ -7,4 +7,4 @@ experiment_name: her2st_to_stnet
 
 evaluation:
   test:
-    spot_classification: true
+    region_classification: true

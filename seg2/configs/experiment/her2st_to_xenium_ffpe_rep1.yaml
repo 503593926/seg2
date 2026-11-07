@@ -1,0 +1,10 @@
+defaults:
+  - base
+  - /task@_global_: her2st_to_xenium_ffpe_rep1
+  - _self_
+
+experiment_name: her2st_to_xenium_ffpe_rep1
+
+evaluation:
+  test:
+    region_classification: true

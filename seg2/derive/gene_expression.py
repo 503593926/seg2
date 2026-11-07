@@ -49,6 +49,9 @@ def load_raw_gene_data(
         counts.index = counts.index.astype(str)
         counts.columns = counts.columns.astype(str)
         spatial["spot_id"] = spatial["spot_id"].astype(str)
+        # spot_id is the common observation key, including native Xenium cell IDs.
+        if not spatial.spot_id.is_unique or not counts.index.is_unique:
+            raise ValueError(f"[{name}] Observation IDs must be unique")
         usable = (
             spatial["selected"].eq(1)
             & spatial["in_content"]
@@ -56,6 +59,9 @@ def load_raw_gene_data(
         )
         spatial = spatial.loc[usable].copy()
         spot_ids: list[str] = spatial["spot_id"].tolist()
+        missing = pd.Index(spot_ids).difference(counts.index)
+        if len(missing):
+            raise ValueError(f"[{name}] Spatial observations are missing from counts: {missing.tolist()[:10]}")
         obs = spatial.set_index("spot_id", drop=False)
         var = pd.DataFrame(index=counts.columns)
         if gene_info is not None:

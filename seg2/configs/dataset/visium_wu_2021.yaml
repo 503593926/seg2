@@ -1,0 +1,9 @@
+defaults:
+  - base
+  - _self_
+
+dataset_name: visium_wu_2021
+data_dir: ${paths.data_root}/visium_wu_2021/1mpp
+raw_root: /home/yfm/data/datasets/spatial_transcriptomics/visium/standard/hbc_wu_2021
+spot_diameter_um: 55.0
+array_pitch_um: 100.0

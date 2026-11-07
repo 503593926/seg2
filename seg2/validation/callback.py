@@ -79,12 +79,12 @@ class ValidationCallback(pl.Callback):
             metrics["val/gene_prediction_pcc_macro"] = expression["macro"][
                 "gene_prediction_pcc"
             ]
-        spot_metrics = summary.get("spot_classification", {}).get("macro", {})
+        region_metrics = summary.get("region_classification", {}).get("macro", {})
         metrics.update(
             {
-                f"val/spot_{key}": spot_metrics[key]
+                f"val/region_{key}": region_metrics[key]
                 for key in ("auc", "ap", "f1", "acc")
-                if spot_metrics.get(key) is not None
+                if region_metrics.get(key) is not None
             }
         )
         pl_module.log_dict(

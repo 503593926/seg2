@@ -9,7 +9,7 @@ inference:
 
 validation:
   enabled: true
-  every_n_epochs: 5
+  every_n_epochs: 1
   weights: ema
   top_genes: 0
 
@@ -17,4 +17,4 @@ test:
   after_train: false
   weights: ema
   top_genes: 0
-  spot_classification: false
+  region_classification: false

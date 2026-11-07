@@ -1,0 +1,10 @@
+defaults:
+  - base
+  - _self_
+
+dataset_name: visium_block_a_section_1
+data_dir: ${paths.data_root}/visium_block_a_section_1/1mpp
+raw_root: /home/yfm/data/datasets/spatial_transcriptomics/visium/standard/hbc_10x_block_a_section_1
+bundle_name: V1_Breast_Cancer_Block_A_Section_1
+spot_diameter_um: 55.0
+array_pitch_um: 100.0

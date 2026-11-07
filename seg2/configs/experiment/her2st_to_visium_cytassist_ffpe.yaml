@@ -1,0 +1,10 @@
+defaults:
+  - base
+  - /task@_global_: her2st_to_visium_cytassist_ffpe
+  - _self_
+
+experiment_name: her2st_to_visium_cytassist_ffpe
+
+evaluation:
+  test:
+    region_classification: true

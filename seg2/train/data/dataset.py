@@ -3,7 +3,7 @@ import numpy as np
 import torch
 from torch.utils.data import Dataset, default_collate
 
-from seg2.models.spot_pooling import collate_spot_pools, prepare_spot_pool
+from seg2.models.region_pooling import collate_region_pools, prepare_region_pool
 from seg2.train.data.augment import (
     augment_geometry,
     build_stain_transform,
@@ -116,23 +116,23 @@ class TrainingDataset(Dataset):
                 sample, rng, self.crop_size, self.cfg.augment.geometry
             )
 
-        sample["spot_pool"] = prepare_spot_pool(
-            sample["tissue"][0],
-            sample["spots"],
-            self.spot_radius_px,
-            self.label_scale,
+        sample["region_pool"] = prepare_region_pool(
+            valid_mask=sample["canvas"][0],
+            coordinates=sample["spots"],
+            radius_px=self.spot_radius_px,
+            label_scale=self.label_scale,
         )
         if self.auxiliary_pool_scales:
             # Rebuild after geometry augmentation, using each native grid's pixel spacing.
-            sample["auxiliary_spot_pools"] = {}
+            sample["auxiliary_region_pools"] = {}
             for scale in self.auxiliary_pool_scales:
                 factor = scale // self.label_scale
-                tissue = sample["tissue"][0, ::factor, ::factor]
-                sample["auxiliary_spot_pools"][str(scale)] = prepare_spot_pool(
-                    tissue,
-                    sample["spots"],
-                    self.spot_radius_px,
-                    scale,
+                canvas = sample["canvas"][0, ::factor, ::factor]
+                sample["auxiliary_region_pools"][str(scale)] = prepare_region_pool(
+                    valid_mask=canvas,
+                    coordinates=sample["spots"],
+                    radius_px=self.spot_radius_px,
+                    label_scale=scale,
                 )
         return sample
 
@@ -198,7 +198,7 @@ class TrainingDataset(Dataset):
         slide = self.slides[name]
         label_top, label_left = (top // self.label_scale, left // self.label_scale)
         size = self.crop_size // self.label_scale
-        keys = ["tissue_mask_bl"]
+        keys = ["tissue_mask_bl", "canvas_mask_bl"]
         if slide["has_segmentation"]:
             keys.extend(("pseudo_mask", "probability"))
         crops = {}
@@ -216,7 +216,10 @@ class TrainingDataset(Dataset):
         else:
             valid = torch.zeros_like(tissue)
             probability = torch.zeros_like(tissue, dtype=torch.float32)
-        return {"tissue": tissue, "valid": valid, "cancer_probability": probability}
+        return {
+            "tissue": tissue, "canvas": crops["canvas_mask_bl"],
+            "valid": valid, "cancer_probability": probability,
+        }
 
     def _spot_targets(self, name, top, left):
         spot_data = self.spots_by_slide[name]
@@ -236,14 +239,14 @@ def collate_samples(samples):
     batch = {}
     for key in samples[0]:
         values = [sample[key] for sample in samples]
-        if key == "spot_pool":
-            batch[key] = collate_spot_pools(values, samples[0]["tissue"].shape[-2:])
-        elif key == "auxiliary_spot_pools":
+        if key == "region_pool":
+            batch[key] = collate_region_pools(plans=values, shape=samples[0]["canvas"].shape[-2:])
+        elif key == "auxiliary_region_pools":
             height, width = samples[0]["image"].shape[-2:]
             batch[key] = {
-                scale: collate_spot_pools(
-                    [value[scale] for value in values],
-                    (height // int(scale), width // int(scale)),
+                scale: collate_region_pools(
+                    plans=[value[scale] for value in values],
+                    shape=(height // int(scale), width // int(scale)),
                 )
                 for scale in values[0]
             }

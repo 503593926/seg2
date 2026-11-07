@@ -7,7 +7,7 @@ defaults:
   - /prepare@prep: base
   - _self_
 
-seeds: [0, 2027, 3407]
+seeds: [3407]
 
 prep:
   resolution:

@@ -1,0 +1,8 @@
+defaults:
+  - base
+  - _self_
+
+resolution:
+  label_mpp: 2.0
+ingest_stages: [counts, mpp, canvas]
+derive_stages: [label_grid, regions, pfm_features]

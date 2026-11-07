@@ -48,7 +48,8 @@ def evaluation_parameters(
         "names": list(map(str, names)),
         "feature_maps": list(map(str, dataset.image_feature_maps)),
         "target_mpp": float(dataset.target_mpp),
-        "spot_diameter_um": float(dataset.spot_diameter_um),
+        "region_type": str(dataset.region_type),
+        "spot_diameter_um": float(dataset.spot_diameter_um) if dataset.region_type == "circle" else None,
         "crop_size": int(options.crop_size),
         "stride": None if options.stride is None else int(options.stride),
         "inference_batch_size": int(options.batch_size),
@@ -57,5 +58,5 @@ def evaluation_parameters(
         "expression_transform": str(options.expression_transform),
         "threshold": float(options.threshold),
         "visualization_top_n": int(stage.top_genes),
-        "evaluate_spots": bool(cfg.evaluation.test.spot_classification),
+        "evaluate_regions": bool(cfg.evaluation.test.region_classification),
     }

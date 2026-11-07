@@ -13,15 +13,15 @@ from seg2.test.data import (
     load_gene_adata,
     read_sample,
 )
-from seg2.test.evaluate import evaluate_spot_probabilities, validate_slide
+from seg2.test.evaluate import evaluate_region_probabilities, validate_slide
 from seg2.test.metrics import (
-    spot_classification_metrics,
+    region_classification_metrics,
     summarize_metrics,
-    summarize_spot_classification,
+    summarize_region_classification,
 )
 from seg2.test.visualization import (
     save_probability_overlay,
-    save_spot_overlay,
+    save_region_overlay,
     save_top_gene_predictions,
 )
 
@@ -61,6 +61,7 @@ def _save_slide_visualizations(
     prediction_mpp,
     spot_diameter_um,
     threshold,
+    region_map,
 ):
     image = cv2.cvtColor(
         cv2.resize(
@@ -80,7 +81,7 @@ def _save_slide_visualizations(
         np.asarray(
             cv2.imread(
                 str(
-                    label_sample_dir(root, name, prediction_mpp, target_mpp)
+                    label_sample_dir(root=root, name=name, label_mpp=prediction_mpp, target_mpp=target_mpp)
                     / "spatial/tissue_mask.png"
                 ),
                 cv2.IMREAD_GRAYSCALE,
@@ -88,14 +89,13 @@ def _save_slide_visualizations(
         )
         > 0
     )
-    save_spot_overlay(
-        directory,
-        image,
-        spots,
-        float(spot_diameter_um) / (2.0 * float(prediction_mpp)),
+    save_region_overlay(
+        directory=directory, image_bgr=image, coordinates=spots,
+        radius_px=None if spot_diameter_um is None else float(spot_diameter_um) / (2.0 * float(prediction_mpp)),
+        region_map=region_map, mpp=prediction_mpp,
     )
     save_probability_overlay(
-        directory, image, tissue, probability, title=name, threshold=float(threshold)
+        directory=directory, image_bgr=image, tissue=tissue, probability=probability, title=name, threshold=float(threshold)
     )
 
 
@@ -108,7 +108,8 @@ def run_test(
     names,
     feature_maps,
     target_mpp,
-    spot_diameter_um,
+    spot_diameter_um=None,
+    region_type="circle",
     crop_size=896,
     stride=None,
     device="cpu",
@@ -117,19 +118,23 @@ def run_test(
     expression_transform="log1p",
     threshold=0.5,
     visualization_top_n=0,
-    evaluate_spots=False,
+    evaluate_regions=False,
 ):
+    if region_type not in {"circle", "polygon"}:
+        raise ValueError(f"Unknown region geometry: {region_type}")
+    if region_type == "circle" and (spot_diameter_um is None or float(spot_diameter_um) <= 0):
+        raise ValueError("Circular regions require a positive spot_diameter_um")
     names = list(map(str, names))
     device = torch.device(device)
-    context = _precision_context(device, precision)
-    model, artifact = load_model(artifact_path, device)
+    context = _precision_context(device=device, precision=precision)
+    model, artifact = load_model(path=artifact_path, device=device)
     output_dir = Path(output_dir)
     roots = (
         {name: Path(data_root[name]) for name in names}
         if isinstance(data_root, dict)
         else dict.fromkeys(names, Path(data_root))
     )
-    raw_genes = load_gene_adata(gene_path, names)
+    raw_genes = load_gene_adata(path=gene_path, names=names)
     spec = artifact.get("expression_spec")
     if raw_genes.uns.get("preprocessing_id") or raw_genes.uns.get("external_task"):
         if not spec or spec.get("preprocessing_id") != raw_genes.uns.get(
@@ -140,32 +145,26 @@ def run_test(
             )
         if spec["expression_transform"] != expression_transform:
             raise ValueError("Model and expression transforms differ")
-    genes = align_gene_adata(raw_genes, model.gene_names)
+    genes = align_gene_adata(gene_adata=raw_genes, gene_names=model.gene_names)
     prediction_mpp = float(target_mpp) * model.output_scale
     output_dir.mkdir(parents=True, exist_ok=True)
     slide_metrics, expression_results, backgrounds = ({}, {}, {})
-    spot_results = {}
+    region_results = {}
     with context:
         for name in names:
             sample = read_sample(
-                roots[name],
-                name,
-                list(feature_maps),
-                float(target_mpp),
-                prediction_mpp,
+                root=roots[name], name=name, feature_maps=list(feature_maps),
+                target_mpp=float(target_mpp), label_mpp=prediction_mpp, region_type=region_type,
             )
             probability, metrics = validate_slide(
-                model,
-                sample,
-                roots[name],
-                device,
+                model=model, slide=sample, root=roots[name], device=device,
                 crop_size=int(crop_size),
                 stride=stride,
                 batch_size=int(inference_batch_size),
                 mpp=float(target_mpp),
                 threshold=float(threshold),
                 gene_adata=genes,
-                spot_radius_px=float(spot_diameter_um) / (2 * float(target_mpp)),
+                spot_radius_px=None if spot_diameter_um is None else float(spot_diameter_um) / (2 * float(target_mpp)),
                 expression_transform=expression_transform,
                 evaluate_segmentation=sample["has_segmentation"],
                 expression_results=expression_results,
@@ -173,29 +172,24 @@ def run_test(
             )
             directory = output_dir / name
             directory.mkdir(parents=True, exist_ok=True)
-            if sample["has_segmentation"] or evaluate_spots:
+            if sample["has_segmentation"] or evaluate_regions:
                 np.save(directory / "probability.npy", probability.astype(np.float32))
                 cv2.imwrite(
                     str(directory / "mask.png"),
                     (probability >= threshold).astype(np.uint8) * 255,
                 )
-            if evaluate_spots:
-                table = evaluate_spot_probabilities(
-                    probability,
-                    roots[name],
-                    name,
-                    float(target_mpp),
-                    prediction_mpp,
-                    float(spot_diameter_um),
-                    threshold,
+            if evaluate_regions:
+                table = evaluate_region_probabilities(
+                    probability=probability, root=roots[name], name=name,
+                    target_mpp=float(target_mpp), prediction_mpp=prediction_mpp,
+                    spot_diameter_um=spot_diameter_um, threshold=threshold, region_map=sample["region_map"],
                 )
-                table.to_csv(directory / "spot_predictions.tsv", sep="\t", index=False)
-                spot_results[name] = table
+                table.to_csv(directory / "region_predictions.tsv", sep="\t", index=False)
+                region_results[name] = table
                 usable = table.classification_valid
-                metrics["spot_classification"] = spot_classification_metrics(
-                    table.loc[usable, "probability"],
-                    table.loc[usable, "spot_label"],
-                    threshold,
+                metrics["region_classification"] = region_classification_metrics(
+                    probability=table.loc[usable, "probability"],
+                    labels=table.loc[usable, "spot_label"], threshold=threshold,
                 )
             if name in expression_results:
                 np.savez_compressed(
@@ -208,44 +202,36 @@ def run_test(
                     gene_names=np.asarray(model.gene_names, dtype=str),
                     expression_transform=expression_transform,
                 )
-            _write_json(directory / "metrics.json", metrics)
+            _write_json(path=directory / "metrics.json", value=metrics)
             if visualization_top_n > 0:
                 _save_slide_visualizations(
-                    directory,
-                    roots[name],
-                    name,
-                    sample["image"],
-                    probability,
-                    genes,
-                    target_mpp,
-                    prediction_mpp,
-                    spot_diameter_um,
-                    threshold,
+                    directory=directory, root=roots[name], name=name, image_rgb=sample["image"],
+                    probability=probability, gene_adata=genes, target_mpp=target_mpp,
+                    prediction_mpp=prediction_mpp, spot_diameter_um=spot_diameter_um,
+                    threshold=threshold, region_map=sample["region_map"],
                 )
             slide_metrics[name] = metrics
             if visualization_top_n > 0:
-                backgrounds[name] = {"image": sample["image"]}
+                backgrounds[name] = {"image": sample["image"], "region_map": sample["region_map"]}
             del sample
-    summary = summarize_metrics(slide_metrics, expression_results)
-    if evaluate_spots:
-        summary["spot_classification"] = summarize_spot_classification(
-            spot_results, threshold
+    summary = summarize_metrics(slides=slide_metrics, expression_results=expression_results)
+    if evaluate_regions:
+        summary["region_classification"] = summarize_region_classification(
+            records=region_results, threshold=threshold
         )
-    _write_json(output_dir / "metrics.json", summary)
+    _write_json(path=output_dir / "metrics.json", value=summary)
     if visualization_top_n > 0:
         save_top_gene_predictions(
-            output_dir / "genes",
-            expression_results,
-            model.gene_names,
-            backgrounds,
+            directory=output_dir / "genes", expression_results=expression_results,
+            gene_names=model.gene_names, slides=backgrounds,
             top_n=int(visualization_top_n),
-            spot_radius_px=float(spot_diameter_um) / (2 * float(target_mpp)),
+            spot_radius_px=None if spot_diameter_um is None else float(spot_diameter_um) / (2 * float(target_mpp)),
             expression_transform=expression_transform,
             source_model="saved_model",
         )
     _write_json(
-        output_dir / "metadata.json",
-        {
+        path=output_dir / "metadata.json",
+        value={
             "artifact": str(Path(artifact_path).resolve()),
             "device": str(device),
             "precision": precision,
@@ -258,7 +244,8 @@ def run_test(
             "crop_size": int(crop_size),
             "stride": stride,
             "expression_transform": expression_transform,
-            "evaluate_spots": bool(evaluate_spots),
+            "evaluate_regions": bool(evaluate_regions),
+            "region_type": region_type,
             "expression_spec": spec,
         },
     )

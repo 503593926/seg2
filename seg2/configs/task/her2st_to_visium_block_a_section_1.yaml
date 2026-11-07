@@ -1,0 +1,9 @@
+defaults:
+  - base
+  - /dataset@source_dataset: her2st
+  - /dataset@target_dataset: visium_block_a_section_1
+  - _self_
+
+task:
+  name: her2st_to_visium_block_a_section_1
+  split_mode: transfer

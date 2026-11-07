@@ -3,7 +3,7 @@ import math
 import torch
 from torch.nn import functional as F
 
-from seg2.models.spot_pooling import pool_spot_batch
+from seg2.models.region_pooling import pool_region_batch
 
 
 def _gene_correlation_terms(predictions, targets, slide_names, min_spots, std_floor):
@@ -33,9 +33,9 @@ def gene_prediction_losses(
 ):
     losses = {}
     field = output["tissue_states"] * output["expression_amplitude"]
-    plan = batch["spot_pool"]
+    plan = batch["region_pool"]
     with torch.autocast(device_type=field.device.type, enabled=False):
-        pooled = pool_spot_batch(field, plan) @ output["expression_templates"]
+        pooled = pool_region_batch(field=field, plan=plan) @ output["expression_templates"]
     predictions = [value for value, count in zip(pooled.split(plan["counts"]), plan["counts"]) if count]
     targets = [
         expression[indices].detach().float()
@@ -95,7 +95,7 @@ def auxiliary_prediction_losses(
                 output["logits"], native_target, native_valid, soft_targets=True,
             )
         if any(float(weights.get(name, 0)) for name in ("gene_prediction", "gene_correlation")):
-            native_batch = {**batch, "spot_pool": batch["auxiliary_spot_pools"][scale]}
+            native_batch = {**batch, "region_pool": batch["auxiliary_region_pools"][scale]}
             gene_losses, count = gene_prediction_losses(
                 output, native_batch, weights=weights,
                 expression_transform=expression_transform,

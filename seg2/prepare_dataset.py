@@ -22,8 +22,8 @@ def run(cfg, skip_features=False):
 
 
 def main() -> None:
-    dataset_name = "stnet"
-    skip_features = True
+    dataset_name = "visium_wu_2021"
+    skip_features = False
 
     config_dir = Path(__file__).resolve().parent / "configs"
     with initialize_config_dir(config_dir=str(config_dir), version_base="1.3"):

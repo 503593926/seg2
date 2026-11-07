@@ -1,6 +1,6 @@
 defaults:
   - paths: base
-  - experiment@_global_: her2st_to_stnet
+  - experiment@_global_: her2st
   - _self_
 
 hydra:
