@@ -6,5 +6,12 @@ defaults:
 experiment_name: her2st_to_stnet
 
 evaluation:
+  validation:
+    every_n_epochs: 5
   test:
     region_classification: true
+
+training:
+  image:
+    epochs: 10
+    ema_decay: 0.995

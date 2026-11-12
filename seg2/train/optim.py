@@ -46,3 +46,25 @@ def configure_optimizer(model, cfg, trainer) -> OptimizerLRSchedulerConfig:
         "optimizer": optimizer,
         "lr_scheduler": {"scheduler": scheduler, "interval": "step", "frequency": 1},
     }
+
+
+# def configure_optimizer(model, cfg, trainer) -> OptimizerLRSchedulerConfig:
+#     decay, no_decay = [], []
+#
+#     for name, parameter in model.named_parameters():
+#         if not parameter.requires_grad:
+#             continue
+#         if parameter.ndim <= 1 or name.endswith(".bias"):
+#             no_decay.append(parameter)
+#         else:
+#             decay.append(parameter)
+#
+#     optimizer = torch.optim.AdamW(
+#         [
+#             {"params": decay, "weight_decay": float(cfg.weight_decay)},
+#             {"params": no_decay, "weight_decay": 0.0},
+#         ],
+#         lr=float(cfg.lr),
+#     )
+#
+#     return {"optimizer": optimizer}

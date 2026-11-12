@@ -3,6 +3,8 @@ import math
 import numpy as np
 import torch
 
+from seg2.common.correlation import spearman_metrics
+
 PCC_TOP_K = (50, 100)
 
 
@@ -171,6 +173,7 @@ def expression_metrics(prediction, target, observed=None):
         "gene_regions": len(prediction),
         "gene_pcc_genes": 0,
         "gene_values": int(observed.sum()),
+        **spearman_metrics(prediction, target, observed),
     }
     if not bool(observed.any()):
         return {
@@ -223,6 +226,7 @@ def summarize_expression_metrics(slides, expression_results):
         "gene_prediction",
         "gene_prediction_rmse",
         "gene_prediction_pcc",
+        "gene_prediction_scc",
         *(f"gene_prediction_pcc_top{k}" for k in PCC_TOP_K),
     ):
         values = [

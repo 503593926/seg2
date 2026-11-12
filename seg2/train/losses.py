@@ -15,12 +15,16 @@ def _gene_correlation_terms(predictions, targets, slide_names, min_spots, std_fl
         target = torch.cat([value for value, slide in zip(targets, slide_names) if slide == name])
         prediction_residuals.append(prediction - prediction.mean(dim=0))
         target_residuals.append(target - target.mean(dim=0))
+
     if not prediction_residuals:
         return predictions[0].sum(dim=0)[:0]
+
     prediction = torch.cat(prediction_residuals)
     target = torch.cat(target_residuals)
+
     var_p = prediction.square().mean(dim=0)
     var_t = target.square().mean(dim=0)
+
     usable = var_t > 1e-12
     scale_p = (var_p + std_floor**2).sqrt()
     scale_t = (var_t + std_floor**2).sqrt()
@@ -34,17 +38,21 @@ def gene_prediction_losses(
     losses = {}
     field = output["tissue_states"] * output["expression_amplitude"]
     plan = batch["region_pool"]
+
     with torch.autocast(device_type=field.device.type, enabled=False):
         pooled = pool_region_batch(field=field, plan=plan) @ output["expression_templates"]
     predictions = [value for value, count in zip(pooled.split(plan["counts"]), plan["counts"]) if count]
+
     targets = [
         expression[indices].detach().float()
         for expression, indices, count in zip(batch["gene_expression"], plan["indices"], plan["counts"])
         if count
     ]
+
     zero = pooled.sum() * 0
     if not predictions:
         return ({name: zero for name in ("gene_prediction", "gene_correlation") if float(weights[name])}, 0)
+
     with torch.autocast(device_type=predictions[0].device.type, enabled=False):
         if expression_transform == "log1p":
             predictions = [prediction.log1p() for prediction in predictions]

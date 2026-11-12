@@ -1,10 +1,8 @@
 """Build evaluation inputs from the composed experiment configuration."""
 
-from pathlib import Path
-
 import anndata as ad
 
-from seg2.common.task import gene_expression_path
+from seg2.common.utils import gene_expression_path
 
 
 def evaluation_inputs(cfg, fold_name):
@@ -12,18 +10,9 @@ def evaluation_inputs(cfg, fold_name):
     dataset = cfg.target_dataset if external else cfg.source_dataset
     gene_path = gene_expression_path(cfg, fold_name, target=external)
     data = ad.read_h5ad(gene_path, backed="r")
-    try:
-        names = list(map(str, data.uns["test_names"]))
-    finally:
-        data.file.close()
+    names = list(map(str, data.uns["test_names"]))
+    data.file.close()
     return dataset, gene_path, names
-
-
-def model_artifact(model_dir, weights):
-    if str(weights) not in {"ema", "model"}:
-        raise ValueError("Evaluation weights must be 'ema' or 'model'")
-    filename = "final_ema_model.pt" if str(weights) == "ema" else "final_model.pt"
-    return Path(model_dir) / filename
 
 
 def evaluation_parameters(

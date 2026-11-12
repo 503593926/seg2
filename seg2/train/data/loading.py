@@ -7,7 +7,7 @@ import cv2
 import numpy as np
 import scipy.sparse as sp
 
-from seg2.common.task import gene_expression_path
+from seg2.common.utils import gene_expression_path
 
 
 def load_gene_adata(fold, cfg):

@@ -127,6 +127,7 @@ class JointModel(nn.Module):
             self.stem(image), task_global, task_spatial,
             return_decoder_features=use_auxiliary,
         )
+        decoder_features = None
         if use_auxiliary:
             decoded_fm, decoder_features = decoded
         else:
@@ -145,7 +146,7 @@ class JointModel(nn.Module):
         else:
             states = self.tissue_state_decoder(*decoder_args)
         output.update(states)
-        if use_auxiliary:
+        if decoder_features is not None:
             auxiliary = {}
             for scale, index in self._auxiliary_stage_indices.items():
                 features = self.auxiliary_projections[scale](decoder_features[index])

@@ -431,7 +431,7 @@ def prepare_external_task(
 
 
 def run_external(cfg):
-    from seg2.common.task import gene_expression_path
+    from seg2.common.utils import gene_expression_path
     from seg2.derive import sample_names
 
     root = Path(str(cfg.target_dataset.data_dir)).expanduser().resolve()

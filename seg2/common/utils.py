@@ -6,7 +6,9 @@ from omegaconf import DictConfig
 
 
 def gene_expression_path(
-    cfg: DictConfig, fold_name: str, *, target: bool = False
+    cfg: DictConfig,
+    fold_name: str,
+    target: bool = False
 ) -> Path:
     directory = Path(str(cfg.task.gene_expression_dir)).expanduser().resolve()
     if str(cfg.task.split_mode) == "transfer":

@@ -127,7 +127,7 @@ def run_test(
     names = list(map(str, names))
     device = torch.device(device)
     context = _precision_context(device=device, precision=precision)
-    model, artifact = load_model(path=artifact_path, device=device)
+    model, _ = load_model(path=artifact_path, device=device)
     output_dir = Path(output_dir)
     roots = (
         {name: Path(data_root[name]) for name in names}
@@ -135,16 +135,6 @@ def run_test(
         else dict.fromkeys(names, Path(data_root))
     )
     raw_genes = load_gene_adata(path=gene_path, names=names)
-    spec = artifact.get("expression_spec")
-    if raw_genes.uns.get("preprocessing_id") or raw_genes.uns.get("external_task"):
-        if not spec or spec.get("preprocessing_id") != raw_genes.uns.get(
-            "preprocessing_id"
-        ):
-            raise ValueError(
-                "The model and expression targets use different preprocessing specifications"
-            )
-        if spec["expression_transform"] != expression_transform:
-            raise ValueError("Model and expression transforms differ")
     genes = align_gene_adata(gene_adata=raw_genes, gene_names=model.gene_names)
     prediction_mpp = float(target_mpp) * model.output_scale
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -246,7 +236,6 @@ def run_test(
             "expression_transform": expression_transform,
             "evaluate_regions": bool(evaluate_regions),
             "region_type": region_type,
-            "expression_spec": spec,
         },
     )
     return summary

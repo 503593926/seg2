@@ -6,7 +6,6 @@ from seg2.test import run_test
 from seg2.test.configuration import (
     evaluation_inputs,
     evaluation_parameters,
-    model_artifact,
 )
 
 
@@ -20,11 +19,16 @@ def main():
         cfg = compose(config_name=config_name)
     dataset, gene_path, names = evaluation_inputs(cfg, model_dir.parent.name)
     test_dir = "external_test" if cfg.task.split_mode == "transfer" else "test"
+    filename = (
+        "final_ema_model.pt"
+        if cfg.evaluation.test.weights == "ema"
+        else "final_model.pt"
+    )
     run_test(
         **evaluation_parameters(
             cfg,
             dataset=dataset,
-            artifact_path=model_artifact(model_dir, cfg.evaluation.test.weights),
+            artifact_path=model_dir / filename,
             gene_path=gene_path,
             output_dir=model_dir / test_dir,
             names=names,

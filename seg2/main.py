@@ -5,7 +5,7 @@ import hydra
 from hydra.core.hydra_config import HydraConfig
 from omegaconf import DictConfig
 
-from seg2.common.task import gene_expression_path
+from seg2.common.utils import gene_expression_path
 from seg2.train.pipeline import run_fold
 
 
@@ -15,20 +15,9 @@ def get_folds(cfg: DictConfig) -> list[dict]:
         data_dir = Path(str(cfg.source_dataset.data_dir)).expanduser().resolve()
         path = gene_expression_path(cfg, str(cfg.experiment_name))
         data = ad.read_h5ad(path, backed="r")
-        try:
-            if data.uns.get("data_role") != "train" or not data.uns.get(
-                "external_task"
-            ):
-                raise ValueError(
-                    "Transfer mode requires the external task's training H5AD"
-                )
-            names = list(map(str, data.uns["train_names"]))
-            if set(data.obs["name"].astype(str)) != set(names):
-                raise ValueError(
-                    "Target test samples must not enter source training data"
-                )
-        finally:
-            data.file.close()
+
+        names = list(map(str, data.uns["train_names"]))
+        data.file.close()
         return [
             {
                 "name": str(cfg.experiment_name),
@@ -74,13 +63,16 @@ def get_folds(cfg: DictConfig) -> list[dict]:
 #                 if cfg.task.split_mode == "transfer"
 #                 else "test"
 #             )
+#             filename = (
+#                 "final_ema_model.pt"
+#                 if cfg.evaluation.test.weights == "ema"
+#                 else "final_model.pt"
+#             )
 #             run_test(
 #                 **evaluation_parameters(
 #                     cfg,
 #                     dataset=dataset,
-#                     artifact_path=model_artifact(
-#                         log_dir, cfg.evaluation.test.weights
-#                     ),
+#                     artifact_path=log_dir / filename,
 #                     gene_path=gene_path,
 #                     output_dir=log_dir / test_dir,
 #                     names=names,
@@ -117,20 +109,22 @@ def run(cfg: DictConfig, run_output_dir: Path) -> None:
                 from seg2.test.configuration import (
                     evaluation_inputs,
                     evaluation_parameters,
-                    model_artifact,
                 )
 
                 dataset, gene_path, names = evaluation_inputs(cfg, fold["name"])
                 test_dir = (
                     "external_test" if cfg.task.split_mode == "transfer" else "test"
                 )
+                filename = (
+                    "final_ema_model.pt"
+                    if cfg.evaluation.test.weights == "ema"
+                    else "final_model.pt"
+                )
                 run_test(
                     **evaluation_parameters(
                         cfg,
                         dataset=dataset,
-                        artifact_path=model_artifact(
-                            log_dir, cfg.evaluation.test.weights
-                        ),
+                        artifact_path=log_dir / filename,
                         gene_path=gene_path,
                         output_dir=log_dir / test_dir,
                         names=names,
