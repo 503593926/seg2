@@ -1,8 +1,8 @@
 defaults:
   - paths: base
-  - experiment@_global_: her2st_to_stnet
+  - experiment@_global_: her2st_to_visium_block_a_section_1
   - _self_
 
 hydra:
   run:
-    dir: ${paths.output_root}/${experiment_name}/${now:%Y-%m-%d}/${now:%H-%M-%S}
+    dir: ${paths.ablation_root}/wo_seg/${experiment_name}/${now:%Y-%m-%d}/${now:%H-%M-%S}
