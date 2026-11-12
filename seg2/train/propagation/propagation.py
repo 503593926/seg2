@@ -1,5 +1,4 @@
 import numpy as np
-from scipy.ndimage import distance_transform_edt
 from scipy.sparse import coo_matrix, csr_matrix, diags
 from scipy.sparse.linalg import spsolve
 
@@ -10,7 +9,8 @@ def standardize(values):
     return (values - values.mean(axis=0)) / np.maximum(values.std(axis=0), 1e-06)
 
 
-def prepare_propagation(superpixels, lab, coordinates, spot_labels, label_scale, max_distance):
+def prepare_propagation(superpixels, lab, seeds):
+    """Prepare the graph using saved, already snapped label-grid seed coordinates."""
     topology = build_random_walker_topology(superpixels)
     labels = topology.foreground_labels
     lab_means = np.zeros((len(labels), lab.shape[-1]), dtype=np.float64)
@@ -18,7 +18,7 @@ def prepare_propagation(superpixels, lab, coordinates, spot_labels, label_scale,
     for channel, values in enumerate(np.moveaxis(lab, -1, 0)):
         sums = np.bincount(flat_superpixels, weights=values.ravel(), minlength=topology.max_label + 1)
         lab_means[:, channel] = sums[labels] / topology.pixel_counts[labels]
-    x, y, spot_labels = snap_spots(coordinates, spot_labels, superpixels, label_scale, max_distance)
+    x, y, spot_labels = seeds["x"], seeds["y"], seeds["labels"]
     votes = compute_seed_votes(superpixels, x, y, spot_labels, topology)[labels]
     seeded = (votes == 1) | (votes == 2)
     probability = np.full(len(labels), 0.5, dtype=np.float64)
@@ -69,28 +69,6 @@ def propagate_features(superpixels, learned, beta, learned_weight, cache):
     lookup = np.zeros(topology.max_label + 1, dtype=np.float32)
     lookup[labels] = np.clip(probability, 0.0, 1.0)
     return lookup[superpixels]
-
-
-def snap_spots(coordinates, labels, superpixels, label_scale, max_distance):
-    coordinates = np.rint(coordinates / label_scale).astype(np.int64)
-    labels = np.asarray(labels, dtype=np.uint8)
-    height, width = superpixels.shape
-    inside = (
-        (coordinates[:, 0] >= 0)
-        & (coordinates[:, 0] < width)
-        & (coordinates[:, 1] >= 0)
-        & (coordinates[:, 1] < height)
-    )
-    coordinates, labels = (coordinates[inside], labels[inside])
-    if not len(coordinates):
-        return (np.empty(0, np.int64), np.empty(0, np.int64), labels)
-    distance, nearest = distance_transform_edt(superpixels == 0, return_indices=True)
-    x, y = (coordinates[:, 0].copy(), coordinates[:, 1].copy())
-    outside = (superpixels[y, x] == 0) & (labels != 255) & (distance[y, x] <= max_distance)
-    original_x, original_y = (x[outside], y[outside])
-    x[outside] = nearest[1, original_y, original_x]
-    y[outside] = nearest[0, original_y, original_x]
-    return (x, y, labels)
 
 
 def build_pseudo_mask(probability, tissue, non_cancer_threshold, cancer_threshold):

@@ -84,6 +84,17 @@ def read_sample(data_dir, name, feature_maps, cfg):
 
     if has_segmentation:
         pseudo_dir = label_dir / str(cfg.source_dataset.pseudo_label_dir)
+        if bool(cfg.dynamic.enabled):
+            seeds_path = pseudo_dir / "propagation_seeds.npz"
+            if not seeds_path.is_file():
+                raise FileNotFoundError(
+                    f"[{name}] Dynamic propagation requires {seeds_path}. "
+                    "Regenerate pseudo labels for this directory to save the selected seeds."
+                )
+            with np.load(seeds_path, allow_pickle=False) as seeds:
+                sample["propagation_seeds"] = {
+                    key: seeds[key] for key in ("spot_ids", "x", "y", "labels")
+                }
         sample.update(
             pseudo_mask=cv2.imread(
                 str(pseudo_dir / "pseudo_mask.png"), cv2.IMREAD_GRAYSCALE

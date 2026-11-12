@@ -85,15 +85,10 @@ class DynamicPropagationCallback(pl.Callback):
         label_mpp = float(resolution.label_mpp)
         if name not in self.slide_cache:
             lab = prepare_snic_lab(cv2.cvtColor(image, cv2.COLOR_RGB2BGR))
-            spot_data = dataset.spots_by_slide[name]
-            labels = dataset.spot_labels.numpy()[spot_data["indices"]]
             self.slide_cache[name] = prepare_propagation(
                 superpixels,
                 lab,
-                spot_data["coords"],
-                labels,
-                dataset.label_scale,
-                float(self.rw.max_snap_distance_um) / label_mpp,
+                slide["propagation_seeds"],
             )
             del lab
         cache = self.slide_cache[name]
